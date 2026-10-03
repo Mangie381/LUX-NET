@@ -1,3 +1,8 @@
+Here is the entire, fully merged `bot.py` script containing all features: Render keep-alive server, GitHub Gist state persistence, edge-TTS voice bridging (`/send-bridge`), and text channel relaying with support for native Discord forwards, other bots, and embeds.
+
+You can copy and paste this directly into your file:
+
+```python
 from __future__ import annotations
 
 import asyncio
@@ -142,7 +147,6 @@ def save_all_data(vc_groups: list[set[int]], relay_groups: list[set[int]]) -> No
         except Exception as e:
             logger.error("Failed to save to GitHub Gist: %s", e)
 
-    # Local fallback save
     try:
         LOCAL_STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as e:
@@ -193,6 +197,22 @@ async def get_text_channel(channel_id: int) -> discord.TextChannel | None:
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
     return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook | None:
+    """Fetch existing relay webhook or create a new one for the channel."""
+    try:
+        webhooks = await channel.webhooks()
+        for wh in webhooks:
+            if wh.name == "LUX-NET Relay":
+                return wh
+        return await channel.create_webhook(name="LUX-NET Relay")
+    except discord.Forbidden:
+        logger.error("Missing 'Manage Webhooks' permission in channel %s (%s)", channel.name, channel.id)
+        return None
+    except discord.HTTPException as e:
+        logger.error("Failed to create webhook in channel %s: %s", channel.id, e)
+        return None
 
 
 async def create_tts_file(text: str, voice: str) -> str:
@@ -294,10 +314,11 @@ async def on_guild_join(guild: discord.Guild) -> None:
     await sync_guild_commands(guild)
 
 
-# --- TEXT RELAY FUNCTIONALITY ---
+# --- TEXT RELAY FUNCTIONALITY (SUPPORTING FORWARDS, BOTS, EMBEDS, WEBHOOKS) ---
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot:
+    # Ignore messages sent by THIS bot to prevent infinite loops
+    if message.author.id == bot.user.id:
         return
 
     group = find_group(text_relay_groups, message.channel.id)
@@ -308,38 +329,71 @@ async def on_message(message: discord.Message) -> None:
     if not target_channel_ids:
         return
 
-    # Prepare files for re-uploading attachments (images, videos, audio, documents)
-    files_to_send = []
-    for attachment in message.attachments:
-        try:
-            file_data = await attachment.to_file()
-            files_to_send.append(file_data)
-        except Exception as e:
-            logger.error("Failed to download attachment %s: %s", attachment.url, e)
-
-    # Header identifying sender
-    header = f"**[{discord.utils.escape_markdown(message.author.display_name)} in {discord.utils.escape_markdown(message.guild.name)}]**"
-    content = f"{header}: {message.content}" if message.content else header
+    # User profile data for webhook styling
+    author_name = message.author.display_name
+    if message.author.bot:
+        author_name += " [BOT]"
+    display_name = f"{author_name} ({message.guild.name})"
+    avatar_url = message.author.display_avatar.url if message.author.display_avatar else None
 
     for target_id in target_channel_ids:
         target_channel = await get_text_channel(target_id)
-        if target_channel:
-            try:
-                # Fresh duplicate files for each channel destination
-                dupe_files = []
-                for attachment in message.attachments:
-                    try:
-                        dupe_files.append(await attachment.to_file())
-                    except Exception:
-                        pass
+        if not target_channel:
+            continue
 
-                await target_channel.send(
-                    content=content,
-                    files=dupe_files,
-                    embeds=message.embeds,
-                )
-            except discord.HTTPException as e:
-                logger.error("Failed to relay message to channel %s: %s", target_id, e)
+        webhook = await get_or_create_webhook(target_channel)
+
+        # Case A: Handle Native Discord Forwards (Snapshots)
+        if hasattr(message, "message_snapshots") and message.message_snapshots:
+            for snapshot in message.message_snapshots:
+                snapshot_files = []
+                if snapshot.attachments:
+                    for att in snapshot.attachments:
+                        try:
+                            snapshot_files.append(await att.to_file())
+                        except Exception as e:
+                            logger.error("Failed to copy snapshot attachment: %s", e)
+
+                if webhook:
+                    try:
+                        await webhook.send(
+                            content=f"**(Forwarded)** {snapshot.content}" if snapshot.content else None,
+                            username=f"{display_name} (Forward)",
+                            avatar_url=avatar_url,
+                            embeds=snapshot.embeds if snapshot.embeds else None,
+                            files=snapshot_files if snapshot_files else None,
+                        )
+                    except discord.HTTPException as e:
+                        logger.error("Webhook snapshot relay failed: %s", e)
+
+        # Case B: Standard Messages, Attachments, Embeds & Other Bot Messages
+        else:
+            files_to_send = []
+            for attachment in message.attachments:
+                try:
+                    files_to_send.append(await attachment.to_file())
+                except Exception as e:
+                    logger.error("Failed to prepare attachment for webhook: %s", e)
+
+            if webhook:
+                try:
+                    await webhook.send(
+                        content=message.content if message.content else None,
+                        username=display_name,
+                        avatar_url=avatar_url,
+                        files=files_to_send if files_to_send else None,
+                        embeds=message.embeds if message.embeds else None,
+                    )
+                except discord.HTTPException as e:
+                    logger.error("Failed to send webhook message to %s: %s", target_id, e)
+            else:
+                # Fallback if Manage Webhooks permission is missing
+                try:
+                    header = f"**[{discord.utils.escape_markdown(display_name)}]**"
+                    content = f"{header}: {message.content}" if message.content else header
+                    await target_channel.send(content=content, files=files_to_send, embeds=message.embeds)
+                except discord.HTTPException as e:
+                    logger.error("Failed fallback send to channel %s: %s", target_id, e)
 
     await bot.process_commands(message)
 
@@ -383,7 +437,7 @@ async def link_relay(interaction: discord.Interaction, target_channel_id: str) -
 
     await respond(
         interaction,
-        f"Linked **#{source_channel.name}** to **#{target_channel.name}** in **{target_channel.guild.name}**. All messages, photos, videos, and files will now relay automatically!",
+        f"Linked **#{source_channel.name}** to **#{target_channel.name}** in **{target_channel.guild.name}**. All messages, forwards, bot embeds, and files will now relay automatically!",
     )
 
 
@@ -665,3 +719,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+```
