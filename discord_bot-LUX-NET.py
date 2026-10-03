@@ -189,11 +189,13 @@ async def get_text_channel(channel_id: int) -> discord.TextChannel | None:
             channel = await bot.fetch_channel(channel_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
-    return channel if isinstance(channel, discord.TextChannel) else None
+    return channel if hasattr(channel, "send") else None
 
 
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook | None:
     """Fetch existing relay webhook or create a new one for the channel."""
+    if not hasattr(channel, "webhooks"):
+        return None
     try:
         webhooks = await channel.webhooks()
         for wh in webhooks:
@@ -307,14 +309,14 @@ async def on_guild_join(guild: discord.Guild) -> None:
     await sync_guild_commands(guild)
 
 
-# --- TEXT RELAY FUNCTIONALITY (SUPPORTING FORWARDS, BOTS, EMBEDS, WEBHOOKS) ---
+# --- TEXT RELAY FUNCTIONALITY ---
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    # Ignore messages sent by THIS bot or webhooks to prevent loops
+    # Ignore messages sent by THIS bot or ANY webhook to prevent loops
     if message.author.id == bot.user.id or message.webhook_id is not None:
         return
 
-    # Account for thread channels by referencing parent channel ID
+    # Handle thread channels by referencing parent channel ID
     channel_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else message.channel.id
 
     group = find_group(text_relay_groups, channel_id)
@@ -325,7 +327,6 @@ async def on_message(message: discord.Message) -> None:
     if not target_channel_ids:
         return
 
-    # User profile data for webhook styling
     author_name = message.author.display_name
     if message.author.bot:
         author_name += " [BOT]"
@@ -404,8 +405,8 @@ async def link_relay(interaction: discord.Interaction, target_channel_id: str) -
         await respond(interaction, "You need **Manage Server** permissions to link text channels.")
         return
 
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await respond(interaction, "This command must be run inside a standard text channel.")
+    if not hasattr(interaction.channel, "send"):
+        await respond(interaction, "This command must be run inside a text channel.")
         return
 
     channel_id_text = target_channel_id.strip()
