@@ -20,7 +20,12 @@ logging.basicConfig(
 logger = logging.getLogger("discord-voice-bridge")
 
 # ------------------------------------------------------------------------------
-# FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
+# GLOBAL RELAY Mappings: { network_code: [channel_id, channel_id, ...] }
+# ------------------------------------------------------------------------------
+relay_bridges = {}
+
+# ------------------------------------------------------------------------------
+# FLASK KEEP-ALIVE SERVER
 # ------------------------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -34,7 +39,6 @@ def run_flask():
     log.setLevel(logging.ERROR)
     flask_app.run(host="0.0.0.0", port=port)
 
-# Start Flask in a background thread
 Thread(target=run_flask, daemon=True).start()
 
 # ------------------------------------------------------------------------------
@@ -63,10 +67,10 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
                 return wh
         return await channel.create_webhook(name="LUX-NET Relay Bridge")
     except discord.Forbidden:
-        logger.error(f"Missing 'Manage Webhooks' permission in channel #{channel.name} (ID: {channel.id})")
+        logger.error(f"Missing 'Manage Webhooks' permission in #{channel.name} (ID: {channel.id})")
         return None
     except Exception as e:
-        logger.error(f"Failed to fetch/create webhook in channel #{channel.name}: {e}")
+        logger.error(f"Failed to create webhook in #{channel.name}: {e}")
         return None
 
 # ------------------------------------------------------------------------------
@@ -76,52 +80,64 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
 async def on_ready():
     logger.info(f"Connected to Discord as {bot.user} in {len(bot.guilds)} servers")
 
-    # Sync commands directly to every server for instant availability without duplicates
+    # Clear old guild-scoped commands to eliminate duplicate slash command entries
     for guild in bot.guilds:
         try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            logger.info(f"Synced {len(synced)} slash commands to {guild.name}")
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
         except Exception as e:
-            logger.error(f"Could not sync instant commands to {guild.name}: {e}")
+            logger.error(f"Could not clear guild commands for {guild.name}: {e}")
+
+    # Clean global sync
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} global slash commands.")
+    except Exception as e:
+        logger.error(f"Failed to sync global slash commands: {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Prevent bot from relaying its own messages or messages from other bots
-    if message.author.bot:
+    # Ignore bot messages and non-guild messages
+    if message.author.bot or not message.guild or not isinstance(message.channel, discord.TextChannel):
         return
 
-    # Process standard prefix commands if any exist
     await bot.process_commands(message)
 
-    # Ignore direct messages
-    if not message.guild or not isinstance(message.channel, discord.TextChannel):
+    # Find active bridge network for the current channel
+    current_channel_id = message.channel.id
+    target_channel_ids = []
+
+    for code, channels in relay_bridges.items():
+        if current_channel_id in channels:
+            # Collect all other channels linked under the same network code
+            target_channel_ids.extend([cid for cid in channels if cid != current_channel_id])
+
+    if not target_channel_ids:
         return
 
-    # TODO: Add your channel mapping/Gist database lookup here to populate target channels
-    target_channels = []
+    # Relay messages to target channels
+    for target_id in set(target_channel_ids):
+        target_channel = bot.get_channel(target_id)
+        if not target_channel or not isinstance(target_channel, discord.TextChannel):
+            continue
 
-    for target_channel in target_channels:
         webhook = await get_or_create_webhook(target_channel)
         if not webhook:
             continue
 
-        # Dynamic parameter building
+        # Build parameters dynamically (Prevents Python 3.14 len(None) crash)
         send_kwargs = {
             "username": message.author.display_name,
             "avatar_url": message.author.display_avatar.url,
             "allowed_mentions": discord.AllowedMentions.none(),
         }
 
-        # 1. Content
         if message.content:
             send_kwargs["content"] = message.content
 
-        # 2. Embeds (Only add if non-empty to avoid len(None) TypeError)
         if message.embeds:
             send_kwargs["embeds"] = message.embeds
 
-        # 3. Attachments (Re-upload so files render across servers)
         files = []
         if message.attachments:
             for attachment in message.attachments:
@@ -129,12 +145,11 @@ async def on_message(message: discord.Message):
                     file = await attachment.to_file()
                     files.append(file)
                 except Exception as e:
-                    logger.error(f"Failed to copy attachment {attachment.filename}: {e}")
+                    logger.error(f"Failed to process attachment: {e}")
 
         if files:
             send_kwargs["files"] = files
 
-        # 4. Stickers and edge cases
         if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
             if message.stickers:
                 send_kwargs["content"] = f"*[Sticker: {message.stickers[0].name}]*"
@@ -143,13 +158,11 @@ async def on_message(message: discord.Message):
 
         try:
             await webhook.send(**send_kwargs)
-        except discord.HTTPException as e:
-            logger.error(f"HTTP Error sending webhook to channel {target_channel.id}: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error sending webhook to channel {target_channel.id}: {e}")
+            logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# ALL 6 LUX-NET SLASH COMMANDS
+# SLASH COMMANDS
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
@@ -159,28 +172,58 @@ async def ping(interaction: discord.Interaction):
 @bot.tree.command(name="link-relay", description="Link this text channel to a cross-server relay network.")
 @app_commands.describe(network_code="The network code to link this text channel to")
 async def link_relay(interaction: discord.Interaction, network_code: str):
-    await interaction.response.send_message(
-        f"✅ Connected **#{interaction.channel.name}** to text relay network `{network_code}`.",
-        ephemeral=False
-    )
+    channel_id = interaction.channel.id
+    code = network_code.strip().lower()
+
+    if code not in relay_bridges:
+        relay_bridges[code] = []
+
+    if channel_id not in relay_bridges[code]:
+        relay_bridges[code].append(channel_id)
+        await interaction.response.send_message(
+            f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! "
+            f"({len(relay_bridges[code])} channels currently connected)",
+            ephemeral=False
+        )
+    else:
+        await interaction.response.send_message(
+            f"⚠️ **#{interaction.channel.name}** is already linked to network `{code}`.",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
 async def unlink_relay(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
-        ephemeral=False
-    )
+    channel_id = interaction.channel.id
+    unlinked = False
+
+    for code, channels in list(relay_bridges.items()):
+        if channel_id in channels:
+            channels.remove(channel_id)
+            unlinked = True
+            if not channels:
+                del relay_bridges[code]
+
+    if unlinked:
+        await interaction.response.send_message(
+            f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
+            ephemeral=False
+        )
+    else:
+        await interaction.response.send_message(
+            f"⚠️ **#{interaction.channel.name}** is not currently linked to any relay network.",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice bridge.")
 @app_commands.describe(network_code="The network code to link this voice channel to")
 async def link_vc(interaction: discord.Interaction, network_code: str):
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be in a voice channel to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You must be connected to a voice channel to run this command.", ephemeral=True)
         return
 
     vc_name = interaction.user.voice.channel.name
     await interaction.response.send_message(
-        f"🎙️ Connected voice channel **{vc_name}** to voice bridge `{network_code}`.",
+        f"🎙️ Connected voice channel **{vc_name}** to voice bridge `{network_code.strip().lower()}`.",
         ephemeral=False
     )
 
@@ -195,14 +238,22 @@ async def unlink_vc(interaction: discord.Interaction):
 async def list_bridges(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🌐 LUX-NET Active Bridges",
-        description="Current active channel connections across the telephone network:",
+        description="Current active network connections:",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Text Relays", value="No active text relays configured.", inline=False)
+
+    if relay_bridges:
+        text_summary = ""
+        for code, channels in relay_bridges.items():
+            text_summary += f"• **`{code}`**: {len(channels)} channel(s) connected\n"
+        embed.add_field(name="Text Relays", value=text_summary, inline=False)
+    else:
+        embed.add_field(name="Text Relays", value="No active text relays linked.", inline=False)
+
     embed.add_field(name="Voice Bridges", value="No active voice bridges connected.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="send-bridge", description="Broadcast a TTS announcement across connected bridge networks.")
+@bot.tree.command(name="send-bridge", description="Broadcast a message across connected bridge networks.")
 @app_commands.describe(message="The message to broadcast across the bridge")
 async def send_bridge(interaction: discord.Interaction, message: str):
     await interaction.response.send_message(
@@ -220,6 +271,9 @@ def main():
         sys.exit(1)
 
     bot.run(token)
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
