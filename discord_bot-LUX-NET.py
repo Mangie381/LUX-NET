@@ -9,14 +9,32 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 
 import discord
 import edge_tts
 from discord import app_commands
 from discord.ext import commands
+from flask import Flask
 from gtts import gTTS
 
+# --- Keep-Alive Web Server for Render ---
+app = Flask("")
 
+
+@app.route("/")
+def home():
+    return "Bot is alive!"
+
+
+def keep_alive():
+    port = int(os.environ.get("PORT", 8080))
+    t = Thread(target=lambda: app.run(host="0.0.0.0", port=port))
+    t.daemon = True
+    t.start()
+
+
+# --- Main Bot Code ---
 ROOT = Path(__file__).resolve().parent
 BRIDGE_STATE_FILE = ROOT / "bridge_state.json"
 MAX_TTS_CHARACTERS = 400
@@ -88,7 +106,6 @@ def load_bridges() -> list[set[int]]:
                 groups.append(group)
             return groups
 
-        # Older releases stored symmetric one-to-one channel mappings.
         bridges = {int(source): int(target) for source, target in data.items()}
         if any(
             source <= 0 or target <= 0 or source == target or bridges.get(target) != source
@@ -720,7 +737,6 @@ async def send_bridge(
 
 
 def main() -> None:
-    # Check for DISCORD_TOKEN first (or fall back to DISCORD_BOT_TOKEN)
     token = os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")
     
     if not token:
@@ -728,9 +744,12 @@ def main() -> None:
             "Missing DISCORD_TOKEN environment variable in Render."
         )
     
-    keep_alive()  # Runs the HTTP server so Render health checks don't time out
+    keep_alive()  # Starts the Flask server for Render health checks
     bot.run(token)
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
