@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import ctypes.util
 import json
@@ -18,13 +19,13 @@ from discord.ext import commands
 from flask import Flask
 from gtts import gTTS
 
-# --- Keep-Alive Web Server for Render ---
+# --- 1. Keep-Alive Web Server for Render ---
 app = Flask("")
 
 
 @app.route("/")
 def home():
-    return "Bot is alive!"
+    return "LUX-NET Relay Service is Active!"
 
 
 def keep_alive():
@@ -34,7 +35,7 @@ def keep_alive():
     t.start()
 
 
-# --- Configuration & Logging ---
+# --- 2. Configuration & Logging ---
 ROOT = Path(__file__).resolve().parent
 LOCAL_STATE_FILE = ROOT / "bridge_state.json"
 MAX_TTS_CHARACTERS = 400
@@ -72,12 +73,22 @@ if not discord.opus.is_loaded():
     try:
         discord.opus.load_opus(opus_library)
     except OSError as error:
-        raise RuntimeError(
-            f"Could not load the Opus voice encoder ({opus_library}); install libopus."
-        ) from error
+        logger.warning("Opus audio library failed to load (%s). Voice features may fail.", error)
 
 
-# --- Persistence Layer (Gist / Local File) ---
+# --- 3. Persistence Layer (GitHub Gist / Local JSON Backup) ---
+def parse_groups_from_json(raw_groups: list) -> list[set[int]]:
+    groups: list[set[int]] = []
+    if not isinstance(raw_groups, list):
+        return groups
+    for raw_group in raw_groups:
+        if isinstance(raw_group, list):
+            group = {int(cid) for cid in raw_group if int(cid) > 0}
+            if len(group) >= 2:
+                groups.append(group)
+    return groups
+
+
 def load_all_data() -> tuple[list[set[int]], list[set[int]]]:
     """Load VC groups and Text Relay groups from GitHub Gist or local JSON file."""
     data = {}
@@ -90,31 +101,20 @@ def load_all_data() -> tuple[list[set[int]], list[set[int]]]:
                 if "bridge_state.json" in files:
                     content = files["bridge_state.json"]["content"]
                     data = json.loads(content)
-                    logger.info("Successfully loaded state from GitHub Gist.")
+                    logger.info("Successfully loaded bridge state from GitHub Gist.")
         except Exception as e:
-            logger.error("Failed to load from GitHub Gist, falling back to local file: %s", e)
+            logger.error("Failed to load state from GitHub Gist: %s", e)
 
     if not data and LOCAL_STATE_FILE.exists():
         try:
             data = json.loads(LOCAL_STATE_FILE.read_text(encoding="utf-8"))
+            logger.info("Loaded bridge state from local backup file.")
         except Exception as e:
-            logger.error("Failed to load local state file: %s", e)
+            logger.error("Failed to load local backup state file: %s", e)
 
     vc_groups = parse_groups_from_json(data.get("vc_groups", data.get("groups", [])))
     relay_groups = parse_groups_from_json(data.get("relay_groups", []))
     return vc_groups, relay_groups
-
-
-def parse_groups_from_json(raw_groups: list) -> list[set[int]]:
-    groups: list[set[int]] = []
-    if not isinstance(raw_groups, list):
-        return groups
-    for raw_group in raw_groups:
-        if isinstance(raw_group, list):
-            group = {int(cid) for cid in raw_group if int(cid) > 0}
-            if len(group) >= 2:
-                groups.append(group)
-    return groups
 
 
 def save_all_data(vc_groups: list[set[int]], relay_groups: list[set[int]]) -> None:
@@ -137,25 +137,26 @@ def save_all_data(vc_groups: list[set[int]], relay_groups: list[set[int]]) -> No
             }
             res = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=gist_data, timeout=10)
             if res.status_code == 200:
-                logger.info("Saved bridge state to GitHub Gist.")
+                logger.info("Saved state update to GitHub Gist.")
         except Exception as e:
-            logger.error("Failed to save to GitHub Gist: %s", e)
+            logger.error("Failed to save state to GitHub Gist: %s", e)
 
     try:
         LOCAL_STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as e:
-        logger.error("Failed to write local backup state file: %s", e)
+        logger.error("Failed to write local state file: %s", e)
 
 
-# --- Core Discord Bot Setup ---
+# --- 4. Core Bot Initialization ---
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.message_content = True
+intents.guilds = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 vc_bridge_groups, text_relay_groups = load_all_data()
-synced_guild_ids: set[int] = set()
 send_history: dict[int, float] = {}
+webhook_cache: dict[int, discord.Webhook] = {}
 
 
 @dataclass(frozen=True)
@@ -171,17 +172,7 @@ speech_queue_preparer: asyncio.Task[None] | None = None
 speech_queue_worker: asyncio.Task[None] | None = None
 
 
-# --- Helper Functions ---
-async def get_voice_channel(channel_id: int) -> discord.VoiceChannel | None:
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return None
-    return channel if isinstance(channel, discord.VoiceChannel) else None
-
-
+# --- 5. Helper Methods ---
 async def get_text_channel(channel_id: int) -> discord.TextChannel | None:
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -192,36 +183,40 @@ async def get_text_channel(channel_id: int) -> discord.TextChannel | None:
     return channel if hasattr(channel, "send") else None
 
 
+async def get_voice_channel(channel_id: int) -> discord.VoiceChannel | None:
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    return channel if isinstance(channel, discord.VoiceChannel) else None
+
+
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook | None:
-    """Fetch existing relay webhook or create a new one for the channel."""
+    """Fetch cached webhook or create a new relay webhook for the text channel."""
+    if channel.id in webhook_cache:
+        return webhook_cache[channel.id]
+
     if not hasattr(channel, "webhooks"):
         return None
+
     try:
         webhooks = await channel.webhooks()
         for wh in webhooks:
             if wh.name == "LUX-NET Relay":
+                webhook_cache[channel.id] = wh
                 return wh
-        return await channel.create_webhook(name="LUX-NET Relay")
+        
+        new_webhook = await channel.create_webhook(name="LUX-NET Relay")
+        webhook_cache[channel.id] = new_webhook
+        return new_webhook
     except discord.Forbidden:
         logger.error("Missing 'Manage Webhooks' permission in channel %s (%s)", channel.name, channel.id)
         return None
     except discord.HTTPException as e:
-        logger.error("Failed to create webhook in channel %s: %s", channel.id, e)
+        logger.error("HTTP exception fetching webhook for %s: %s", channel.id, e)
         return None
-
-
-async def create_tts_file(text: str, voice: str) -> str:
-    descriptor, path = tempfile.mkstemp(prefix="discord-bridge-", suffix=".mp3")
-    os.close(descriptor)
-    try:
-        if voice == LEGACY_TTS_VOICE:
-            await asyncio.to_thread(gTTS(text=text, lang="en", timeout=(10, 30)).save, path)
-        else:
-            await edge_tts.Communicate(text=text, voice=voice).save(path)
-        return path
-    except BaseException:
-        Path(path).unlink(missing_ok=True)
-        raise
 
 
 def find_group(groups: list[set[int]], channel_id: int) -> set[int] | None:
@@ -279,44 +274,42 @@ def chunk_message_lines(lines: list[str]) -> list[str]:
     return chunks
 
 
-async def sync_guild_commands(guild: discord.Guild) -> None:
-    if guild.id in synced_guild_ids:
-        return
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        synced_guild_ids.add(guild.id)
-        logger.info("Synced %d slash commands to %s (%s)", len(synced), guild.name, guild.id)
-    except discord.HTTPException:
-        logger.exception("Could not sync slash commands to %s", guild.name)
-
-
+# --- 6. Lifecycle & Sync Events ---
 @bot.event
 async def on_ready() -> None:
     global speech_queue_preparer, speech_queue_worker
 
-    for guild in bot.guilds:
-        await sync_guild_commands(guild)
+    # Sync slash commands globally once on startup
+    try:
+        synced = await bot.tree.sync()
+        logger.info("Synced %d global slash commands.", len(synced))
+    except Exception as e:
+        logger.error("Failed to sync slash commands globally: %s", e)
+
     if speech_queue_preparer is None or speech_queue_preparer.done():
         speech_queue_preparer = asyncio.create_task(prepare_speech_queue())
     if speech_queue_worker is None or speech_queue_worker.done():
         speech_queue_worker = asyncio.create_task(process_speech_queue())
-    logger.info("Connected to Discord as %s in %d servers", bot.user, len(bot.guilds))
+
+    logger.info("Bot online as %s across %d server(s).", bot.user, len(bot.guilds))
 
 
-@bot.event
-async def on_guild_join(guild: discord.Guild) -> None:
-    await sync_guild_commands(guild)
+@bot.command(name="sync")
+@commands.is_owner()
+async def manual_sync(ctx: commands.Context) -> None:
+    """Manual trigger to force-sync slash commands if needed."""
+    synced = await bot.tree.sync()
+    await ctx.send(f"Force synced {len(synced)} slash commands globally.")
 
 
-# --- TEXT RELAY FUNCTIONALITY ---
+# --- 7. Text Relay Operations ---
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    # Ignore messages sent by THIS bot or ANY webhook to prevent loops
+    # Ignore messages sent by this bot or any webhook to stop infinite loops
     if message.author.id == bot.user.id or message.webhook_id is not None:
         return
 
-    # Handle thread channels by referencing parent channel ID
+    # Handle threads by referencing parent channel ID
     channel_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else message.channel.id
 
     group = find_group(text_relay_groups, channel_id)
@@ -340,7 +333,7 @@ async def on_message(message: discord.Message) -> None:
 
         webhook = await get_or_create_webhook(target_channel)
 
-        # Case A: Handle Native Discord Forwards (Snapshots)
+        # Handle Native Discord Message Snapshots (Forwards)
         if hasattr(message, "message_snapshots") and message.message_snapshots:
             for snapshot in message.message_snapshots:
                 snapshot_files = []
@@ -349,7 +342,7 @@ async def on_message(message: discord.Message) -> None:
                         try:
                             snapshot_files.append(await att.to_file())
                         except Exception as e:
-                            logger.error("Failed to copy snapshot attachment: %s", e)
+                            logger.error("Failed to process snapshot file: %s", e)
 
                 if webhook:
                     try:
@@ -361,16 +354,16 @@ async def on_message(message: discord.Message) -> None:
                             files=snapshot_files if snapshot_files else None,
                         )
                     except discord.HTTPException as e:
-                        logger.error("Webhook snapshot relay failed: %s", e)
+                        logger.error("Webhook snapshot forward failed: %s", e)
 
-        # Case B: Standard Messages, Attachments, Embeds & Other Bot Messages
+        # Standard Messages, Images, File Attachments & Embeds
         else:
             files_to_send = []
             for attachment in message.attachments:
                 try:
                     files_to_send.append(await attachment.to_file())
                 except Exception as e:
-                    logger.error("Failed to prepare attachment for webhook: %s", e)
+                    logger.error("Failed to attach file for webhook: %s", e)
 
             if webhook:
                 try:
@@ -382,22 +375,24 @@ async def on_message(message: discord.Message) -> None:
                         embeds=message.embeds if message.embeds else None,
                     )
                 except discord.HTTPException as e:
-                    logger.error("Failed to send webhook message to %s: %s", target_id, e)
+                    logger.error("Failed to relay message via webhook to %s: %s", target_id, e)
+                    # Clear invalid webhook cache entry if request rejected
+                    webhook_cache.pop(target_channel.id, None)
             else:
-                # Fallback if Manage Webhooks permission is missing
+                # Fallback message sending if Manage Webhooks is missing
                 try:
                     header = f"**[{discord.utils.escape_markdown(display_name)}]**"
                     content = f"{header}: {message.content}" if message.content else header
                     await target_channel.send(content=content, files=files_to_send, embeds=message.embeds)
                 except discord.HTTPException as e:
-                    logger.error("Failed fallback send to channel %s: %s", target_id, e)
+                    logger.error("Fallback message send failed to %s: %s", target_id, e)
 
     await bot.process_commands(message)
 
 
-@bot.tree.command(name="link-relay", description="Link this text channel to another server's text channel for live relays.")
+@bot.tree.command(name="link-relay", description="Link this text channel to another server's text channel.")
 @app_commands.guild_only()
-@app_commands.describe(target_channel_id="Text channel ID from the other server to pair with")
+@app_commands.describe(target_channel_id="Text channel ID from the target server to pair with")
 async def link_relay(interaction: discord.Interaction, target_channel_id: str) -> None:
     global text_relay_groups
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
@@ -406,7 +401,7 @@ async def link_relay(interaction: discord.Interaction, target_channel_id: str) -
         return
 
     if not hasattr(interaction.channel, "send"):
-        await respond(interaction, "This command must be run inside a text channel.")
+        await respond(interaction, "Run this command inside a text channel.")
         return
 
     channel_id_text = target_channel_id.strip()
@@ -416,7 +411,7 @@ async def link_relay(interaction: discord.Interaction, target_channel_id: str) -
     try:
         parsed_id = int(channel_id_text)
     except ValueError:
-        await respond(interaction, "Provide a valid numeric channel ID.")
+        await respond(interaction, "Please provide a valid numeric channel ID.")
         return
 
     source_channel = interaction.channel
@@ -426,7 +421,7 @@ async def link_relay(interaction: discord.Interaction, target_channel_id: str) -
         return
 
     if source_channel.guild.id == target_channel.guild.id:
-        await respond(interaction, "Text relay targets must be in a different server.")
+        await respond(interaction, "Text relay target channels must be in different servers.")
         return
 
     text_relay_groups = merge_groups(text_relay_groups, source_channel.id, target_channel.id)
@@ -434,7 +429,7 @@ async def link_relay(interaction: discord.Interaction, target_channel_id: str) -
 
     await respond(
         interaction,
-        f"Linked **#{source_channel.name}** to **#{target_channel.name}** in **{target_channel.guild.name}**. All messages, forwards, bot embeds, and files will now relay automatically!",
+        f"Successfully linked **#{source_channel.name}** to **#{target_channel.name}** in **{target_channel.guild.name}**! Messages, images, and files will now relay automatically.",
     )
 
 
@@ -459,18 +454,18 @@ async def unlink_relay(interaction: discord.Interaction) -> None:
     await respond(interaction, f"Removed **#{source_channel.name}** from text relaying.")
 
 
-# --- VOICE BRIDGE COMMANDS ---
+# --- 8. Voice Bridge Commands & TTS Engine ---
 @bot.tree.command(name="link-vc", description="Add a voice channel to a multi-server bridge.")
 @app_commands.guild_only()
-@app_commands.describe(target_channel_id="Voice channel ID to add to or merge with this bridge")
+@app_commands.describe(target_channel_id="Voice channel ID to pair with")
 async def link_vc(interaction: discord.Interaction, target_channel_id: str) -> None:
     global vc_bridge_groups
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
     if member is None or not member.guild_permissions.manage_guild:
-        await respond(interaction, "You need **Manage Server** permissions to change voice pairings.")
+        await respond(interaction, "You need **Manage Server** permissions to configure voice bridges.")
         return
     if member.voice is None or not isinstance(member.voice.channel, discord.VoiceChannel):
-        await respond(interaction, "Join the source voice channel before linking it.")
+        await respond(interaction, "Join the source voice channel before executing this command.")
         return
 
     channel_id_text = target_channel_id.strip()
@@ -480,16 +475,16 @@ async def link_vc(interaction: discord.Interaction, target_channel_id: str) -> N
     try:
         parsed_id = int(channel_id_text)
     except ValueError:
-        await respond(interaction, "Enter a valid voice-channel ID.")
+        await respond(interaction, "Enter a valid numeric channel ID.")
         return
 
     source_channel = member.voice.channel
     target_channel = await get_voice_channel(parsed_id)
     if not target_channel:
-        await respond(interaction, "Couldn't find that voice channel. Check its ID and my access.")
+        await respond(interaction, "Could not locate that voice channel. Verify its ID and permissions.")
         return
     if target_channel.guild.id == source_channel.guild.id:
-        await respond(interaction, "The target voice channel must be in a different server.")
+        await respond(interaction, "Target voice channels must be in a different server.")
         return
 
     vc_bridge_groups = merge_groups(vc_bridge_groups, source_channel.id, target_channel.id)
@@ -501,7 +496,7 @@ async def link_vc(interaction: discord.Interaction, target_channel_id: str) -> N
     )
 
 
-@bot.tree.command(name="unlink-vc", description="Remove your current voice channel from its bridge.")
+@bot.tree.command(name="unlink-vc", description="Remove your active voice channel from the bridge.")
 @app_commands.guild_only()
 async def unlink_vc(interaction: discord.Interaction) -> None:
     global vc_bridge_groups
@@ -510,12 +505,12 @@ async def unlink_vc(interaction: discord.Interaction) -> None:
         await respond(interaction, "You need **Manage Server** permissions.")
         return
     if member.voice is None or not isinstance(member.voice.channel, discord.VoiceChannel):
-        await respond(interaction, "Join the voice channel you want to unlink first.")
+        await respond(interaction, "Join the target voice channel first.")
         return
 
     source_channel = member.voice.channel
     if not find_group(vc_bridge_groups, source_channel.id):
-        await respond(interaction, "This voice channel isn't in a bridge group.")
+        await respond(interaction, "This voice channel isn't in an active bridge group.")
         return
 
     vc_bridge_groups = remove_from_groups(vc_bridge_groups, source_channel.id)
@@ -561,7 +556,20 @@ async def list_bridges(interaction: discord.Interaction) -> None:
         await interaction.followup.send(chunk, ephemeral=True)
 
 
-# --- TTS VOICE SPEECH PIPELINE ---
+async def create_tts_file(text: str, voice: str) -> str:
+    descriptor, path = tempfile.mkstemp(prefix="discord-bridge-", suffix=".mp3")
+    os.close(descriptor)
+    try:
+        if voice == LEGACY_TTS_VOICE:
+            await asyncio.to_thread(gTTS(text=text, lang="en", timeout=(10, 30)).save, path)
+        else:
+            await edge_tts.Communicate(text=text, voice=voice).save(path)
+        return path
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
 def take_send_slot(user_id: int) -> float:
     now = time.monotonic()
     last_sent_at = send_history.get(user_id)
@@ -661,7 +669,7 @@ async def process_speech_queue() -> None:
 @app_commands.guild_only()
 @app_commands.describe(
     message="Text to speak aloud (up to 400 characters)",
-    voice="Choose a natural voice for this announcement",
+    voice="Choose a voice for this announcement",
 )
 @app_commands.choices(voice=TTS_VOICE_CHOICES)
 async def send_bridge(
@@ -705,6 +713,7 @@ async def send_bridge(
     await respond(interaction, f"Queued for {len(target_channel_ids)} other server(s).")
 
 
+# --- 9. Execution Entry Point ---
 def main() -> None:
     token = os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")
     if not token:
@@ -712,6 +721,10 @@ def main() -> None:
 
     keep_alive()
     bot.run(token)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
