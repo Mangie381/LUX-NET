@@ -1,0 +1,5 @@
+discord.py
+edge-tts
+gTTS
+flask
+gunicorn
