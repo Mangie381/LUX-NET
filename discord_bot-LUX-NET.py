@@ -20,12 +20,12 @@ logging.basicConfig(
 logger = logging.getLogger("discord-voice-bridge")
 
 # ------------------------------------------------------------------------------
-# GLOBAL RELAY Mappings: { network_code: [channel_id, channel_id, ...] }
+# GLOBAL RELAY MAPPINGS: { network_code: [channel_id, channel_id, ...] }
 # ------------------------------------------------------------------------------
 relay_bridges = {}
 
 # ------------------------------------------------------------------------------
-# FLASK KEEP-ALIVE SERVER
+# FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
 # ------------------------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -103,17 +103,35 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    # Find active bridge network for the current channel
+    # Find active bridge networks for the current channel
     current_channel_id = message.channel.id
     target_channel_ids = []
 
     for code, channels in relay_bridges.items():
         if current_channel_id in channels:
-            # Collect all other channels linked under the same network code
             target_channel_ids.extend([cid for cid in channels if cid != current_channel_id])
 
     if not target_channel_ids:
         return
+
+    # 1. Format content with source server indicator
+    server_badge = f"[`{message.guild.name}`]"
+    raw_content = message.content or ""
+
+    # 2. Handle Replies cleanly (if replying to an earlier message)
+    reply_prefix = ""
+    if message.reference and message.reference.message_id:
+        try:
+            ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            if ref_msg:
+                snippet = ref_msg.content[:60] + "..." if len(ref_msg.content) > 60 else ref_msg.content
+                if not snippet and ref_msg.attachments:
+                    snippet = "[Attachment]"
+                reply_prefix = f"> ↩️ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
+        except Exception:
+            pass  # Fail gracefully if reference message can't be fetched
+
+    final_content = f"{reply_prefix}{server_badge} {raw_content}".strip()
 
     # Relay messages to target channels
     for target_id in set(target_channel_ids):
@@ -132,8 +150,8 @@ async def on_message(message: discord.Message):
             "allowed_mentions": discord.AllowedMentions.none(),
         }
 
-        if message.content:
-            send_kwargs["content"] = message.content
+        if final_content:
+            send_kwargs["content"] = final_content
 
         if message.embeds:
             send_kwargs["embeds"] = message.embeds
@@ -152,7 +170,7 @@ async def on_message(message: discord.Message):
 
         if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
             if message.stickers:
-                send_kwargs["content"] = f"*[Sticker: {message.stickers[0].name}]*"
+                send_kwargs["content"] = f"{server_badge} *[Sticker: {message.stickers[0].name}]*"
             else:
                 continue
 
@@ -261,6 +279,99 @@ async def send_bridge(interaction: discord.Interaction, message: str):
         ephemeral=False
     )
 
+@bot.tree.command(name="relay-info", description="View connected channels and status for a specific network code.")
+@app_commands.describe(network_code="The network code to inspect")
+async def relay_info(interaction: discord.Interaction, network_code: str):
+    code = network_code.strip().lower()
+    
+    if code not in relay_bridges or not relay_bridges[code]:
+        await interaction.response.send_message(
+            f"❌ Relay network `{code}` is not active or has no linked channels.",
+            ephemeral=True
+        )
+        return
+
+    channel_mentions = []
+    guild_count = set()
+
+    for cid in relay_bridges[code]:
+        ch = bot.get_channel(cid)
+        if ch and isinstance(ch, discord.TextChannel):
+            channel_mentions.append(f"• **#{ch.name}** ({ch.guild.name})")
+            guild_count.add(ch.guild.id)
+
+    embed = discord.Embed(
+        title=f"📡 Network Relay: `{code}`",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Connected Channels", value="\n".join(channel_mentions) if channel_mentions else "None", inline=False)
+    embed.add_field(name="Total Servers", value=str(len(guild_count)), inline=True)
+    embed.add_field(name="Total Channels", value=str(len(channel_mentions)), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="test-relay", description="Send a test ping across a linked relay network.")
+@app_commands.describe(network_code="The network code to test")
+async def test_relay(interaction: discord.Interaction, network_code: str):
+    code = network_code.strip().lower()
+
+    if code not in relay_bridges or interaction.channel.id not in relay_bridges[code]:
+        await interaction.response.send_message(
+            f"⚠️ This channel is not linked to network `{code}`.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(f"🧪 Sending test signal across relay `{code}`...", ephemeral=True)
+
+    target_ids = [cid for cid in relay_bridges[code] if cid != interaction.channel.id]
+    delivered = 0
+
+    for target_id in set(target_ids):
+        target_channel = bot.get_channel(target_id)
+        if not target_channel or not isinstance(target_channel, discord.TextChannel):
+            continue
+
+        webhook = await get_or_create_webhook(target_channel)
+        if webhook:
+            try:
+                await webhook.send(
+                    content=f"🔔 **LUX-NET Relay Test**: Connection active from **#{interaction.channel.name}** ({interaction.guild.name})!",
+                    username="LUX-NET Network Monitor",
+                    avatar_url=bot.user.display_avatar.url
+                )
+                delivered += 1
+            except Exception as e:
+                logger.error(f"Test signal failed for channel {target_id}: {e}")
+
+    await interaction.followup.send(
+        f"✅ Test complete! Signal delivered to **{delivered}/{len(set(target_ids))}** connected channels.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="clear-relays", description="Remove all active text relay links for this server.")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def clear_relays(interaction: discord.Interaction):
+    guild_channels = [ch.id for ch in interaction.guild.text_channels]
+    removed_count = 0
+
+    for code, channels in list(relay_bridges.items()):
+        before_len = len(channels)
+        relay_bridges[code] = [cid for cid in channels if cid not in guild_channels]
+        removed_count += (before_len - len(relay_bridges[code]))
+        if not relay_bridges[code]:
+            del relay_bridges[code]
+
+    await interaction.response.send_message(
+        f"🧹 Cleared **{removed_count}** active relay link(s) across **{interaction.guild.name}**.",
+        ephemeral=False
+    )
+
+@clear_relays.error
+async def clear_relays_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You need the `Manage Channels` permission to run this command.", ephemeral=True)
+
 # ------------------------------------------------------------------------------
 # MAIN RUNNER
 # ------------------------------------------------------------------------------
@@ -274,6 +385,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 if __name__ == "__main__":
     main()
