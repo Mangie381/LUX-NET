@@ -1,10 +1,4 @@
-Here is the entire, fully merged `bot.py` script containing all features: Render keep-alive server, GitHub Gist state persistence, edge-TTS voice bridging (`/send-bridge`), and text channel relaying with support for native Discord forwards, other bots, and embeds.
-
-You can copy and paste this directly into your file:
-
-```python
 from __future__ import annotations
-
 import asyncio
 import ctypes.util
 import json
