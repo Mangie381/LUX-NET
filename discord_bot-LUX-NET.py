@@ -20,9 +20,13 @@ logging.basicConfig(
 logger = logging.getLogger("discord-voice-bridge")
 
 # ------------------------------------------------------------------------------
-# GLOBAL RELAY MAPPINGS: { network_code: [channel_id, channel_id, ...] }
+# GLOBAL MAPPINGS
 # ------------------------------------------------------------------------------
+# { network_code: [channel_id, channel_id, ...] }
 relay_bridges = {}
+
+# { thread_network_code: [thread_id, thread_id, ...] }
+thread_bridges = {}
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -55,32 +59,33 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
-async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook | None:
-    """Finds an existing webhook created by the bot or creates a new one."""
-    if not isinstance(channel, discord.TextChannel):
+async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.Webhook | None:
+    """Finds an existing webhook created by the bot or creates a new one (Supports TextChannels & Threads parent channels)."""
+    target_channel = channel.parent if isinstance(channel, discord.Thread) else channel
+
+    if not isinstance(target_channel, discord.TextChannel):
         return None
 
     try:
-        webhooks = await channel.webhooks()
+        webhooks = await target_channel.webhooks()
         for wh in webhooks:
             if wh.user == bot.user:
                 return wh
-        return await channel.create_webhook(name="LUX-NET Relay Bridge")
+        return await target_channel.create_webhook(name="LUX-NET Relay Bridge")
     except discord.Forbidden:
-        logger.error(f"Missing 'Manage Webhooks' permission in #{channel.name} (ID: {channel.id})")
+        logger.error(f"Missing 'Manage Webhooks' permission in #{target_channel.name}")
         return None
     except Exception as e:
-        logger.error(f"Failed to create webhook in #{channel.name}: {e}")
+        logger.error(f"Failed to create webhook in #{target_channel.name}: {e}")
         return None
 
 # ------------------------------------------------------------------------------
-# BOT EVENTS
+# BOT EVENTS (TEXT, THREADS, & WEBHOOKS)
 # ------------------------------------------------------------------------------
 @bot.event
 async def on_ready():
     logger.info(f"Connected to Discord as {bot.user} in {len(bot.guilds)} servers")
 
-    # Clear old guild-scoped commands to eliminate duplicate slash command entries
     for guild in bot.guilds:
         try:
             bot.tree.clear_commands(guild=guild)
@@ -88,96 +93,118 @@ async def on_ready():
         except Exception as e:
             logger.error(f"Could not clear guild commands for {guild.name}: {e}")
 
-    # Clean global sync
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} global slash commands.")
     except Exception as e:
         logger.error(f"Failed to sync global slash commands: {e}")
 
+
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages and non-guild messages
-    if message.author.bot or not message.guild or not isinstance(message.channel, discord.TextChannel):
+    if message.author.bot or not message.guild:
         return
 
     await bot.process_commands(message)
 
-    # Find active bridge networks for the current channel
-    current_channel_id = message.channel.id
+    current_channel = message.channel
+    is_thread = isinstance(current_channel, discord.Thread)
+
     target_channel_ids = []
+    target_thread_ids = []
 
-    for code, channels in relay_bridges.items():
-        if current_channel_id in channels:
-            target_channel_ids.extend([cid for cid in channels if cid != current_channel_id])
+    if is_thread:
+        # Check if this thread is part of any thread network code
+        for code, threads in thread_bridges.items():
+            if current_channel.id in threads:
+                target_thread_ids.extend([tid for tid in threads if tid != current_channel.id])
+    else:
+        current_channel_id = current_channel.id
+        for code, channels in relay_bridges.items():
+            if current_channel_id in channels:
+                target_channel_ids.extend([cid for cid in channels if cid != current_channel_id])
 
-    if not target_channel_ids:
+    if not target_channel_ids and not target_thread_ids:
         return
 
-    # 1. Format content with source server indicator
-    server_badge = f"[`{message.guild.name}`]"
-    raw_content = message.content or ""
+    # 1. Construct Webhook Username with Server Location (Safe against Discord's 80-char limit)
+    author_name = message.author.display_name
+    guild_name = message.guild.name
+    webhook_username = f"{author_name} [{guild_name}]"
+    if len(webhook_username) > 80:
+        available_len = max(10, 80 - len(author_name) - 3)
+        webhook_username = f"{author_name} [{guild_name[:available_len]}]"
 
-    # 2. Handle Replies cleanly (if replying to an earlier message)
+    # 2. Handle Replies cleanly
+    raw_content = message.content or ""
     reply_prefix = ""
     if message.reference and message.reference.message_id:
         try:
-            ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            ref_msg = await current_channel.fetch_message(message.reference.message_id)
             if ref_msg:
                 snippet = ref_msg.content[:60] + "..." if len(ref_msg.content) > 60 else ref_msg.content
                 if not snippet and ref_msg.attachments:
                     snippet = "[Attachment]"
                 reply_prefix = f"> ↩️ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
         except Exception:
-            pass  # Fail gracefully if reference message can't be fetched
+            pass
 
-    final_content = f"{reply_prefix}{server_badge} {raw_content}".strip()
+    final_content = f"{reply_prefix}{raw_content}".strip()
 
-    # Relay messages to target channels
-    for target_id in set(target_channel_ids):
-        target_channel = bot.get_channel(target_id)
-        if not target_channel or not isinstance(target_channel, discord.TextChannel):
-            continue
+    # Base send parameters
+    send_kwargs = {
+        "username": webhook_username,
+        "avatar_url": message.author.display_avatar.url,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
 
-        webhook = await get_or_create_webhook(target_channel)
-        if not webhook:
-            continue
+    if final_content:
+        send_kwargs["content"] = final_content
 
-        # Build parameters dynamically (Prevents Python 3.14 len(None) crash)
-        send_kwargs = {
-            "username": message.author.display_name,
-            "avatar_url": message.author.display_avatar.url,
-            "allowed_mentions": discord.AllowedMentions.none(),
-        }
+    if message.embeds:
+        send_kwargs["embeds"] = message.embeds
 
-        if final_content:
-            send_kwargs["content"] = final_content
+    files = []
+    if message.attachments:
+        for attachment in message.attachments:
+            try:
+                file = await attachment.to_file()
+                files.append(file)
+            except Exception as e:
+                logger.error(f"Failed to process attachment: {e}")
 
-        if message.embeds:
-            send_kwargs["embeds"] = message.embeds
+    if files:
+        send_kwargs["files"] = files
 
-        files = []
-        if message.attachments:
-            for attachment in message.attachments:
-                try:
-                    file = await attachment.to_file()
-                    files.append(file)
-                except Exception as e:
-                    logger.error(f"Failed to process attachment: {e}")
+    if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
+        if message.stickers:
+            send_kwargs["content"] = f"*[Sticker: {message.stickers[0].name}]*"
+        else:
+            return
 
-        if files:
-            send_kwargs["files"] = files
+    # Broadcast to Mirrored Threads
+    if target_thread_ids:
+        for tid in set(target_thread_ids):
+            t_channel = bot.get_channel(tid)
+            if t_channel and isinstance(t_channel, discord.Thread):
+                webhook = await get_or_create_webhook(t_channel)
+                if webhook:
+                    try:
+                        await webhook.send(thread=t_channel, **send_kwargs)
+                    except Exception as e:
+                        logger.error(f"Error relaying thread message to {tid}: {e}")
 
-        if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
-            if message.stickers:
-                send_kwargs["content"] = f"{server_badge} *[Sticker: {message.stickers[0].name}]*"
-            else:
-                continue
-
-        try:
-            await webhook.send(**send_kwargs)
-        except Exception as e:
-            logger.error(f"Error relaying message to {target_channel.id}: {e}")
+    # Broadcast to Main Text Channels
+    elif target_channel_ids:
+        for target_id in set(target_channel_ids):
+            target_channel = bot.get_channel(target_id)
+            if target_channel and isinstance(target_channel, discord.TextChannel):
+                webhook = await get_or_create_webhook(target_channel)
+                if webhook:
+                    try:
+                        await webhook.send(**send_kwargs)
+                    except Exception as e:
+                        logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
 # SLASH COMMANDS
@@ -232,6 +259,76 @@ async def unlink_relay(interaction: discord.Interaction):
             ephemeral=True
         )
 
+@bot.tree.command(name="link-thread", description="Link or create a matching thread across servers using a shared thread code.")
+@app_commands.describe(
+    network_code="The unique code for this thread bridge",
+    thread_name="Name of the thread to create if it doesn't exist here yet"
+)
+async def link_thread(interaction: discord.Interaction, network_code: str, thread_name: str = None):
+    code = network_code.strip().lower()
+    current_channel = interaction.channel
+
+    # If user is inside an existing thread, link it directly
+    if isinstance(current_channel, discord.Thread):
+        thread_id = current_channel.id
+        if code not in thread_bridges:
+            thread_bridges[code] = []
+        if thread_id not in thread_bridges[code]:
+            thread_bridges[code].append(thread_id)
+        
+        await interaction.response.send_message(
+            f"🧵 Linked this thread (**{current_channel.name}**) to thread network `{code}`! ({len(thread_bridges[code])} connected)",
+            ephemeral=False
+        )
+    
+    # If user is in a regular text channel, create a brand-new thread with the requested title
+    elif isinstance(current_channel, discord.TextChannel):
+        if not thread_name:
+            await interaction.response.send_message("❌ Please provide a `thread_name` if you are running this command in a text channel to create a new thread.", ephemeral=True)
+            return
+
+        try:
+            new_thread = await current_channel.create_thread(name=thread_name, auto_archive_duration=60)
+            thread_id = new_thread.id
+
+            if code not in thread_bridges:
+                thread_bridges[code] = []
+            if thread_id not in thread_bridges[code]:
+                thread_bridges[code].append(thread_id)
+
+            await interaction.response.send_message(
+                f"🧵 Created and linked new thread **#{thread_name}** to thread network `{code}`!",
+                ephemeral=False
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to create thread: {e}", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ This command can only be used in text channels or threads.", ephemeral=True)
+
+@bot.tree.command(name="unlink-thread", description="Disconnect this thread from its active cross-server thread network.")
+async def unlink_thread(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message("❌ You must run this command inside the thread you want to unlink.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel.id
+    unlinked = False
+
+    for code, threads in list(thread_bridges.items()):
+        if thread_id in threads:
+            threads.remove(thread_id)
+            unlinked = True
+            if not threads:
+                del thread_bridges[code]
+
+    if unlinked:
+        await interaction.response.send_message(
+            f"🔌 Disconnected thread **{interaction.channel.name}** from the cross-server network.",
+            ephemeral=False
+        )
+    else:
+        await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
+
 @bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice bridge.")
 @app_commands.describe(network_code="The network code to link this voice channel to")
 async def link_vc(interaction: discord.Interaction, network_code: str):
@@ -252,7 +349,7 @@ async def unlink_vc(interaction: discord.Interaction):
         ephemeral=False
     )
 
-@bot.tree.command(name="list-bridges", description="List all active text and voice bridge connections.")
+@bot.tree.command(name="list-bridges", description="List all active text, thread, and voice bridge connections.")
 async def list_bridges(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🌐 LUX-NET Active Bridges",
@@ -263,10 +360,18 @@ async def list_bridges(interaction: discord.Interaction):
     if relay_bridges:
         text_summary = ""
         for code, channels in relay_bridges.items():
-            text_summary += f"• **`{code}`**: {len(channels)} channel(s) connected\n"
+            text_summary += f"• **`{code}`**: {len(channels)} channel(s)\n"
         embed.add_field(name="Text Relays", value=text_summary, inline=False)
     else:
         embed.add_field(name="Text Relays", value="No active text relays linked.", inline=False)
+
+    if thread_bridges:
+        thread_summary = ""
+        for code, threads in thread_bridges.items():
+            thread_summary += f"• **`{code}`**: {len(threads)} thread(s)\n"
+        embed.add_field(name="Thread Relays", value=thread_summary, inline=False)
+    else:
+        embed.add_field(name="Thread Relays", value="No active thread bridges linked.", inline=False)
 
     embed.add_field(name="Voice Bridges", value="No active voice bridges connected.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -284,29 +389,22 @@ async def send_bridge(interaction: discord.Interaction, message: str):
 async def relay_info(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
     
-    if code not in relay_bridges or not relay_bridges[code]:
+    if code not in relay_bridges and code not in thread_bridges:
         await interaction.response.send_message(
-            f"❌ Relay network `{code}` is not active or has no linked channels.",
+            f"❌ Network code `{code}` is not active.",
             ephemeral=True
         )
         return
 
-    channel_mentions = []
-    guild_count = set()
+    embed = discord.Embed(title=f"📡 Network Info: `{code}`", color=discord.Color.green())
 
-    for cid in relay_bridges[code]:
-        ch = bot.get_channel(cid)
-        if ch and isinstance(ch, discord.TextChannel):
-            channel_mentions.append(f"• **#{ch.name}** ({ch.guild.name})")
-            guild_count.add(ch.guild.id)
+    if code in relay_bridges:
+        ch_mentions = [f"• <#{cid}>" for cid in relay_bridges[code] if bot.get_channel(cid)]
+        embed.add_field(name="Text Channels", value="\n".join(ch_mentions) if ch_mentions else "None", inline=False)
 
-    embed = discord.Embed(
-        title=f"📡 Network Relay: `{code}`",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="Connected Channels", value="\n".join(channel_mentions) if channel_mentions else "None", inline=False)
-    embed.add_field(name="Total Servers", value=str(len(guild_count)), inline=True)
-    embed.add_field(name="Total Channels", value=str(len(channel_mentions)), inline=True)
+    if code in thread_bridges:
+        th_mentions = [f"• <#{tid}>" for tid in thread_bridges[code] if bot.get_channel(tid)]
+        embed.add_field(name="Threads", value="\n".join(th_mentions) if th_mentions else "None", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -315,39 +413,40 @@ async def relay_info(interaction: discord.Interaction, network_code: str):
 async def test_relay(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
 
-    if code not in relay_bridges or interaction.channel.id not in relay_bridges[code]:
-        await interaction.response.send_message(
-            f"⚠️ This channel is not linked to network `{code}`.",
-            ephemeral=True
-        )
+    if code not in relay_bridges and code not in thread_bridges:
+        await interaction.response.send_message(f"⚠️ Network `{code}` is not active.", ephemeral=True)
         return
 
-    await interaction.response.send_message(f"🧪 Sending test signal across relay `{code}`...", ephemeral=True)
+    await interaction.response.send_message(f"🧪 Sending test signal across network `{code}`...", ephemeral=True)
 
-    target_ids = [cid for cid in relay_bridges[code] if cid != interaction.channel.id]
+    # Gather target IDs
+    targets = []
+    if code in relay_bridges and interaction.channel.id in relay_bridges[code]:
+        targets = [cid for cid in relay_bridges[code] if cid != interaction.channel.id]
+    elif code in thread_bridges and interaction.channel.id in thread_bridges[code]:
+        targets = [tid for tid in thread_bridges[code] if tid != interaction.channel.id]
+
     delivered = 0
-
-    for target_id in set(target_ids):
+    for target_id in set(targets):
         target_channel = bot.get_channel(target_id)
-        if not target_channel or not isinstance(target_channel, discord.TextChannel):
-            continue
+        if target_channel:
+            webhook = await get_or_create_webhook(target_channel)
+            if webhook:
+                try:
+                    kwargs = {
+                        "content": f"🔔 **LUX-NET Test**: Active from **{interaction.channel.name}** ({interaction.guild.name})!",
+                        "username": "LUX-NET Network Monitor",
+                        "avatar_url": bot.user.display_avatar.url
+                    }
+                    if isinstance(target_channel, discord.Thread):
+                        kwargs["thread"] = target_channel
+                    
+                    await webhook.send(**kwargs)
+                    delivered += 1
+                except Exception as e:
+                    logger.error(f"Test signal failed for {target_id}: {e}")
 
-        webhook = await get_or_create_webhook(target_channel)
-        if webhook:
-            try:
-                await webhook.send(
-                    content=f"🔔 **LUX-NET Relay Test**: Connection active from **#{interaction.channel.name}** ({interaction.guild.name})!",
-                    username="LUX-NET Network Monitor",
-                    avatar_url=bot.user.display_avatar.url
-                )
-                delivered += 1
-            except Exception as e:
-                logger.error(f"Test signal failed for channel {target_id}: {e}")
-
-    await interaction.followup.send(
-        f"✅ Test complete! Signal delivered to **{delivered}/{len(set(target_ids))}** connected channels.",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"✅ Test complete! Delivered to **{delivered}** target(s).", ephemeral=True)
 
 @bot.tree.command(name="clear-relays", description="Remove all active text relay links for this server.")
 @app_commands.checks.has_permissions(manage_channels=True)
@@ -363,7 +462,7 @@ async def clear_relays(interaction: discord.Interaction):
             del relay_bridges[code]
 
     await interaction.response.send_message(
-        f"🧹 Cleared **{removed_count}** active relay link(s) across **{interaction.guild.name}**.",
+        f"🧹 Cleared **{removed_count}** active text relay link(s) for this server.",
         ephemeral=False
     )
 
@@ -383,7 +482,5 @@ def main():
 
     bot.run(token)
 
-if __name__ == "__main__":
-    main()
 if __name__ == "__main__":
     main()
