@@ -720,11 +720,15 @@ async def send_bridge(
 
 
 def main() -> None:
-    token = os.environ.get("DISCORD_BOT_TOKEN")
+    # Check for DISCORD_TOKEN first (or fall back to DISCORD_BOT_TOKEN)
+    token = os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")
+    
     if not token:
         raise SystemExit(
-            "Missing DISCORD_BOT_TOKEN. Add a newly regenerated bot token to Replit Secrets."
+            "Missing DISCORD_TOKEN environment variable in Render."
         )
+    
+    keep_alive()  # Runs the HTTP server so Render health checks don't time out
     bot.run(token)
 
 
