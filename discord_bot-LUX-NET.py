@@ -23,8 +23,17 @@ logger = logging.getLogger("discord-voice-bridge")
 # ------------------------------------------------------------------------------
 # DATABASE SETUP & HELPERS (PERSISTENT STORAGE)
 # ------------------------------------------------------------------------------
+# Automatically use Render's persistent disk path if available, else local file
+if os.environ.get("RENDER"):
+    DB_DIR = "/var/data"
+    if not os.path.exists(DB_DIR):
+        os.makedirs(DB_DIR, exist_ok=True)
+    DB_PATH = os.path.join(DB_DIR, "bridges.db")
+else:
+    DB_PATH = "bridges.db"
+
 def init_db():
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS text_relays (
@@ -44,7 +53,7 @@ def init_db():
 init_db()
 
 def add_link(table: str, code: str, item_id: int):
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     col = "channel_id" if table == "text_relays" else "thread_id"
     cursor.execute(f"SELECT 1 FROM {table} WHERE network_code = ? AND {col} = ?", (code, item_id))
@@ -54,7 +63,7 @@ def add_link(table: str, code: str, item_id: int):
     conn.close()
 
 def remove_link(table: str, code: str, item_id: int):
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     col = "channel_id" if table == "text_relays" else "thread_id"
     cursor.execute(f"DELETE FROM {table} WHERE network_code = ? AND {col} = ?", (code, item_id))
@@ -62,7 +71,7 @@ def remove_link(table: str, code: str, item_id: int):
     conn.close()
 
 def get_links(table: str, code: str):
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     col = "channel_id" if table == "text_relays" else "thread_id"
     cursor.execute(f"SELECT {col} FROM {table} WHERE network_code = ?", (code,))
@@ -155,7 +164,7 @@ async def on_message(message: discord.Message):
     target_channel_ids = []
     target_thread_ids = []
 
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     if is_thread:
@@ -194,7 +203,7 @@ async def on_message(message: discord.Message):
                 snippet = ref_msg.content[:60] + "..." if len(ref_msg.content) > 60 else ref_msg.content
                 if not snippet and ref_msg.attachments:
                     snippet = "[Attachment]"
-                reply_prefix = f"> ↩️ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
+                reply_prefix = f"> ↩️️ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
         except Exception:
             pass
 
@@ -282,7 +291,7 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
 async def unlink_relay(interaction: discord.Interaction):
     channel_id = interaction.channel.id
     
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT network_code FROM text_relays WHERE channel_id = ?", (channel_id,))
     codes = [row[0] for row in cursor.fetchall()]
@@ -345,7 +354,7 @@ async def unlink_thread(interaction: discord.Interaction):
 
     thread_id = interaction.channel.id
     
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT network_code FROM thread_relays WHERE thread_id = ?", (thread_id,))
     codes = [row[0] for row in cursor.fetchall()]
@@ -383,7 +392,7 @@ async def unlink_vc(interaction: discord.Interaction):
 
 @bot.tree.command(name="list-bridges", description="List all active text, thread, and voice bridge connections.")
 async def list_bridges(interaction: discord.Interaction):
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("SELECT DISTINCT network_code FROM text_relays")
@@ -502,7 +511,7 @@ async def test_relay(interaction: discord.Interaction, network_code: str):
 async def clear_relays(interaction: discord.Interaction):
     guild_channels = {ch.id for ch in interaction.guild.text_channels}
     
-    conn = sqlite3.connect("bridges.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT network_code, channel_id FROM text_relays")
     rows = cursor.fetchall()
