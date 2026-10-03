@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import logging
+import sqlite3
 from threading import Thread
 
 import discord
@@ -20,13 +21,54 @@ logging.basicConfig(
 logger = logging.getLogger("discord-voice-bridge")
 
 # ------------------------------------------------------------------------------
-# GLOBAL MAPPINGS
+# DATABASE SETUP & HELPERS (PERSISTENT STORAGE)
 # ------------------------------------------------------------------------------
-# { network_code: [channel_id, channel_id, ...] }
-relay_bridges = {}
+def init_db():
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS text_relays (
+            network_code TEXT,
+            channel_id INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS thread_relays (
+            network_code TEXT,
+            thread_id INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# { thread_network_code: [thread_id, thread_id, ...] }
-thread_bridges = {}
+init_db()
+
+def add_link(table: str, code: str, item_id: int):
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    col = "channel_id" if table == "text_relays" else "thread_id"
+    cursor.execute(f"SELECT 1 FROM {table} WHERE network_code = ? AND {col} = ?", (code, item_id))
+    if not cursor.fetchone():
+        cursor.execute(f"INSERT INTO {table} (network_code, {col}) VALUES (?, ?)", (code, item_id))
+        conn.commit()
+    conn.close()
+
+def remove_link(table: str, code: str, item_id: int):
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    col = "channel_id" if table == "text_relays" else "thread_id"
+    cursor.execute(f"DELETE FROM {table} WHERE network_code = ? AND {col} = ?", (code, item_id))
+    conn.commit()
+    conn.close()
+
+def get_links(table: str, code: str):
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    col = "channel_id" if table == "text_relays" else "thread_id"
+    cursor.execute(f"SELECT {col} FROM {table} WHERE network_code = ?", (code,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -113,21 +155,28 @@ async def on_message(message: discord.Message):
     target_channel_ids = []
     target_thread_ids = []
 
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+
     if is_thread:
-        # Check if this thread is part of any thread network code
-        for code, threads in thread_bridges.items():
-            if current_channel.id in threads:
-                target_thread_ids.extend([tid for tid in threads if tid != current_channel.id])
+        cursor.execute("SELECT network_code FROM thread_relays WHERE thread_id = ?", (current_channel.id,))
+        codes = [row[0] for row in cursor.fetchall()]
+        for code in codes:
+            cursor.execute("SELECT thread_id FROM thread_relays WHERE network_code = ? AND thread_id != ?", (code, current_channel.id))
+            target_thread_ids.extend([row[0] for row in cursor.fetchall()])
     else:
-        current_channel_id = current_channel.id
-        for code, channels in relay_bridges.items():
-            if current_channel_id in channels:
-                target_channel_ids.extend([cid for cid in channels if cid != current_channel_id])
+        cursor.execute("SELECT network_code FROM text_relays WHERE channel_id = ?", (current_channel.id,))
+        codes = [row[0] for row in cursor.fetchall()]
+        for code in codes:
+            cursor.execute("SELECT channel_id FROM text_relays WHERE network_code = ? AND channel_id != ?", (code, current_channel.id))
+            target_channel_ids.extend([row[0] for row in cursor.fetchall()])
+    
+    conn.close()
 
     if not target_channel_ids and not target_thread_ids:
         return
 
-    # 1. Construct Webhook Username with Server Location (Safe against Discord's 80-char limit)
+    # 1. Construct Webhook Username with Server Location
     author_name = message.author.display_name
     guild_name = message.guild.name
     webhook_username = f"{author_name} [{guild_name}]"
@@ -220,35 +269,28 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
     channel_id = interaction.channel.id
     code = network_code.strip().lower()
 
-    if code not in relay_bridges:
-        relay_bridges[code] = []
+    add_link("text_relays", code, channel_id)
+    channels = get_links("text_relays", code)
 
-    if channel_id not in relay_bridges[code]:
-        relay_bridges[code].append(channel_id)
-        await interaction.response.send_message(
-            f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! "
-            f"({len(relay_bridges[code])} channels currently connected)",
-            ephemeral=False
-        )
-    else:
-        await interaction.response.send_message(
-            f"⚠️ **#{interaction.channel.name}** is already linked to network `{code}`.",
-            ephemeral=True
-        )
+    await interaction.response.send_message(
+        f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! "
+        f"({len(channels)} channels currently connected)",
+        ephemeral=False
+    )
 
 @bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
 async def unlink_relay(interaction: discord.Interaction):
     channel_id = interaction.channel.id
-    unlinked = False
+    
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT network_code FROM text_relays WHERE channel_id = ?", (channel_id,))
+    codes = [row[0] for row in cursor.fetchall()]
+    conn.close()
 
-    for code, channels in list(relay_bridges.items()):
-        if channel_id in channels:
-            channels.remove(channel_id)
-            unlinked = True
-            if not channels:
-                del relay_bridges[code]
-
-    if unlinked:
+    if codes:
+        for code in codes:
+            remove_link("text_relays", code, channel_id)
         await interaction.response.send_message(
             f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
             ephemeral=False
@@ -268,20 +310,14 @@ async def link_thread(interaction: discord.Interaction, network_code: str, threa
     code = network_code.strip().lower()
     current_channel = interaction.channel
 
-    # If user is inside an existing thread, link it directly
     if isinstance(current_channel, discord.Thread):
-        thread_id = current_channel.id
-        if code not in thread_bridges:
-            thread_bridges[code] = []
-        if thread_id not in thread_bridges[code]:
-            thread_bridges[code].append(thread_id)
+        add_link("thread_relays", code, current_channel.id)
+        threads = get_links("thread_relays", code)
         
         await interaction.response.send_message(
-            f"🧵 Linked this thread (**{current_channel.name}**) to thread network `{code}`! ({len(thread_bridges[code])} connected)",
+            f"🧵 Linked this thread (**{current_channel.name}**) to thread network `{code}`! ({len(threads)} connected)",
             ephemeral=False
         )
-    
-    # If user is in a regular text channel, create a brand-new thread with the requested title
     elif isinstance(current_channel, discord.TextChannel):
         if not thread_name:
             await interaction.response.send_message("❌ Please provide a `thread_name` if you are running this command in a text channel to create a new thread.", ephemeral=True)
@@ -289,12 +325,8 @@ async def link_thread(interaction: discord.Interaction, network_code: str, threa
 
         try:
             new_thread = await current_channel.create_thread(name=thread_name, auto_archive_duration=60)
-            thread_id = new_thread.id
-
-            if code not in thread_bridges:
-                thread_bridges[code] = []
-            if thread_id not in thread_bridges[code]:
-                thread_bridges[code].append(thread_id)
+            add_link("thread_relays", code, new_thread.id)
+            threads = get_links("thread_relays", code)
 
             await interaction.response.send_message(
                 f"🧵 Created and linked new thread **#{thread_name}** to thread network `{code}`!",
@@ -312,16 +344,16 @@ async def unlink_thread(interaction: discord.Interaction):
         return
 
     thread_id = interaction.channel.id
-    unlinked = False
+    
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT network_code FROM thread_relays WHERE thread_id = ?", (thread_id,))
+    codes = [row[0] for row in cursor.fetchall()]
+    conn.close()
 
-    for code, threads in list(thread_bridges.items()):
-        if thread_id in threads:
-            threads.remove(thread_id)
-            unlinked = True
-            if not threads:
-                del thread_bridges[code]
-
-    if unlinked:
+    if codes:
+        for code in codes:
+            remove_link("thread_relays", code, thread_id)
         await interaction.response.send_message(
             f"🔌 Disconnected thread **{interaction.channel.name}** from the cross-server network.",
             ephemeral=False
@@ -351,23 +383,35 @@ async def unlink_vc(interaction: discord.Interaction):
 
 @bot.tree.command(name="list-bridges", description="List all active text, thread, and voice bridge connections.")
 async def list_bridges(interaction: discord.Interaction):
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT DISTINCT network_code FROM text_relays")
+    text_codes = [row[0] for row in cursor.fetchall()]
+
+    cursor.execute("SELECT DISTINCT network_code FROM thread_relays")
+    thread_codes = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
     embed = discord.Embed(
         title="🌐 LUX-NET Active Bridges",
-        description="Current active network connections:",
+        description="Current active network connections (saved persistently):",
         color=discord.Color.blue()
     )
 
-    if relay_bridges:
+    if text_codes:
         text_summary = ""
-        for code, channels in relay_bridges.items():
+        for code in text_codes:
+            channels = get_links("text_relays", code)
             text_summary += f"• **`{code}`**: {len(channels)} channel(s)\n"
         embed.add_field(name="Text Relays", value=text_summary, inline=False)
     else:
         embed.add_field(name="Text Relays", value="No active text relays linked.", inline=False)
 
-    if thread_bridges:
+    if thread_codes:
         thread_summary = ""
-        for code, threads in thread_bridges.items():
+        for code in thread_codes:
+            threads = get_links("thread_relays", code)
             thread_summary += f"• **`{code}`**: {len(threads)} thread(s)\n"
         embed.add_field(name="Thread Relays", value=thread_summary, inline=False)
     else:
@@ -389,7 +433,10 @@ async def send_bridge(interaction: discord.Interaction, message: str):
 async def relay_info(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
     
-    if code not in relay_bridges and code not in thread_bridges:
+    text_channels = get_links("text_relays", code)
+    thread_channels = get_links("thread_relays", code)
+
+    if not text_channels and not thread_channels:
         await interaction.response.send_message(
             f"❌ Network code `{code}` is not active.",
             ephemeral=True
@@ -398,12 +445,12 @@ async def relay_info(interaction: discord.Interaction, network_code: str):
 
     embed = discord.Embed(title=f"📡 Network Info: `{code}`", color=discord.Color.green())
 
-    if code in relay_bridges:
-        ch_mentions = [f"• <#{cid}>" for cid in relay_bridges[code] if bot.get_channel(cid)]
+    if text_channels:
+        ch_mentions = [f"• <#{cid}>" for cid in text_channels if bot.get_channel(cid)]
         embed.add_field(name="Text Channels", value="\n".join(ch_mentions) if ch_mentions else "None", inline=False)
 
-    if code in thread_bridges:
-        th_mentions = [f"• <#{tid}>" for tid in thread_bridges[code] if bot.get_channel(tid)]
+    if thread_channels:
+        th_mentions = [f"• <#{tid}>" for tid in thread_channels if bot.get_channel(tid)]
         embed.add_field(name="Threads", value="\n".join(th_mentions) if th_mentions else "None", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -413,18 +460,20 @@ async def relay_info(interaction: discord.Interaction, network_code: str):
 async def test_relay(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
 
-    if code not in relay_bridges and code not in thread_bridges:
+    text_channels = get_links("text_relays", code)
+    thread_channels = get_links("thread_relays", code)
+
+    if not text_channels and not thread_channels:
         await interaction.response.send_message(f"⚠️ Network `{code}` is not active.", ephemeral=True)
         return
 
     await interaction.response.send_message(f"🧪 Sending test signal across network `{code}`...", ephemeral=True)
 
-    # Gather target IDs
     targets = []
-    if code in relay_bridges and interaction.channel.id in relay_bridges[code]:
-        targets = [cid for cid in relay_bridges[code] if cid != interaction.channel.id]
-    elif code in thread_bridges and interaction.channel.id in thread_bridges[code]:
-        targets = [tid for tid in thread_bridges[code] if tid != interaction.channel.id]
+    if interaction.channel.id in text_channels:
+        targets = [cid for cid in text_channels if cid != interaction.channel.id]
+    elif interaction.channel.id in thread_channels:
+        targets = [tid for tid in thread_channels if tid != interaction.channel.id]
 
     delivered = 0
     for target_id in set(targets):
@@ -451,15 +500,21 @@ async def test_relay(interaction: discord.Interaction, network_code: str):
 @bot.tree.command(name="clear-relays", description="Remove all active text relay links for this server.")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def clear_relays(interaction: discord.Interaction):
-    guild_channels = [ch.id for ch in interaction.guild.text_channels]
+    guild_channels = {ch.id for ch in interaction.guild.text_channels}
+    
+    conn = sqlite3.connect("bridges.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT network_code, channel_id FROM text_relays")
+    rows = cursor.fetchall()
+    
     removed_count = 0
-
-    for code, channels in list(relay_bridges.items()):
-        before_len = len(channels)
-        relay_bridges[code] = [cid for cid in channels if cid not in guild_channels]
-        removed_count += (before_len - len(relay_bridges[code]))
-        if not relay_bridges[code]:
-            del relay_bridges[code]
+    for code, cid in rows:
+        if cid in guild_channels:
+            cursor.execute("DELETE FROM text_relays WHERE network_code = ? AND channel_id = ?", (code, cid))
+            removed_count += 1
+            
+    conn.commit()
+    conn.close()
 
     await interaction.response.send_message(
         f"🧹 Cleared **{removed_count}** active text relay link(s) for this server.",
@@ -483,5 +538,4 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
-    main()
     main()
