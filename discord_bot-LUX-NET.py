@@ -150,7 +150,6 @@ def save_all_data(vc_groups: list[set[int]], relay_groups: list[set[int]]) -> No
 # --- Core Discord Bot Setup ---
 intents = discord.Intents.default()
 intents.voice_states = True
-intents.messages = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
@@ -311,15 +310,18 @@ async def on_guild_join(guild: discord.Guild) -> None:
 # --- TEXT RELAY FUNCTIONALITY (SUPPORTING FORWARDS, BOTS, EMBEDS, WEBHOOKS) ---
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    # Ignore messages sent by THIS bot to prevent infinite loops
-    if message.author.id == bot.user.id:
+    # Ignore messages sent by THIS bot or webhooks to prevent loops
+    if message.author.id == bot.user.id or message.webhook_id is not None:
         return
 
-    group = find_group(text_relay_groups, message.channel.id)
+    # Account for thread channels by referencing parent channel ID
+    channel_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else message.channel.id
+
+    group = find_group(text_relay_groups, channel_id)
     if not group:
         return
 
-    target_channel_ids = group - {message.channel.id}
+    target_channel_ids = group - {channel_id}
     if not target_channel_ids:
         return
 
@@ -327,7 +329,7 @@ async def on_message(message: discord.Message) -> None:
     author_name = message.author.display_name
     if message.author.bot:
         author_name += " [BOT]"
-    display_name = f"{author_name} ({message.guild.name})"
+    display_name = f"{author_name} ({message.guild.name})" if message.guild else author_name
     avatar_url = message.author.display_avatar.url if message.author.display_avatar else None
 
     for target_id in target_channel_ids:
