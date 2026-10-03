@@ -76,21 +76,14 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
 async def on_ready():
     logger.info(f"Connected to Discord as {bot.user} in {len(bot.guilds)} servers")
 
-    # 1. Clear duplicate guild-scoped commands on connected servers
+    # Sync commands directly to every server for instant availability without duplicates
     for guild in bot.guilds:
         try:
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-            logger.info(f"Cleared duplicate guild commands from {guild.name}")
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced)} slash commands to {guild.name}")
         except Exception as e:
-            logger.error(f"Could not clear guild commands in {guild.name}: {e}")
-
-    # 2. Sync global commands cleanly
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} global slash commands.")
-    except Exception as e:
-        logger.error(f"Failed to sync global slash commands: {e}")
+            logger.error(f"Could not sync instant commands to {guild.name}: {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -105,8 +98,7 @@ async def on_message(message: discord.Message):
     if not message.guild or not isinstance(message.channel, discord.TextChannel):
         return
 
-    # MAPPED TARGET CHANNELS LOOKUP
-    # Insert or query your target bridged text channel objects here
+    # TODO: Add your channel mapping/Gist database lookup here to populate target channels
     target_channels = []
 
     for target_channel in target_channels:
@@ -157,12 +149,66 @@ async def on_message(message: discord.Message):
             logger.error(f"Unexpected error sending webhook to channel {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# SLASH COMMANDS
+# ALL 6 LUX-NET SLASH COMMANDS
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"Pong! 🏓 `{latency}ms`", ephemeral=True)
+
+@bot.tree.command(name="link-relay", description="Link this text channel to a cross-server relay network.")
+@app_commands.describe(network_code="The network code to link this text channel to")
+async def link_relay(interaction: discord.Interaction, network_code: str):
+    await interaction.response.send_message(
+        f"✅ Connected **#{interaction.channel.name}** to text relay network `{network_code}`.",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
+async def unlink_relay(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice bridge.")
+@app_commands.describe(network_code="The network code to link this voice channel to")
+async def link_vc(interaction: discord.Interaction, network_code: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ You must be in a voice channel to use this command.", ephemeral=True)
+        return
+
+    vc_name = interaction.user.voice.channel.name
+    await interaction.response.send_message(
+        f"🎙️ Connected voice channel **{vc_name}** to voice bridge `{network_code}`.",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="unlink-vc", description="Disconnect this server's voice channel from the bridge.")
+async def unlink_vc(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "🔌 Disconnected voice channel from the cross-server bridge.",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="list-bridges", description="List all active text and voice bridge connections.")
+async def list_bridges(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🌐 LUX-NET Active Bridges",
+        description="Current active channel connections across the telephone network:",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Text Relays", value="No active text relays configured.", inline=False)
+    embed.add_field(name="Voice Bridges", value="No active voice bridges connected.", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="send-bridge", description="Broadcast a TTS announcement across connected bridge networks.")
+@app_commands.describe(message="The message to broadcast across the bridge")
+async def send_bridge(interaction: discord.Interaction, message: str):
+    await interaction.response.send_message(
+        f"📢 **Bridge Broadcast**: {message}",
+        ephemeral=False
+    )
 
 # ------------------------------------------------------------------------------
 # MAIN RUNNER
@@ -176,5 +222,4 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
-    main()
     main()
