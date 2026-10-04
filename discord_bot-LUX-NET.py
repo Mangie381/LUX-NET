@@ -144,21 +144,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if member.bot:
         return
 
-    # Check Code-based VC bridges or Direct ID VC bridges when someone joins a VC
     if after.channel:
         joined_vc_id = after.channel.id
-        
-        codes_to_check = []
         try:
-            # 1. Check code-based VC table
-            res = supabase.table("vc_code_relays").select("network_code").eq("vc_id", joined_vc_id).execute()
-            codes_to_check.extend([row["network_code"] for row in res.data])
-
-            # 2. Check direct bidirectional VC pairs table
-            direct_res = supabase.table("vc_direct_relays").select("vc_b").eq("vc_a", joined_vc_id).execute()
-            codes_to_check.extend([row["vc_b"] for row in direct_res.data])
-            direct_res_rev = supabase.table("vc_direct_relays").select("vc_a").eq("vc_b", joined_vc_id).execute()
-            codes_to_check.extend([row["vc_a"] for row in direct_res_rev.data])
+            supabase.table("vc_code_relays").select("network_code").eq("vc_id", joined_vc_id).execute()
         except Exception as e:
             logger.error(f"Error checking VC bridge database: {e}")
 
@@ -382,7 +371,7 @@ async def unlink_thread(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# NEW VOICE CHANNEL BRIDGING COMMANDS (CODE-BASED & DIRECT ID)
+# VOICE CHANNEL BRIDGING COMMANDS (CODE-BASED & DIRECT ID)
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="link-vc-code", description="Link your current voice channel to a multi-VC bridge network code.")
 @app_commands.describe(network_code="Shared code name to bridge multiple voice channels together")
@@ -439,7 +428,6 @@ async def link_vc_direct(interaction: discord.Interaction, target_vc_id: str):
         return
 
     try:
-        # Check if direct link entry already exists bidirectionally
         existing = (
             supabase.table("vc_direct_relays")
             .select("*")
@@ -481,7 +469,7 @@ async def unlink_vc_direct(interaction: discord.Interaction, target_vc_id: str):
         await interaction.response.send_message(f"❌ Error unlinking direct VC bridge: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# INTERACTIVE YOUTUBE & SEARCH COMMANDS
+# INTERACTIVE YOUTUBE & SEARCH COMMANDS (WITH DUCKDUCKGO FALLBACK)
 # ------------------------------------------------------------------------------
 class YouTubeSelectView(discord.ui.View):
     def __init__(self, entries):
@@ -516,27 +504,40 @@ class YouTubeDropdown(discord.ui.Select):
 async def play(interaction: discord.Interaction, search: str):
     await interaction.response.defer(ephemeral=True)
 
+    entries = []
     try:
         search_opts = {
             'extract_flat': True,
             'default_search': 'ytsearch5',
             'quiet': True,
         }
-        
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(search, download=False))
-        
         entries = data.get('entries', [])
-        if not entries:
-            await interaction.followup.send(f"⚠️ No YouTube videos found for `{search}`.", ephemeral=True)
-            return
+    except Exception:
+        pass
 
-        view = YouTubeSelectView(entries)
-        await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
+    # Fallback search via DuckDuckGo if YouTube API blocks/throttles
+    if not entries:
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(f"{search} site:youtube.com/watch", max_results=5):
+                    href = r.get("href", "")
+                    if "youtube.com/watch" in href:
+                        entries.append({
+                            'title': r.get("title", "YouTube Video"),
+                            'uploader': "Web Result",
+                            'webpage_url': href
+                        })
+        except Exception as e:
+            logger.error(f"Fallback search error: {e}")
 
-    except Exception as e:
-        logger.error(f"Search/Selection error: {e}")
-        await interaction.followup.send(f"❌ An error occurred while searching YouTube: {e}", ephemeral=True)
+    if not entries:
+        await interaction.followup.send(f"⚠️ Could not find any YouTube videos for `{search}` due to API restrictions. Try typing slightly different keywords.", ephemeral=True)
+        return
+
+    view = YouTubeSelectView(entries)
+    await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
 @bot.tree.command(name="search", description="Perform a fast, reliable web search via DuckDuckGo.")
 @app_commands.describe(query="What would you like to search for?")
