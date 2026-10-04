@@ -469,7 +469,7 @@ async def unlink_vc_direct(interaction: discord.Interaction, target_vc_id: str):
         await interaction.response.send_message(f"❌ Error unlinking direct VC bridge: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# INTERACTIVE YOUTUBE & SEARCH COMMANDS (WITH DUCKDUCKGO FALLBACK)
+# INTERACTIVE YOUTUBE & SEARCH COMMANDS (WITH URL & DDG FALLBACK)
 # ------------------------------------------------------------------------------
 class YouTubeSelectView(discord.ui.View):
     def __init__(self, entries):
@@ -499,41 +499,54 @@ class YouTubeDropdown(discord.ui.Select):
             ephemeral=False
         )
 
-@bot.tree.command(name="play", description="Search YouTube and select the exact video from a dropdown list.")
-@app_commands.describe(search="Search keywords for the video")
+@bot.tree.command(name="play", description="Search YouTube or paste a direct YouTube URL.")
+@app_commands.describe(search="Search keywords or paste a YouTube URL")
 async def play(interaction: discord.Interaction, search: str):
     await interaction.response.defer(ephemeral=True)
 
     entries = []
-    try:
-        search_opts = {
-            'extract_flat': True,
-            'default_search': 'ytsearch5',
-            'quiet': True,
-        }
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(search, download=False))
-        entries = data.get('entries', [])
-    except Exception:
-        pass
-
-    # Fallback search via DuckDuckGo if YouTube API blocks/throttles
-    if not entries:
+    
+    # Check if the user pasted a direct YouTube link
+    if "youtube.com/watch" in search or "youtu.be/" in search:
+        entries.append({
+            'title': 'Direct YouTube Link',
+            'uploader': 'Provided URL',
+            'webpage_url': search.strip()
+        })
+    else:
+        # Try yt-dlp search first
         try:
-            with DDGS() as ddgs:
-                for r in ddgs.text(f"{search} site:youtube.com/watch", max_results=5):
-                    href = r.get("href", "")
-                    if "youtube.com/watch" in href:
-                        entries.append({
-                            'title': r.get("title", "YouTube Video"),
-                            'uploader': "Web Result",
-                            'webpage_url': href
-                        })
-        except Exception as e:
-            logger.error(f"Fallback search error: {e}")
+            search_opts = {
+                'extract_flat': True,
+                'default_search': 'ytsearch5',
+                'quiet': True,
+            }
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(search, download=False))
+            entries = data.get('entries', [])
+        except Exception:
+            pass
+
+        # Fallback search via DuckDuckGo web scraper
+        if not entries:
+            try:
+                with DDGS() as ddgs:
+                    for r in ddgs.text(f"{search} site:youtube.com/watch", max_results=5):
+                        href = r.get("href", "")
+                        if "youtube.com/watch" in href:
+                            entries.append({
+                                'title': r.get("title", "YouTube Video"),
+                                'uploader': "Web Result",
+                                'webpage_url': href
+                            })
+            except Exception as e:
+                logger.error(f"Fallback search error: {e}")
 
     if not entries:
-        await interaction.followup.send(f"⚠️ Could not find any YouTube videos for `{search}` due to API restrictions. Try typing slightly different keywords.", ephemeral=True)
+        await interaction.followup.send(
+            f"⚠️ Could not find any videos for `{search}`. If YouTube is blocking search queries from this server's IP, try pasting the **direct YouTube URL** into the search argument instead!", 
+            ephemeral=True
+        )
         return
 
     view = YouTubeSelectView(entries)
@@ -582,4 +595,5 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
+    main()
     main()
