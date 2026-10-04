@@ -151,19 +151,31 @@ async def on_message(message: discord.Message):
         if is_thread:
             res = supabase.table("thread_relays").select("network_code").eq("thread_id", current_channel.id).execute()
             codes = [row["network_code"] for row in res.data]
+            if not codes:
+                return
             for code in codes:
                 t_res = supabase.table("thread_relays").select("thread_id").eq("network_code", code).neq("thread_id", current_channel.id).execute()
                 target_thread_ids.extend([row["thread_id"] for row in t_res.data])
         else:
             res = supabase.table("text_relays").select("network_code").eq("channel_id", current_channel.id).execute()
             codes = [row["network_code"] for row in res.data]
+            
+            if not codes:
+                logger.warning(f"Relay Debug: Channel #{current_channel.name} (ID: {current_channel.id}) sent a message, but is NOT linked to any network in Supabase!")
+                return
+
             for code in codes:
                 c_res = supabase.table("text_relays").select("channel_id").eq("network_code", code).neq("channel_id", current_channel.id).execute()
                 target_channel_ids.extend([row["channel_id"] for row in c_res.data])
     except Exception as e:
         logger.error(f"Database query error in on_message: {e}")
+        return
+
+    target_channel_ids = list(set(target_channel_ids))
+    target_thread_ids = list(set(target_thread_ids))
 
     if not target_channel_ids and not target_thread_ids:
+        logger.warning(f"Relay Debug: Channel #{current_channel.name} is linked to code(s) {codes}, but found 0 target channels to relay to!")
         return
 
     author_name = message.author.display_name
@@ -219,7 +231,7 @@ async def on_message(message: discord.Message):
             return
 
     if target_thread_ids:
-        for tid in set(target_thread_ids):
+        for tid in target_thread_ids:
             t_channel = bot.get_channel(tid)
             if t_channel and isinstance(t_channel, discord.Thread):
                 webhook = await get_or_create_webhook(t_channel)
@@ -229,8 +241,8 @@ async def on_message(message: discord.Message):
                     except Exception as e:
                         logger.error(f"Error relaying thread message to {tid}: {e}")
 
-    elif target_channel_ids:
-        for target_id in set(target_channel_ids):
+    if target_channel_ids:
+        for target_id in target_channel_ids:
             target_channel = bot.get_channel(target_id)
             if target_channel and isinstance(target_channel, discord.TextChannel):
                 webhook = await get_or_create_webhook(target_channel)
@@ -519,4 +531,5 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
+    main()
     main()
