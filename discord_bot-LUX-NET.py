@@ -118,7 +118,7 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
     try:
         webhooks = await target_channel.webhooks()
         for wh in webhooks:
-            if wh.user == bot.user:
+            if wh.user and wh.user.id == bot.user.id:
                 return wh
         return await target_channel.create_webhook(name="LUX-NET Relay Bridge")
     except discord.Forbidden:
@@ -195,16 +195,40 @@ async def on_thread_create(thread: discord.Thread):
     if not isinstance(thread.parent, discord.ForumChannel):
         return
 
-    # If this thread was just spawned by our own webhook bridge, ignore it completely to stop loops
+    # Check memory cache first
     if thread.id in RELAYED_THREAD_IDS:
-        return
-
-    if thread.owner and thread.owner.id == bot.user.id:
         return
 
     current_forum_id = thread.parent.id
 
+    if not supabase:
+        return
+
     try:
+        # Give Discord a moment to fully register the thread and its starter message
+        await asyncio.sleep(1.0)
+
+        # Fetch webhooks for this forum to identify if this thread was created by our bridge
+        try:
+            webhooks = await thread.parent.webhooks()
+            webhook_ids = {wh.id for wh in webhooks}
+        except Exception:
+            webhook_ids = set()
+
+        starter_message = None
+        async for msg in thread.history(limit=1, oldest_first=True):
+            starter_message = msg
+            break
+
+        if starter_message:
+            # If the starter message belongs to our bridge webhook or any bot, ignore it to stop loops & duplication
+            if (starter_message.webhook_id and starter_message.webhook_id in webhook_ids) or starter_message.author.bot:
+                RELAYED_THREAD_IDS.add(thread.id)
+                return
+
+        if not starter_message:
+            return
+
         res = supabase.table("forum_relays").select("network_code").eq("forum_channel_id", current_forum_id).execute()
         codes = [row["network_code"] for row in res.data]
         if not codes:
@@ -223,15 +247,6 @@ async def on_thread_create(thread: discord.Thread):
         return
 
     try:
-        await asyncio.sleep(0.5)
-        starter_message = None
-        async for msg in thread.history(limit=1, oldest_first=True):
-            starter_message = msg
-            break
-
-        if not starter_message:
-            return
-
         author = starter_message.author
         author_name = author.display_name
         guild_name = thread.guild.name
@@ -299,8 +314,11 @@ async def on_thread_create(thread: discord.Thread):
                     try:
                         sent_msg = await webhook.send(**send_kwargs)
                         if sent_msg:
-                            if sent_msg.thread:
+                            if isinstance(sent_msg.channel, discord.Thread):
+                                RELAYED_THREAD_IDS.add(sent_msg.channel.id)
+                            elif sent_msg.thread:
                                 RELAYED_THREAD_IDS.add(sent_msg.thread.id)
+                                
                             MESSAGE_MAP[starter_message.id].add((target_forum.id, sent_msg.id))
                     except Exception as e:
                         logger.error(f"Error relaying forum post to {fid}: {e}")
@@ -672,7 +690,7 @@ async def unlink_thread(interaction: discord.Interaction):
                 ephemeral=False
             )
         else:
-            await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
+            await interaction.response.send_message("⚠️️ This thread is not currently linked to any network.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
