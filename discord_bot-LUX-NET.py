@@ -469,6 +469,8 @@ async def link_forum(interaction: discord.Interaction, network_code: str, forum_
         return
 
     code = network_code.strip().lower()
+    logger.info(f"Attempting to link forum ID {target_forum.id} ({target_forum.name}) to code {code}")
+    
     add_link("forum_relays", code, target_forum.id)
     forums = get_links("forum_relays", code)
     
@@ -679,6 +681,9 @@ def main():
         sys.exit(1)
 
     bot.run(token)
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
