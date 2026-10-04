@@ -107,11 +107,11 @@ ytdl_format_options = {
     'quiet': True,
     'no_warnings': True,
     'extract_flat': False,
-    'cachedir': False,  # Disables writing cache to disk, keeping I/O clean
+    'cachedir': False,
 }
 
 ffmpeg_options = {
-    'options': '-vn -b:a 96k',  # Caps bitrate to 96k to save RAM and bandwidth
+    'options': '-vn -b:a 96k',
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -probesize 32000 -analyzeduration 0'
 }
 
@@ -439,7 +439,7 @@ async def list_bridges(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# MEMORY-OPTIMIZED YOUTUBE & SEARCH COMMANDS
+# YOUTUBE & ROBUST WEB SEARCH COMMANDS
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="play", description="Stream audio from YouTube efficiently into your voice channel.")
 @app_commands.describe(search="YouTube URL or search keywords")
@@ -464,7 +464,7 @@ async def play(interaction: discord.Interaction, search: str):
                 logger.error(f"Player error: {error}")
 
         interaction.guild.voice_client.play(player, after=after_playing)
-        await interaction.followup.send(f"🎶 Now playing (Optimized Stream): **{player.title}**")
+        await interaction.followup.send(f"🎶 Now playing: **{player.title}**")
     except Exception as e:
         logger.error(f"Playback error: {e}")
         await interaction.followup.send(f"❌ An error occurred while trying to play that video: {e}")
@@ -477,19 +477,20 @@ async def stop(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("⚠ The bot is not connected to a voice channel.", ephemeral=True)
 
-@bot.tree.command(name="search", description="Perform a fast, memory-lean web search via DuckDuckGo.")
+@bot.tree.command(name="search", description="Perform a fast, reliable web search via DuckDuckGo.")
 @app_commands.describe(query="What would you like to search for?")
 async def search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
     try:
         results = []
+        # backend="lite" prevents empty result bugs and wrapper blocks
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=5):
+            for r in ddgs.text(query, max_results=5, backend="lite"):
                 results.append(r)
 
         if not results:
-            await interaction.followup.send(f"⚠️ No results found for `{query}`.")
+            await interaction.followup.send(f"⚠️ No results found for `{query}`. Try using simpler keywords.")
             return
 
         embed = discord.Embed(
