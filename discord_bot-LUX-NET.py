@@ -22,6 +22,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("discord-voice-bridge")
 
+# Suppress noisy library logs to save CPU cycles
+logging.getLogger("yt_dlp").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ------------------------------------------------------------------------------
 # SUPABASE DATABASE SETUP & HELPERS
 # ------------------------------------------------------------------------------
@@ -94,19 +98,21 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------------------------------------------------------------------
-# YOUTUBE & AUDIO HELPER SETUP
+# MEMORY-OPTIMIZED YOUTUBE & AUDIO HELPER SETUP
 # ------------------------------------------------------------------------------
 ytdl_format_options = {
     'format': 'bestaudio/best',
     'noplaylist': True,
     'default_search': 'auto',
     'quiet': True,
+    'no_warnings': True,
     'extract_flat': False,
+    'cachedir': False,  # Disables writing cache to disk, keeping I/O clean
 }
 
 ffmpeg_options = {
-    'options': '-vn',
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+    'options': '-vn -b:a 96k',  # Caps bitrate to 96k to save RAM and bandwidth
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -probesize 32000 -analyzeduration 0'
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -157,6 +163,13 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
 @bot.event
 async def on_ready():
     logger.info(f"Connected to Discord as {bot.user} in {len(bot.guilds)} servers")
+
+    for guild in bot.guilds:
+        try:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+        except Exception as e:
+            logger.error(f"Could not clear guild commands for {guild.name}: {e}")
 
     try:
         synced = await bot.tree.sync()
@@ -282,51 +295,8 @@ async def on_message(message: discord.Message):
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# SLASH COMMANDS (HELP, RELAYS, MEDIA & UTILS)
+# SLASH COMMANDS
 # ------------------------------------------------------------------------------
-@bot.tree.command(name="help", description="Displays instructions, command guides, and setup guidelines for LUX-NET.")
-async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📖 LUX-NET Bot Guide & Setup",
-        description="Welcome to **LUX-NET**, your multi-server bridge, YouTube audio streamer, and internet search tool!",
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="💬 Cross-Server Relays",
-        value=(
-            "• `/link-relay [network_code]` — Links a text channel to a shared network.\n"
-            "• `/unlink-relay` — Disconnects the channel from relaying.\n"
-            "• `/link-thread [network_code] [thread_name]` — Links/creates a cross-server thread bridge.\n"
-            "• `/unlink-thread` — Disconnects the current thread.\n"
-            "• `/list-bridges` — Displays all active bridge networks."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🎵 YouTube Audio & 🔍 Web Search",
-        value=(
-            "• `/play [search]` — Plays audio from a YouTube URL or query in your VC.\n"
-            "• `/stop` — Stops playback and disconnects the bot from the voice channel.\n"
-            "• `/search [query]` — Queries the internet via DuckDuckGo and returns results."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚙️ Bot Setup Guide",
-        value=(
-            "1. **Discord Bot Token**: Create an application on the Discord Developer Portal, enable `Message Content`, `Guilds`, and `Voice States` intents, and set `DISCORD_TOKEN`.\n"
-            "2. **Supabase Database**: Create tables named `text_relays` and `thread_relays` with columns `network_code` and `channel_id`/`thread_id`, then provide `SUPABASE_URL` and `SUPABASE_KEY`.\n"
-            "3. **Permissions**: Ensure the bot has `Manage Webhooks` permissions in any text channels you plan to bridge.\n"
-            "4. **Hosting**: Host on Render (or similar platforms) using the built-in Flask keep-alive web server."
-        ),
-        inline=False
-    )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
@@ -350,6 +320,7 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
 @bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
 async def unlink_relay(interaction: discord.Interaction):
     channel_id = interaction.channel.id
+    
     try:
         res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
         codes = [row["network_code"] for row in res.data]
@@ -468,9 +439,9 @@ async def list_bridges(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# YOUTUBE / AUDIO PLAYBACK COMMANDS
+# MEMORY-OPTIMIZED YOUTUBE & SEARCH COMMANDS
 # ------------------------------------------------------------------------------
-@bot.tree.command(name="play", description="Play audio from a YouTube link or search query in your voice channel.")
+@bot.tree.command(name="play", description="Stream audio from YouTube efficiently into your voice channel.")
 @app_commands.describe(search="YouTube URL or search keywords")
 async def play(interaction: discord.Interaction, search: str):
     if not interaction.user.voice or not interaction.user.voice.channel:
@@ -493,23 +464,20 @@ async def play(interaction: discord.Interaction, search: str):
                 logger.error(f"Player error: {error}")
 
         interaction.guild.voice_client.play(player, after=after_playing)
-        await interaction.followup.send(f"🎶 Now playing: **{player.title}**")
+        await interaction.followup.send(f"🎶 Now playing (Optimized Stream): **{player.title}**")
     except Exception as e:
         logger.error(f"Playback error: {e}")
         await interaction.followup.send(f"❌ An error occurred while trying to play that video: {e}")
 
-@bot.tree.command(name="stop", description="Stop playback and disconnect the bot from the voice channel.")
+@bot.tree.command(name="stop", description="Stop playback, clear streams, and disconnect the bot.")
 async def stop(interaction: discord.Interaction):
     if interaction.guild.voice_client:
         await interaction.guild.voice_client.disconnect()
-        await interaction.response.send_message("⏹️ Stopped playback and left the voice channel.", ephemeral=False)
+        await interaction.response.send_message("⏹️ Stopped playback and cleared audio streams.", ephemeral=False)
     else:
         await interaction.response.send_message("⚠ The bot is not connected to a voice channel.", ephemeral=True)
 
-# ------------------------------------------------------------------------------
-# INTERNET SEARCH COMMAND
-# ------------------------------------------------------------------------------
-@bot.tree.command(name="search", description="Search the internet using DuckDuckGo.")
+@bot.tree.command(name="search", description="Perform a fast, memory-lean web search via DuckDuckGo.")
 @app_commands.describe(query="What would you like to search for?")
 async def search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
