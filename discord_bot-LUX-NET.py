@@ -100,6 +100,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Dictionary to map original message IDs to sets of mirrored webhook message IDs: { source_msg_id: { (channel_id, webhook_msg_id) } }
 MESSAGE_MAP = {}
 
+# Set to track newly created forum threads and prevent duplicate relaying loops
+PROCESSED_FORUM_THREADS = set()
+
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
@@ -194,6 +197,9 @@ async def on_thread_create(thread: discord.Thread):
 
     if thread.owner and thread.owner.id == bot.user.id:
         return
+
+    # Mark this thread as handled immediately to prevent duplicate triggers
+    PROCESSED_FORUM_THREADS.add(thread.id)
 
     current_forum_id = thread.parent.id
 
@@ -312,15 +318,24 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages, DMs, and messages sent by webhooks (prevents duplicate loops)
+    # Ignore bot messages, DMs, and webhook messages
     if message.author.bot or not message.guild or message.webhook_id:
         return
-
-    await bot.process_commands(message)
 
     current_channel = message.channel
     is_thread = isinstance(current_channel, discord.Thread)
     is_forum_thread = is_thread and isinstance(current_channel.parent, discord.ForumChannel)
+
+    # If this is the starter message of a newly created forum thread, skip it here 
+    # because on_thread_create already handled it, preventing duplicates.
+    if is_forum_thread:
+        if current_channel.id in PROCESSED_FORUM_THREADS:
+            return
+        # If it's a subsequent message inside an already created forum thread, allow it through:
+        # (We can also add it to PROCESSED_FORUM_THREADS so future messages aren't treated as starters)
+        PROCESSED_FORUM_THREADS.add(current_channel.id)
+
+    await bot.process_commands(message)
 
     target_channel_ids = []
     target_thread_ids = []
@@ -792,5 +807,5 @@ def main():
 
     bot.run(token)
 
-if __name__ ==- "__main__":
+if __name__ == "__main__":
     main()
