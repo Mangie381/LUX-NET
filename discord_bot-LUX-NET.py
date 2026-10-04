@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import logging
+import io
 from threading import Thread
 
 import discord
@@ -228,14 +229,20 @@ async def on_message(message: discord.Message):
     if message.embeds:
         send_kwargs["embeds"] = message.embeds
 
+    # Fixed Robust Attachment Relaying
     files = []
     if message.attachments:
         for attachment in message.attachments:
             try:
-                file = await attachment.to_file()
-                files.append(file)
+                # Read file bytes into memory to bypass expiring CDN URLs safely
+                file_bytes = await attachment.read()
+                file_obj = discord.File(
+                    fp=io.BytesIO(file_bytes),
+                    filename=attachment.filename
+                )
+                files.append(file_obj)
             except Exception as e:
-                logger.error(f"Failed to process attachment: {e}")
+                logger.error(f"Failed to process attachment {attachment.filename}: {e}")
 
     if files:
         send_kwargs["files"] = files
@@ -595,5 +602,4 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
-    main()
     main()
