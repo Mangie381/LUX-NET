@@ -94,11 +94,11 @@ intents.guilds = True
 intents.messages = True
 intents.voice_states = True
 intents.reactions = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Dictionary to map original message IDs AND mirrored webhook message IDs back to their group network:
-# { msg_id: root_message_id }
 MESSAGE_REVERSE_MAP = {}
 # { root_message_id: set((channel_id, msg_id)) }
 MESSAGE_MAP = {}
@@ -107,7 +107,6 @@ MESSAGE_MAP = {}
 RELAYED_THREAD_IDS = set()
 
 def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
-    # Find root source message id if it exists, otherwise source_msg_id is the root
     root_id = MESSAGE_REVERSE_MAP.get(source_msg_id, source_msg_id)
     
     if root_id not in MESSAGE_MAP:
@@ -176,7 +175,6 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
     emoji = reaction.emoji
 
     for channel_id, target_msg_id in mirrored_targets:
-        # Do not re-react to the same message where the reaction was originally added
         if channel_id == msg.channel.id and target_msg_id == msg.id:
             continue
 
