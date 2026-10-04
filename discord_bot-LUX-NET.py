@@ -40,55 +40,32 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def add_link(table: str, code: str, item_id: int):
     try:
-        if table == "text_relays":
-            col = "channel_id"
-        elif table == "thread_relays":
-            col = "thread_id"
-        elif table == "forum_relays":
-            col = "forum_channel_id"
-        else:
-            col = "vc_id"
-
-        existing = (
-            supabase.table(table)
-            .select("*")
-            .eq("network_code", code)
-            .eq(col, item_id)
-            .execute()
-        )
-        if not existing.data:
-            supabase.table(table).insert({"network_code": code, col: item_id}).execute()
+        col = "forum_channel_id" if table == "forum_relays" else ("channel_id" if table == "text_relays" else "thread_id")
+        
+        supabase.table(table).upsert(
+            {"network_code": code, col: item_id}, 
+            on_conflict="network_code," + col
+        ).execute()
+        logger.info(f"Successfully added/upserted {item_id} to {table} under {code}")
     except Exception as e:
-        logger.error(f"Failed to add link to Supabase ({table}): {e}")
+        logger.error(f"CRITICAL Supabase insert error in ({table}): {e}")
 
 def remove_link(table: str, code: str, item_id: int):
     try:
-        if table == "text_relays":
-            col = "channel_id"
-        elif table == "thread_relays":
-            col = "thread_id"
-        elif table == "forum_relays":
-            col = "forum_channel_id"
-        else:
-            col = "vc_id"
+        col = "forum_channel_id" if table == "forum_relays" else ("channel_id" if table == "text_relays" else "thread_id")
         supabase.table(table).delete().eq("network_code", code).eq(col, item_id).execute()
     except Exception as e:
         logger.error(f"Failed to remove link from Supabase ({table}): {e}")
 
 def get_links(table: str, code: str):
     try:
-        if table == "text_relays":
-            col = "channel_id"
-        elif table == "thread_relays":
-            col = "thread_id"
-        elif table == "forum_relays":
-            col = "forum_channel_id"
-        else:
-            col = "vc_id"
+        col = "forum_channel_id" if table == "forum_relays" else ("channel_id" if table == "text_relays" else "thread_id")
+        
         response = supabase.table(table).select(col).eq("network_code", code).execute()
+        logger.info(f"Supabase fetch response for {table} code '{code}': {response.data}")
         return [row[col] for row in response.data]
     except Exception as e:
-        logger.error(f"Failed to fetch links from Supabase ({table}): {e}")
+        logger.error(f"CRITICAL Supabase fetch error in ({table}): {e}")
         return []
 
 # ------------------------------------------------------------------------------
@@ -163,11 +140,9 @@ async def on_ready():
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
-    # Check if this thread was created inside a Forum Channel
     if not isinstance(thread.parent, discord.ForumChannel):
         return
 
-    # Prevent loop if bot created it
     if thread.owner and thread.owner.id == bot.user.id:
         return
 
@@ -243,12 +218,28 @@ async def on_message(message: discord.Message):
 
     current_channel = message.channel
     is_thread = isinstance(current_channel, discord.Thread)
+    is_forum_thread = is_thread and isinstance(current_channel.parent, discord.ForumChannel)
 
     target_channel_ids = []
     target_thread_ids = []
 
     try:
-        if is_thread:
+        if is_forum_thread:
+            current_forum_id = current_channel.parent.id
+            res = supabase.table("forum_relays").select("network_code").eq("forum_channel_id", current_forum_id).execute()
+            codes = [row["network_code"] for row in res.data]
+            if not codes:
+                return
+            for code in codes:
+                f_res = supabase.table("forum_relays").select("forum_channel_id").eq("network_code", code).neq("forum_channel_id", current_forum_id).execute()
+                forum_ids = [row["forum_channel_id"] for row in f_res.data]
+                for fid in forum_ids:
+                    f_ch = bot.get_channel(fid)
+                    if f_ch and isinstance(f_ch, discord.ForumChannel):
+                        for active_thread in f_ch.threads:
+                            if active_thread.name.lower() == current_channel.name.lower():
+                                target_thread_ids.append(active_thread.id)
+        elif is_thread:
             res = supabase.table("thread_relays").select("network_code").eq("thread_id", current_channel.id).execute()
             codes = [row["network_code"] for row in res.data]
             if not codes:
@@ -310,10 +301,9 @@ async def on_message(message: discord.Message):
     if message.embeds:
         send_kwargs["embeds"] = message.embeds
 
-    # File size safeguard (10MB limit check)
     files = []
     skipped_files = []
-    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+    MAX_FILE_SIZE = 10 * 1024 * 1024
 
     if message.attachments:
         for attachment in message.attachments:
@@ -376,6 +366,50 @@ async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"Pong! 🏓 `{latency}ms`", ephemeral=True)
 
+@bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
+@app_connections = app_commands.describe(network_code="The network code to inspect")
+async def list_bridges(interaction: discord.Interaction, network_code: str):
+    code = network_code.strip().lower()
+    await interaction.response.defer(ephemeral=True)
+
+    text_ids = get_links("text_relays", code)
+    thread_ids = get_links("thread_relays", code)
+    forum_ids = get_links("forum_relays", code)
+
+    embed = discord.Embed(title=f"🌐 Bridge Status for Network: `{code}`", color=discord.Color.blurple())
+
+    # Text Channels
+    text_desc = []
+    for cid in text_ids:
+        ch = bot.get_channel(cid)
+        if ch:
+            text_desc.append(f"• #{ch.name} (*{ch.guild.name}*)")
+        else:
+            text_desc.append(f"• ID: `{cid}` (Cached/Missing)")
+    embed.add_field(name=f"💬 Text Channels ({len(text_ids)})", value="\n".join(text_desc) if text_desc else "None", inline=False)
+
+    # Threads
+    thread_desc = []
+    for tid in thread_ids:
+        th = bot.get_channel(tid)
+        if th:
+            thread_desc.append(f"• Thread: {th.name} (*{th.guild.name}*)")
+        else:
+            thread_desc.append(f"• ID: `{tid}` (Cached/Missing)")
+    embed.add_field(name=f"🧵 Threads ({len(thread_ids)})", value="\n".join(thread_desc) if thread_desc else "None", inline=False)
+
+    # Forums
+    forum_desc = []
+    for fid in forum_ids:
+        fch = bot.get_channel(fid)
+        if fch:
+            forum_desc.append(f"• Forum: {fch.name} (*{fch.guild.name}*)")
+        else:
+            forum_desc.append(f"• ID: `{fid}` (Cached/Missing)")
+    embed.add_field(name=f"📌 Forum Channels ({len(forum_ids)})", value="\n".join(forum_desc) if forum_desc else "None", inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="link-relay", description="Link this text channel to a cross-server relay network.")
 @app_commands.describe(network_code="The network code to link this text channel to")
 async def link_relay(interaction: discord.Interaction, network_code: str):
@@ -413,25 +447,33 @@ async def unlink_relay(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking: {e}", ephemeral=True)
 
-@bot.tree.command(name="link-forum", description="Link this forum channel to a cross-server forum network.")
-@app_commands.describe(network_code="The shared network code for this forum bridge")
-async def link_forum(interaction: discord.Interaction, network_code: str):
-    current_channel = interaction.channel
-    forum_ch = None
-    if isinstance(current_channel, discord.Thread) and isinstance(current_channel.parent, discord.ForumChannel):
-        forum_ch = current_channel.parent
-    elif isinstance(current_channel, discord.ForumChannel):
-        forum_ch = current_channel
+@bot.tree.command(name="link-forum", description="Link a forum channel to a cross-server forum network.")
+@app_commands.describe(
+    network_code="The shared network code for this forum bridge",
+    forum_channel="Select the forum channel to link (optional, defaults to current channel)"
+)
+async def link_forum(interaction: discord.Interaction, network_code: str, forum_channel: discord.ForumChannel = None):
+    target_forum = forum_channel
+    if not target_forum:
+        current_channel = interaction.channel
+        if isinstance(current_channel, discord.Thread) and isinstance(current_channel.parent, discord.ForumChannel):
+            target_forum = current_channel.parent
+        elif isinstance(current_channel, discord.ForumChannel):
+            target_forum = current_channel
 
-    if not forum_ch:
-        await interaction.response.send_message("❌ Please run this command inside a forum post or directly within a Forum Channel.", ephemeral=True)
+    if not target_forum:
+        await interaction.response.send_message(
+            "❌ Please select a `forum_channel` in the option, run this inside a forum post, or use it directly in a Forum Channel.", 
+            ephemeral=True
+        )
         return
 
     code = network_code.strip().lower()
-    add_link("forum_relays", code, forum_ch.id)
+    add_link("forum_relays", code, target_forum.id)
     forums = get_links("forum_relays", code)
+    
     await interaction.response.send_message(
-        f"📌 Linked forum **{forum_ch.name}** to network `{code}`! ({len(forums)} connected)",
+        f"📌 Linked forum **{target_forum.name}** to network `{code}`! ({len(forums)} connected channels)",
         ephemeral=False
     )
 
@@ -515,101 +557,6 @@ async def unlink_thread(interaction: discord.Interaction):
             await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
-
-@bot.tree.command(name="link-vc-code", description="Link your current voice channel to a multi-VC bridge network code.")
-@app_commands.describe(network_code="Shared code name to bridge voice channels")
-async def link_vc_code(interaction: discord.Interaction, network_code: str):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
-        return
-
-    vc = interaction.user.voice.channel
-    code = network_code.strip().lower()
-
-    try:
-        add_link("vc_code_relays", code, vc.id)
-        linked_vcs = get_links("vc_code_relays", code)
-        await interaction.response.send_message(
-            f"🔊 Successfully bridged voice channel **{vc.name}** to multi-VC network `{code}`! ({len(linked_vcs)} connected VCs)",
-            ephemeral=False
-        )
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error linking voice channel: {e}", ephemeral=True)
-
-@bot.tree.command(name="unlink-vc-code", description="Unlink this voice channel from its active multi-VC network.")
-async def unlink_vc_code(interaction: discord.Interaction):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be in a voice channel to run this command.", ephemeral=True)
-        return
-
-    vc = interaction.user.voice.channel
-    try:
-        res = supabase.table("vc_code_relays").select("network_code").eq("vc_id", vc.id).execute()
-        codes = [row["network_code"] for row in res.data]
-
-        if codes:
-            for code in codes:
-                remove_link("vc_code_relays", code, vc.id)
-            await interaction.response.send_message(f"🔌 Disconnected voice channel **{vc.name}** from network.", ephemeral=False)
-        else:
-            await interaction.response.send_message("⚠️ This voice channel is not linked to any code-based VC network.", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error unlinking voice channel: {e}", ephemeral=True)
-
-@bot.tree.command(name="link-vc-direct", description="Directly bridge your current voice channel to another Voice Channel ID.")
-@app_commands.describe(target_vc_id="Target Discord Voice Channel ID")
-async def link_vc_direct(interaction: discord.Interaction, target_vc_id: str):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
-        return
-
-    current_vc = interaction.user.voice.channel
-    try:
-        target_id = int(target_vc_id.strip())
-    except ValueError:
-        await interaction.response.send_message("❌ Invalid target Voice Channel ID format.", ephemeral=True)
-        return
-
-    try:
-        existing = (
-            supabase.table("vc_direct_relays")
-            .select("*")
-            .or_(f"and(vc_a.eq.{current_vc.id},vc_b.eq.{target_id}),and(vc_a.eq.{target_id},vc_b.eq.{current_vc.id})")
-            .execute()
-        )
-
-        if not existing.data:
-            supabase.table("vc_direct_relays").insert({"vc_a": current_vc.id, "vc_b": target_id}).execute()
-
-        await interaction.response.send_message(
-            f"🔗 Successfully established a direct bridge between **{current_vc.name}** and Target VC ID `{target_id}`!",
-            ephemeral=False
-        )
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Failed to create direct VC link: {e}", ephemeral=True)
-
-@bot.tree.command(name="unlink-vc-direct", description="Remove a direct ID bridge from your voice channel.")
-@app_commands.describe(target_vc_id="Target Voice Channel ID to disconnect from")
-async def unlink_vc_direct(interaction: discord.Interaction, target_vc_id: str):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
-        return
-
-    current_vc = interaction.user.voice.channel
-    try:
-        target_id = int(target_vc_id.strip())
-    except ValueError:
-        await interaction.response.send_message("❌ Invalid target Voice Channel ID format.", ephemeral=True)
-        return
-
-    try:
-        supabase.table("vc_direct_relays").delete().or_(
-            f"and(vc_a.eq.{current_vc.id},vc_b.eq.{target_id}),and(vc_a.eq.{target_id},vc_b.eq.{current_vc.id})"
-        ).execute()
-
-        await interaction.response.send_message(f"🔌 Removed direct bridge between your voice channel and ID `{target_id}`.", ephemeral=False)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error unlinking direct VC bridge: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
 # YOUTUBE & WEB SEARCH COMMANDS
@@ -732,6 +679,9 @@ def main():
         sys.exit(1)
 
     bot.run(token)
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
