@@ -3,3 +3,4 @@ edge-tts
 gTTS
 flask
 gunicorn
+supabase
