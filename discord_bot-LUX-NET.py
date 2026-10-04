@@ -260,7 +260,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
+    # Ignore bot messages, DMs, and messages sent by webhooks (prevents bridging duplicate loops)
+    if message.author.bot or not message.guild or message.webhook_id:
         return
 
     await bot.process_commands(message)
