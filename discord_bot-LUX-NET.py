@@ -2,13 +2,13 @@ import os
 import sys
 import asyncio
 import logging
-import sqlite3
 from threading import Thread
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
+from supabase import create_client, Client
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -21,63 +21,47 @@ logging.basicConfig(
 logger = logging.getLogger("discord-voice-bridge")
 
 # ------------------------------------------------------------------------------
-# DATABASE SETUP & HELPERS (PERSISTENT STORAGE)
+# SUPABASE DATABASE SETUP & HELPERS
 # ------------------------------------------------------------------------------
-# Automatically use Render's persistent disk path if available, else local file
-if os.environ.get("RENDER"):
-    DB_DIR = "/var/data"
-    if not os.path.exists(DB_DIR):
-        os.makedirs(DB_DIR, exist_ok=True)
-    DB_PATH = os.path.join(DB_DIR, "bridges.db")
-else:
-    DB_PATH = "bridges.db"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS text_relays (
-            network_code TEXT,
-            channel_id INTEGER
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS thread_relays (
-            network_code TEXT,
-            thread_id INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.critical("SUPABASE_URL or SUPABASE_KEY environment variables are missing!")
+    sys.exit(1)
 
-init_db()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def add_link(table: str, code: str, item_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    col = "channel_id" if table == "text_relays" else "thread_id"
-    cursor.execute(f"SELECT 1 FROM {table} WHERE network_code = ? AND {col} = ?", (code, item_id))
-    if not cursor.fetchone():
-        cursor.execute(f"INSERT INTO {table} (network_code, {col}) VALUES (?, ?)", (code, item_id))
-        conn.commit()
-    conn.close()
+    try:
+        col = "channel_id" if table == "text_relays" else "thread_id"
+        existing = (
+            supabase.table(table)
+            .select("*")
+            .eq("network_code", code)
+            .eq(col, item_id)
+            .execute()
+        )
+        if not existing.data:
+            supabase.table(table).insert({"network_code": code, col: item_id}).execute()
+    except Exception as e:
+        logger.error(f"Failed to add link to Supabase: {e}")
 
 def remove_link(table: str, code: str, item_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    col = "channel_id" if table == "text_relays" else "thread_id"
-    cursor.execute(f"DELETE FROM {table} WHERE network_code = ? AND {col} = ?", (code, item_id))
-    conn.commit()
-    conn.close()
+    try:
+        col = "channel_id" if table == "text_relays" else "thread_id"
+        supabase.table(table).delete().eq("network_code", code).eq(col, item_id).execute()
+    except Exception as e:
+        logger.error(f"Failed to remove link from Supabase: {e}")
 
 def get_links(table: str, code: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    col = "channel_id" if table == "text_relays" else "thread_id"
-    cursor.execute(f"SELECT {col} FROM {table} WHERE network_code = ?", (code,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in rows]
+    try:
+        col = "channel_id" if table == "text_relays" else "thread_id"
+        response = supabase.table(table).select(col).eq("network_code", code).execute()
+        return [row[col] for row in response.data]
+    except Exception as e:
+        logger.error(f"Failed to fetch links from Supabase: {e}")
+        return []
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -111,7 +95,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # WEBHOOK HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
 async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.Webhook | None:
-    """Finds an existing webhook created by the bot or creates a new one (Supports TextChannels & Threads parent channels)."""
     target_channel = channel.parent if isinstance(channel, discord.Thread) else channel
 
     if not isinstance(target_channel, discord.TextChannel):
@@ -164,28 +147,25 @@ async def on_message(message: discord.Message):
     target_channel_ids = []
     target_thread_ids = []
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    if is_thread:
-        cursor.execute("SELECT network_code FROM thread_relays WHERE thread_id = ?", (current_channel.id,))
-        codes = [row[0] for row in cursor.fetchall()]
-        for code in codes:
-            cursor.execute("SELECT thread_id FROM thread_relays WHERE network_code = ? AND thread_id != ?", (code, current_channel.id))
-            target_thread_ids.extend([row[0] for row in cursor.fetchall()])
-    else:
-        cursor.execute("SELECT network_code FROM text_relays WHERE channel_id = ?", (current_channel.id,))
-        codes = [row[0] for row in cursor.fetchall()]
-        for code in codes:
-            cursor.execute("SELECT channel_id FROM text_relays WHERE network_code = ? AND channel_id != ?", (code, current_channel.id))
-            target_channel_ids.extend([row[0] for row in cursor.fetchall()])
-    
-    conn.close()
+    try:
+        if is_thread:
+            res = supabase.table("thread_relays").select("network_code").eq("thread_id", current_channel.id).execute()
+            codes = [row["network_code"] for row in res.data]
+            for code in codes:
+                t_res = supabase.table("thread_relays").select("thread_id").eq("network_code", code).neq("thread_id", current_channel.id).execute()
+                target_thread_ids.extend([row["thread_id"] for row in t_res.data])
+        else:
+            res = supabase.table("text_relays").select("network_code").eq("channel_id", current_channel.id).execute()
+            codes = [row["network_code"] for row in res.data]
+            for code in codes:
+                c_res = supabase.table("text_relays").select("channel_id").eq("network_code", code).neq("channel_id", current_channel.id).execute()
+                target_channel_ids.extend([row["channel_id"] for row in c_res.data])
+    except Exception as e:
+        logger.error(f"Database query error in on_message: {e}")
 
     if not target_channel_ids and not target_thread_ids:
         return
 
-    # 1. Construct Webhook Username with Server Location
     author_name = message.author.display_name
     guild_name = message.guild.name
     webhook_username = f"{author_name} [{guild_name}]"
@@ -193,7 +173,6 @@ async def on_message(message: discord.Message):
         available_len = max(10, 80 - len(author_name) - 3)
         webhook_username = f"{author_name} [{guild_name[:available_len]}]"
 
-    # 2. Handle Replies cleanly
     raw_content = message.content or ""
     reply_prefix = ""
     if message.reference and message.reference.message_id:
@@ -203,13 +182,12 @@ async def on_message(message: discord.Message):
                 snippet = ref_msg.content[:60] + "..." if len(ref_msg.content) > 60 else ref_msg.content
                 if not snippet and ref_msg.attachments:
                     snippet = "[Attachment]"
-                reply_prefix = f"> ↩️️ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
+                reply_prefix = f"> ↩ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
         except Exception:
             pass
 
     final_content = f"{reply_prefix}{raw_content}".strip()
 
-    # Base send parameters
     send_kwargs = {
         "username": webhook_username,
         "avatar_url": message.author.display_avatar.url,
@@ -240,7 +218,6 @@ async def on_message(message: discord.Message):
         else:
             return
 
-    # Broadcast to Mirrored Threads
     if target_thread_ids:
         for tid in set(target_thread_ids):
             t_channel = bot.get_channel(tid)
@@ -252,7 +229,6 @@ async def on_message(message: discord.Message):
                     except Exception as e:
                         logger.error(f"Error relaying thread message to {tid}: {e}")
 
-    # Broadcast to Main Text Channels
     elif target_channel_ids:
         for target_id in set(target_channel_ids):
             target_channel = bot.get_channel(target_id)
@@ -291,24 +267,24 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
 async def unlink_relay(interaction: discord.Interaction):
     channel_id = interaction.channel.id
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT network_code FROM text_relays WHERE channel_id = ?", (channel_id,))
-    codes = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    try:
+        res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
+        codes = [row["network_code"] for row in res.data]
 
-    if codes:
-        for code in codes:
-            remove_link("text_relays", code, channel_id)
-        await interaction.response.send_message(
-            f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
-            ephemeral=False
-        )
-    else:
-        await interaction.response.send_message(
-            f"⚠️ **#{interaction.channel.name}** is not currently linked to any relay network.",
-            ephemeral=True
-        )
+        if codes:
+            for code in codes:
+                remove_link("text_relays", code, channel_id)
+            await interaction.response.send_message(
+                f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
+                ephemeral=False
+            )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ **#{interaction.channel.name}** is not currently linked to any relay network.",
+                ephemeral=True
+            )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error unlinking: {e}", ephemeral=True)
 
 @bot.tree.command(name="link-thread", description="Link or create a matching thread across servers using a shared thread code.")
 @app_commands.describe(
@@ -354,21 +330,21 @@ async def unlink_thread(interaction: discord.Interaction):
 
     thread_id = interaction.channel.id
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT network_code FROM thread_relays WHERE thread_id = ?", (thread_id,))
-    codes = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    try:
+        res = supabase.table("thread_relays").select("network_code").eq("thread_id", thread_id).execute()
+        codes = [row["network_code"] for row in res.data]
 
-    if codes:
-        for code in codes:
-            remove_link("thread_relays", code, thread_id)
-        await interaction.response.send_message(
-            f"🔌 Disconnected thread **{interaction.channel.name}** from the cross-server network.",
-            ephemeral=False
-        )
-    else:
-        await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
+        if codes:
+            for code in codes:
+                remove_link("thread_relays", code, thread_id)
+            await interaction.response.send_message(
+                f"🔌 Disconnected thread **{interaction.channel.name}** from the cross-server network.",
+                ephemeral=False
+            )
+        else:
+            await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
 @bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice bridge.")
 @app_commands.describe(network_code="The network code to link this voice channel to")
@@ -392,19 +368,19 @@ async def unlink_vc(interaction: discord.Interaction):
 
 @bot.tree.command(name="list-bridges", description="List all active text, thread, and voice bridge connections.")
 async def list_bridges(interaction: discord.Interaction):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT DISTINCT network_code FROM text_relays")
-    text_codes = [row[0] for row in cursor.fetchall()]
+    try:
+        t_res = supabase.table("text_relays").select("network_code").execute()
+        text_codes = list(set([row["network_code"] for row in t_res.data]))
 
-    cursor.execute("SELECT DISTINCT network_code FROM thread_relays")
-    thread_codes = [row[0] for row in cursor.fetchall()]
-    conn.close()
+        th_res = supabase.table("thread_relays").select("network_code").execute()
+        thread_codes = list(set([row["network_code"] for row in th_res.data]))
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error fetching bridges: {e}", ephemeral=True)
+        return
 
     embed = discord.Embed(
         title="🌐 LUX-NET Active Bridges",
-        description="Current active network connections (saved persistently):",
+        description="Current active network connections (saved securely in Supabase):",
         color=discord.Color.blue()
     )
 
@@ -511,24 +487,20 @@ async def test_relay(interaction: discord.Interaction, network_code: str):
 async def clear_relays(interaction: discord.Interaction):
     guild_channels = {ch.id for ch in interaction.guild.text_channels}
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT network_code, channel_id FROM text_relays")
-    rows = cursor.fetchall()
-    
-    removed_count = 0
-    for code, cid in rows:
-        if cid in guild_channels:
-            cursor.execute("DELETE FROM text_relays WHERE network_code = ? AND channel_id = ?", (code, cid))
-            removed_count += 1
-            
-    conn.commit()
-    conn.close()
+    try:
+        res = supabase.table("text_relays").select("network_code, channel_id").execute()
+        removed_count = 0
+        for row in res.data:
+            if row["channel_id"] in guild_channels:
+                supabase.table("text_relays").delete().eq("network_code", row["network_code"]).eq("channel_id", row["channel_id"]).execute()
+                removed_count += 1
 
-    await interaction.response.send_message(
-        f"🧹 Cleared **{removed_count}** active text relay link(s) for this server.",
-        ephemeral=False
-    )
+        await interaction.response.send_message(
+            f"🧹 Cleared **{removed_count}** active text relay link(s) for this server.",
+            ephemeral=False
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error clearing relays: {e}", ephemeral=True)
 
 @clear_relays.error
 async def clear_relays_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
