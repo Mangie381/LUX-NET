@@ -367,7 +367,7 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! 🏓 `{latency}ms`", ephemeral=True)
 
 @bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
-@app_connections = app_commands.describe(network_code="The network code to inspect")
+@app_commands.describe(network_code="The network code to inspect")
 async def list_bridges(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
     await interaction.response.defer(ephemeral=True)
@@ -679,9 +679,6 @@ def main():
         sys.exit(1)
 
     bot.run(token)
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
