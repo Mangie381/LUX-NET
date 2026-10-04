@@ -102,7 +102,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.Webhook | None:
     target_channel = channel.parent if isinstance(channel, discord.Thread) else channel
 
-    if not isinstance(target_channel, discord.TextChannel):
+    if isinstance(target_channel, discord.Thread):
+        target_channel = target_channel.parent
+
+    if not isinstance(target_channel, (discord.TextChannel, discord.ForumChannel)):
         return None
 
     try:
@@ -176,24 +179,70 @@ async def on_thread_create(thread: discord.Thread):
         if not starter_message:
             return
 
-        author_name = starter_message.author.display_name
+        author = starter_message.author
+        author_name = author.display_name
         guild_name = thread.guild.name
         post_title = thread.name
-        post_body = starter_message.content or "[No description text]"
-        
-        relay_content = (
-            f"📌 **New Forum Post in [{guild_name}]:** `{post_title}`\n"
-            f"👤 **Author:** {author_name}\n\n"
-            f"{post_body}"
-        )
+        post_body = starter_message.content or ""
+
+        webhook_username = f"{author_name} [{guild_name}]"
+        if len(webhook_username) > 80:
+            available_len = max(10, 80 - len(author_name) - 3)
+            webhook_username = f"{author_name} [{guild_name[:available_len]}]"
+
+        avatar_url = author.display_avatar.url
+
+        files = []
+        skipped_files = []
+        MAX_FILE_SIZE = 10 * 1024 * 1024
+
+        if starter_message.attachments:
+            for attachment in starter_message.attachments:
+                if attachment.size > MAX_FILE_SIZE:
+                    skipped_files.append(attachment.filename)
+                    continue
+                try:
+                    file_bytes = await attachment.read()
+                    file_obj = discord.File(
+                        fp=io.BytesIO(file_bytes),
+                        filename=attachment.filename
+                    )
+                    files.append(file_obj)
+                except Exception as e:
+                    logger.error(f"Failed to process attachment {attachment.filename}: {e}")
+
+        if skipped_files:
+            skip_notice = f"\n*⚠ [Skipped oversized file(s): {', '.join(skipped_files)} - Exceeds Discord size limit]*"
+            post_body += skip_notice
+
+        send_kwargs = {
+            "username": webhook_username,
+            "avatar_url": avatar_url,
+            "allowed_mentions": discord.AllowedMentions.none(),
+            "thread_name": post_title[:100],
+        }
+
+        if post_body:
+            send_kwargs["content"] = post_body
+
+        if starter_message.embeds:
+            send_kwargs["embeds"] = starter_message.embeds
+
+        if files:
+            send_kwargs["files"] = files
+
+        if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
+            send_kwargs["content"] = f"*[Forum Post: {post_title}]*"
 
         for fid in target_forum_ids:
             target_forum = bot.get_channel(fid)
             if target_forum and isinstance(target_forum, discord.ForumChannel):
-                await target_forum.create_thread(
-                    name=post_title[:100],
-                    content=relay_content
-                )
+                webhook = await get_or_create_webhook(target_forum)
+                if webhook:
+                    try:
+                        await webhook.send(**send_kwargs)
+                    except Exception as e:
+                        logger.error(f"Error relaying forum post to {fid}: {e}")
     except Exception as e:
         logger.error(f"Failed to relay new forum post: {e}")
 
@@ -681,9 +730,6 @@ def main():
         sys.exit(1)
 
     bot.run(token)
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
