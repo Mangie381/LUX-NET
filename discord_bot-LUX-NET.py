@@ -93,8 +93,12 @@ intents.message_content = True
 intents.guilds = True
 intents.messages = True
 intents.voice_states = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# In-memory mapping to map mirrored message IDs for reactions: { source_message_id: { target_message_id } }
+MESSAGE_MAP = {}
 
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
@@ -122,7 +126,7 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
         return None
 
 # ------------------------------------------------------------------------------
-# BOT EVENTS (TEXT, THREADS, FORUMS, & VOICE BRIDGING)
+# BOT EVENTS (TEXT, THREADS, FORUMS, VOICE, & REACTIONS)
 # ------------------------------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -140,6 +144,58 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} global slash commands.")
     except Exception as e:
         logger.error(f"Failed to sync global slash commands: {e}")
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
+    if user.bot:
+        return
+
+    source_msg = reaction.message
+    # Check if this message ID is tracked in our bridge map
+    target_msg_ids = MESSAGE_MAP.get(source_msg.id)
+    if not target_msg_ids:
+        return
+
+    emoji = reaction.emoji
+    for t_id in target_msg_ids:
+        try:
+            # Find channel from message cache or fetch
+            for guild in bot.guilds:
+                for channel in guild.text_channels:
+                    try:
+                        t_msg = await channel.fetch_message(t_id)
+                        if t_msg:
+                            await t_msg.add_reaction(emoji)
+                            break
+                    except discord.NotFound:
+                        continue
+        except Exception as e:
+            logger.error(f"Failed to add cross-server reaction: {e}")
+
+@bot.event
+async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | discord.Member):
+    if user.bot:
+        return
+
+    source_msg = reaction.message
+    target_msg_ids = MESSAGE_MAP.get(source_msg.id)
+    if not target_msg_ids:
+        return
+
+    emoji = reaction.emoji
+    for t_id in target_msg_ids:
+        try:
+            for guild in bot.guilds:
+                for channel in guild.text_channels:
+                    try:
+                        t_msg = await channel.fetch_message(t_id)
+                        if t_msg:
+                            await t_msg.remove_reaction(emoji, bot.user)
+                            break
+                    except discord.NotFound:
+                        continue
+        except Exception as e:
+            logger.error(f"Failed to remove cross-server reaction: {e}")
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
@@ -220,6 +276,7 @@ async def on_thread_create(thread: discord.Thread):
             "avatar_url": avatar_url,
             "allowed_mentions": discord.AllowedMentions.none(),
             "thread_name": post_title[:100],
+            "wait": True
         }
 
         if post_body:
@@ -240,7 +297,11 @@ async def on_thread_create(thread: discord.Thread):
                 webhook = await get_or_create_webhook(target_forum)
                 if webhook:
                     try:
-                        await webhook.send(**send_kwargs)
+                        sent_webhook_msg = await webhook.send(**send_kwargs)
+                        if sent_webhook_msg:
+                            if starter_message.id not in MESSAGE_MAP:
+                                MESSAGE_MAP[starter_message.id] = set()
+                            MESSAGE_MAP[starter_message.id].add(sent_webhook_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying forum post to {fid}: {e}")
     except Exception as e:
@@ -343,6 +404,7 @@ async def on_message(message: discord.Message):
         "username": webhook_username,
         "avatar_url": message.author.display_avatar.url,
         "allowed_mentions": discord.AllowedMentions.none(),
+        "wait": True
     }
 
     if final_content:
@@ -386,6 +448,9 @@ async def on_message(message: discord.Message):
         else:
             return
 
+    if message.id not in MESSAGE_MAP:
+        MESSAGE_MAP[message.id] = set()
+
     if target_thread_ids:
         for tid in target_thread_ids:
             t_channel = bot.get_channel(tid)
@@ -393,7 +458,9 @@ async def on_message(message: discord.Message):
                 webhook = await get_or_create_webhook(t_channel)
                 if webhook:
                     try:
-                        await webhook.send(thread=t_channel, **send_kwargs)
+                        sent_msg = await webhook.send(thread=t_channel, **send_kwargs)
+                        if sent_msg:
+                            MESSAGE_MAP[message.id].add(sent_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying thread message to {tid}: {e}")
 
@@ -404,7 +471,9 @@ async def on_message(message: discord.Message):
                 webhook = await get_or_create_webhook(target_channel)
                 if webhook:
                     try:
-                        await webhook.send(**send_kwargs)
+                        sent_msg = await webhook.send(**send_kwargs)
+                        if sent_msg:
+                            MESSAGE_MAP[message.id].add(sent_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
