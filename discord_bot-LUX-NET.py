@@ -71,17 +71,15 @@ def get_links(table: str, code: str):
 # Persistent Message Mapping Helpers via Supabase (Replaces in-memory dicts)
 def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
     try:
-        # Check if either message is already mapped to a root group
         res = supabase.table("message_mappings").select("root_message_id").or_(f"message_id.eq.{source_msg_id},message_id.eq.{target_msg_id}").limit(1).execute()
         if res.data:
             root_id = res.data[0]["root_message_id"]
         else:
             root_id = source_msg_id
 
-        # Upsert both entries into Supabase
         supabase.table("message_mappings").upsert([
             {"root_message_id": root_id, "channel_id": target_channel_id, "message_id": target_msg_id},
-            {"root_message_id": root_id, "channel_id": source_msg_id, "message_id": source_msg_id} # self reference hook
+            {"root_message_id": root_id, "channel_id": source_msg_id, "message_id": source_msg_id}
         ], on_conflict="channel_id,message_id").execute()
     except Exception as e:
         logger.error(f"Failed to register message mapping in Supabase: {e}")
@@ -129,7 +127,6 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Set to track thread IDs that are currently being created by our webhook bridge to prevent re-triggering loops
 RELAYED_THREAD_IDS = set()
 
 # ------------------------------------------------------------------------------
@@ -198,7 +195,20 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
             if channel:
                 target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
-                    await target_msg.add_reaction(emoji)
+                    source_count = 1
+                    for r in msg.reactions:
+                        if str(r.emoji) == str(emoji):
+                            source_count = r.count
+                            break
+
+                    target_count = 0
+                    for r in target_msg.reactions:
+                        if str(r.emoji) == str(emoji):
+                            target_count = r.count
+                            break
+
+                    if source_count > target_count:
+                        await target_msg.add_reaction(emoji)
         except Exception as e:
             logger.error(f"Failed to add cross-server reaction to message {target_msg_id}: {e}")
 
@@ -223,7 +233,14 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
             if channel:
                 target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
-                    await target_msg.remove_reaction(emoji, bot.user)
+                    source_count = 0
+                    for r in msg.reactions:
+                        if str(r.emoji) == str(emoji):
+                            source_count = r.count
+                            break
+
+                    if source_count == 0:
+                        await target_msg.remove_reaction(emoji, bot.user)
         except Exception as e:
             logger.error(f"Failed to remove cross-server reaction from message {target_msg_id}: {e}")
 
