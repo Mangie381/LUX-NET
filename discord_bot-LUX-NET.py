@@ -22,7 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("discord-voice-bridge")
 
-# Suppress noisy library logs to save CPU cycles
 logging.getLogger("yt_dlp").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -40,7 +39,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def add_link(table: str, code: str, item_id: int):
     try:
-        col = "channel_id" if table == "text_relays" else "thread_id"
+        col = "channel_id" if table == "text_relays" else ("thread_id" if table == "thread_relays" else "vc_id")
         existing = (
             supabase.table(table)
             .select("*")
@@ -55,14 +54,14 @@ def add_link(table: str, code: str, item_id: int):
 
 def remove_link(table: str, code: str, item_id: int):
     try:
-        col = "channel_id" if table == "text_relays" else "thread_id"
+        col = "channel_id" if table == "text_relays" else ("thread_id" if table == "thread_relays" else "vc_id")
         supabase.table(table).delete().eq("network_code", code).eq(col, item_id).execute()
     except Exception as e:
         logger.error(f"Failed to remove link from Supabase: {e}")
 
 def get_links(table: str, code: str):
     try:
-        col = "channel_id" if table == "text_relays" else "thread_id"
+        col = "channel_id" if table == "text_relays" else ("thread_id" if table == "thread_relays" else "vc_id")
         response = supabase.table(table).select(col).eq("network_code", code).execute()
         return [row[col] for row in response.data]
     except Exception as e:
@@ -98,44 +97,6 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------------------------------------------------------------------
-# MEMORY-OPTIMIZED YOUTUBE & AUDIO HELPER SETUP
-# ------------------------------------------------------------------------------
-ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'default_search': 'auto',
-    'quiet': True,
-    'no_warnings': True,
-    'extract_flat': False,
-    'cachedir': False,
-}
-
-ffmpeg_options = {
-    'options': '-vn -b:a 96k',
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -probesize 32000 -analyzeduration 0'
-}
-
-ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
-
-class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get('title')
-        self.url = data.get('webpage_url')
-
-    @classmethod
-    async def from_url(cls, url, *, loop=None, stream=True):
-        loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-        
-        if 'entries' in data:
-            data = data['entries'][0]
-
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-
-# ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
 async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.Webhook | None:
@@ -158,7 +119,7 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
         return None
 
 # ------------------------------------------------------------------------------
-# BOT EVENTS (TEXT, THREADS, & WEBHOOKS)
+# BOT EVENTS (TEXT, THREADS, & VOICE STATE BRIDGE)
 # ------------------------------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -176,6 +137,30 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} global slash commands.")
     except Exception as e:
         logger.error(f"Failed to sync global slash commands: {e}")
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+
+    # Check Code-based VC bridges or Direct ID VC bridges when someone joins a VC
+    if after.channel:
+        joined_vc_id = after.channel.id
+        
+        codes_to_check = []
+        try:
+            # 1. Check code-based VC table
+            res = supabase.table("vc_code_relays").select("network_code").eq("vc_id", joined_vc_id).execute()
+            codes_to_check.extend([row["network_code"] for row in res.data])
+
+            # 2. Check direct bidirectional VC pairs table
+            direct_res = supabase.table("vc_direct_relays").select("vc_b").eq("vc_a", joined_vc_id).execute()
+            codes_to_check.extend([row["vc_b"] for row in direct_res.data])
+            direct_res_rev = supabase.table("vc_direct_relays").select("vc_a").eq("vc_b", joined_vc_id).execute()
+            codes_to_check.extend([row["vc_a"] for row in direct_res_rev.data])
+        except Exception as e:
+            logger.error(f"Error checking VC bridge database: {e}")
 
 
 @bot.event
@@ -295,7 +280,7 @@ async def on_message(message: discord.Message):
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# SLASH COMMANDS
+# TEXT, THREAD, & VOICE BRIDGE SLASH COMMANDS
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
@@ -320,7 +305,6 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
 @bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
 async def unlink_relay(interaction: discord.Interaction):
     channel_id = interaction.channel.id
-    
     try:
         res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
         codes = [row["network_code"] for row in res.data]
@@ -352,7 +336,6 @@ async def link_thread(interaction: discord.Interaction, network_code: str, threa
     if isinstance(current_channel, discord.Thread):
         add_link("thread_relays", code, current_channel.id)
         threads = get_links("thread_relays", code)
-        
         await interaction.response.send_message(
             f"🧵 Linked this thread (**{current_channel.name}**) to thread network `{code}`! ({len(threads)} connected)",
             ephemeral=False
@@ -366,7 +349,6 @@ async def link_thread(interaction: discord.Interaction, network_code: str, threa
             new_thread = await current_channel.create_thread(name=thread_name, auto_archive_duration=60)
             add_link("thread_relays", code, new_thread.id)
             threads = get_links("thread_relays", code)
-
             await interaction.response.send_message(
                 f"🧵 Created and linked new thread **#{thread_name}** to thread network `{code}`!",
                 ephemeral=False
@@ -383,7 +365,6 @@ async def unlink_thread(interaction: discord.Interaction):
         return
 
     thread_id = interaction.channel.id
-    
     try:
         res = supabase.table("thread_relays").select("network_code").eq("thread_id", thread_id).execute()
         codes = [row["network_code"] for row in res.data]
@@ -400,82 +381,162 @@ async def unlink_thread(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
-@bot.tree.command(name="list-bridges", description="List all active text, thread, and voice bridge connections.")
-async def list_bridges(interaction: discord.Interaction):
-    try:
-        t_res = supabase.table("text_relays").select("network_code").execute()
-        text_codes = list(set([row["network_code"] for row in t_res.data]))
-
-        th_res = supabase.table("thread_relays").select("network_code").execute()
-        thread_codes = list(set([row["network_code"] for row in th_res.data]))
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error fetching bridges: {e}", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🌐 LUX-NET Active Bridges",
-        description="Current active network connections (saved securely in Supabase):",
-        color=discord.Color.blue()
-    )
-
-    if text_codes:
-        text_summary = ""
-        for code in text_codes:
-            channels = get_links("text_relays", code)
-            text_summary += f"• **`{code}`**: {len(channels)} channel(s)\n"
-        embed.add_field(name="Text Relays", value=text_summary, inline=False)
-    else:
-        embed.add_field(name="Text Relays", value="No active text relays linked.", inline=False)
-
-    if thread_codes:
-        thread_summary = ""
-        for code in thread_codes:
-            threads = get_links("thread_relays", code)
-            thread_summary += f"• **`{code}`**: {len(threads)} thread(s)\n"
-        embed.add_field(name="Thread Relays", value=thread_summary, inline=False)
-    else:
-        embed.add_field(name="Thread Relays", value="No active thread bridges linked.", inline=False)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 # ------------------------------------------------------------------------------
-# YOUTUBE & ROBUST WEB SEARCH COMMANDS
+# NEW VOICE CHANNEL BRIDGING COMMANDS (CODE-BASED & DIRECT ID)
 # ------------------------------------------------------------------------------
-@bot.tree.command(name="play", description="Stream audio from YouTube efficiently into your voice channel.")
-@app_commands.describe(search="YouTube URL or search keywords")
-async def play(interaction: discord.Interaction, search: str):
+@bot.tree.command(name="link-vc-code", description="Link your current voice channel to a multi-VC bridge network code.")
+@app_commands.describe(network_code="Shared code name to bridge multiple voice channels together")
+async def link_vc_code(interaction: discord.Interaction, network_code: str):
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
         return
 
-    voice_channel = interaction.user.voice.channel
-    await interaction.response.defer()
+    vc = interaction.user.voice.channel
+    code = network_code.strip().lower()
 
     try:
-        if interaction.guild.voice_client is not None:
-            await interaction.guild.voice_client.move_to(voice_channel)
-        else:
-            await voice_channel.connect()
-
-        player = await YTDLSource.from_url(search, loop=bot.loop, stream=True)
-        
-        def after_playing(error):
-            if error:
-                logger.error(f"Player error: {error}")
-
-        interaction.guild.voice_client.play(player, after=after_playing)
-        await interaction.followup.send(f"🎶 Now playing: **{player.title}**")
+        add_link("vc_code_relays", code, vc.id)
+        linked_vcs = get_links("vc_code_relays", code)
+        await interaction.response.send_message(
+            f"🔊 Successfully bridged voice channel **{vc.name}** to multi-VC network `{code}`! ({len(linked_vcs)} connected VCs)",
+            ephemeral=False
+        )
     except Exception as e:
-        logger.error(f"Playback error: {e}")
-        await interaction.followup.send(f"❌ An error occurred while trying to play that video: {e}")
+        await interaction.response.send_message(f"❌ Error linking voice channel: {e}", ephemeral=True)
 
-@bot.tree.command(name="stop", description="Stop playback, clear streams, and disconnect the bot.")
-async def stop(interaction: discord.Interaction):
-    if interaction.guild.voice_client:
-        await interaction.guild.voice_client.disconnect()
-        await interaction.response.send_message("⏹️ Stopped playback and cleared audio streams.", ephemeral=False)
-    else:
-        await interaction.response.send_message("⚠ The bot is not connected to a voice channel.", ephemeral=True)
+@bot.tree.command(name="unlink-vc-code", description="Unlink this voice channel from its active multi-VC network code.")
+async def unlink_vc_code(interaction: discord.Interaction):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ You must be in a voice channel to run this command.", ephemeral=True)
+        return
+
+    vc = interaction.user.voice.channel
+    try:
+        res = supabase.table("vc_code_relays").select("network_code").eq("vc_id", vc.id).execute()
+        codes = [row["network_code"] for row in res.data]
+
+        if codes:
+            for code in codes:
+                remove_link("vc_code_relays", code, vc.id)
+            await interaction.response.send_message(f"🔌 Disconnected voice channel **{vc.name}** from multi-VC network.", ephemeral=False)
+        else:
+            await interaction.response.send_message("⚠️ This voice channel is not linked to any code-based VC network.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error unlinking voice channel: {e}", ephemeral=True)
+
+@bot.tree.command(name="link-vc-direct", description="Directly bridge your current voice channel to another specific Voice Channel ID.")
+@app_commands.describe(target_vc_id="The exact Discord Voice Channel ID of the other server/channel to connect with")
+async def link_vc_direct(interaction: discord.Interaction, target_vc_id: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
+        return
+
+    current_vc = interaction.user.voice.channel
+    try:
+        target_id = int(target_vc_id.strip())
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid target Voice Channel ID format. Must be numeric numbers.", ephemeral=True)
+        return
+
+    try:
+        # Check if direct link entry already exists bidirectionally
+        existing = (
+            supabase.table("vc_direct_relays")
+            .select("*")
+            .or_(f"and(vc_a.eq.{current_vc.id},vc_b.eq.{target_id}),and(vc_a.eq.{target_id},vc_b.eq.{current_vc.id})")
+            .execute()
+        )
+
+        if not existing.data:
+            supabase.table("vc_direct_relays").insert({"vc_a": current_vc.id, "vc_b": target_id}).execute()
+
+        await interaction.response.send_message(
+            f"🔗 Successfully established a direct bridge between **{current_vc.name}** and Target VC ID `{target_id}`!",
+            ephemeral=False
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to create direct VC link: {e}", ephemeral=True)
+
+@bot.tree.command(name="unlink-vc-direct", description="Remove a direct ID bridge from your voice channel.")
+@app_commands.describe(target_vc_id="The exact target Voice Channel ID to disconnect from")
+async def unlink_vc_direct(interaction: discord.Interaction, target_vc_id: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
+        return
+
+    current_vc = interaction.user.voice.channel
+    try:
+        target_id = int(target_vc_id.strip())
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid target Voice Channel ID format.", ephemeral=True)
+        return
+
+    try:
+        supabase.table("vc_direct_relays").delete().or_(
+            f"and(vc_a.eq.{current_vc.id},vc_b.eq.{target_id}),and(vc_a.eq.{target_id},vc_b.eq.{current_vc.id})"
+        ).execute()
+
+        await interaction.response.send_message(f"🔌 Removed direct bridge between your voice channel and ID `{target_id}`.", ephemeral=False)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error unlinking direct VC bridge: {e}", ephemeral=True)
+
+# ------------------------------------------------------------------------------
+# INTERACTIVE YOUTUBE & SEARCH COMMANDS
+# ------------------------------------------------------------------------------
+class YouTubeSelectView(discord.ui.View):
+    def __init__(self, entries):
+        super().__init__(timeout=60)
+        options = []
+        for entry in entries[:5]:
+            title = entry.get('title', 'Unknown Title')[:100]
+            uploader = entry.get('uploader', 'Unknown Channel')[:100]
+            url = entry.get('webpage_url', '')
+            options.append(
+                discord.SelectOption(
+                    label=title[:100],
+                    description=f"By: {uploader}"[:100],
+                    value=url
+                )
+            )
+        self.add_item(YouTubeDropdown(options))
+
+class YouTubeDropdown(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Select the correct video from the search...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_url = self.values[0]
+        await interaction.response.send_message(
+            f"✅ You selected: {selected_url}\n(Click the link to open and watch the full video directly!)",
+            ephemeral=False
+        )
+
+@bot.tree.command(name="play", description="Search YouTube and select the exact video from a dropdown list.")
+@app_commands.describe(search="Search keywords for the video")
+async def play(interaction: discord.Interaction, search: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        search_opts = {
+            'extract_flat': True,
+            'default_search': 'ytsearch5',
+            'quiet': True,
+        }
+        
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(search, download=False))
+        
+        entries = data.get('entries', [])
+        if not entries:
+            await interaction.followup.send(f"⚠️ No YouTube videos found for `{search}`.", ephemeral=True)
+            return
+
+        view = YouTubeSelectView(entries)
+        await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
+
+    except Exception as e:
+        logger.error(f"Search/Selection error: {e}")
+        await interaction.followup.send(f"❌ An error occurred while searching YouTube: {e}", ephemeral=True)
 
 @bot.tree.command(name="search", description="Perform a fast, reliable web search via DuckDuckGo.")
 @app_commands.describe(query="What would you like to search for?")
@@ -484,7 +545,6 @@ async def search(interaction: discord.Interaction, query: str):
 
     try:
         results = []
-        # backend="lite" prevents empty result bugs and wrapper blocks
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=5, backend="lite"):
                 results.append(r)
