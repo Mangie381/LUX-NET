@@ -9,6 +9,8 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 from supabase import create_client, Client
+import yt_dlp
+from duckduckgo_search import DDGS
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -92,6 +94,42 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------------------------------------------------------------------
+# YOUTUBE & AUDIO HELPER SETUP
+# ------------------------------------------------------------------------------
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'default_search': 'auto',
+    'quiet': True,
+    'extract_flat': False,
+}
+
+ffmpeg_options = {
+    'options': '-vn',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+}
+
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('webpage_url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=True):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
+# ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
 async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.Webhook | None:
@@ -119,13 +157,6 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
 @bot.event
 async def on_ready():
     logger.info(f"Connected to Discord as {bot.user} in {len(bot.guilds)} servers")
-
-    for guild in bot.guilds:
-        try:
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-        except Exception as e:
-            logger.error(f"Could not clear guild commands for {guild.name}: {e}")
 
     try:
         synced = await bot.tree.sync()
@@ -161,7 +192,6 @@ async def on_message(message: discord.Message):
             codes = [row["network_code"] for row in res.data]
             
             if not codes:
-                logger.warning(f"Relay Debug: Channel #{current_channel.name} (ID: {current_channel.id}) sent a message, but is NOT linked to any network in Supabase!")
                 return
 
             for code in codes:
@@ -175,7 +205,6 @@ async def on_message(message: discord.Message):
     target_thread_ids = list(set(target_thread_ids))
 
     if not target_channel_ids and not target_thread_ids:
-        logger.warning(f"Relay Debug: Channel #{current_channel.name} is linked to code(s) {codes}, but found 0 target channels to relay to!")
         return
 
     author_name = message.author.display_name
@@ -253,8 +282,51 @@ async def on_message(message: discord.Message):
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# SLASH COMMANDS
+# SLASH COMMANDS (HELP, RELAYS, MEDIA & UTILS)
 # ------------------------------------------------------------------------------
+@bot.tree.command(name="help", description="Displays instructions, command guides, and setup guidelines for LUX-NET.")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 LUX-NET Bot Guide & Setup",
+        description="Welcome to **LUX-NET**, your multi-server bridge, YouTube audio streamer, and internet search tool!",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="💬 Cross-Server Relays",
+        value=(
+            "• `/link-relay [network_code]` — Links a text channel to a shared network.\n"
+            "• `/unlink-relay` — Disconnects the channel from relaying.\n"
+            "• `/link-thread [network_code] [thread_name]` — Links/creates a cross-server thread bridge.\n"
+            "• `/unlink-thread` — Disconnects the current thread.\n"
+            "• `/list-bridges` — Displays all active bridge networks."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎵 YouTube Audio & 🔍 Web Search",
+        value=(
+            "• `/play [search]` — Plays audio from a YouTube URL or query in your VC.\n"
+            "• `/stop` — Stops playback and disconnects the bot from the voice channel.\n"
+            "• `/search [query]` — Queries the internet via DuckDuckGo and returns results."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚙️ Bot Setup Guide",
+        value=(
+            "1. **Discord Bot Token**: Create an application on the Discord Developer Portal, enable `Message Content`, `Guilds`, and `Voice States` intents, and set `DISCORD_TOKEN`.\n"
+            "2. **Supabase Database**: Create tables named `text_relays` and `thread_relays` with columns `network_code` and `channel_id`/`thread_id`, then provide `SUPABASE_URL` and `SUPABASE_KEY`.\n"
+            "3. **Permissions**: Ensure the bot has `Manage Webhooks` permissions in any text channels you plan to bridge.\n"
+            "4. **Hosting**: Host on Render (or similar platforms) using the built-in Flask keep-alive web server."
+        ),
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
@@ -278,7 +350,6 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
 @bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
 async def unlink_relay(interaction: discord.Interaction):
     channel_id = interaction.channel.id
-    
     try:
         res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
         codes = [row["network_code"] for row in res.data]
@@ -358,26 +429,6 @@ async def unlink_thread(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
-@bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice bridge.")
-@app_commands.describe(network_code="The network code to link this voice channel to")
-async def link_vc(interaction: discord.Interaction, network_code: str):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be connected to a voice channel to run this command.", ephemeral=True)
-        return
-
-    vc_name = interaction.user.voice.channel.name
-    await interaction.response.send_message(
-        f"🎙️ Connected voice channel **{vc_name}** to voice bridge `{network_code.strip().lower()}`.",
-        ephemeral=False
-    )
-
-@bot.tree.command(name="unlink-vc", description="Disconnect this server's voice channel from the bridge.")
-async def unlink_vc(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "🔌 Disconnected voice channel from the cross-server bridge.",
-        ephemeral=False
-    )
-
 @bot.tree.command(name="list-bridges", description="List all active text, thread, and voice bridge connections.")
 async def list_bridges(interaction: discord.Interaction):
     try:
@@ -414,110 +465,80 @@ async def list_bridges(interaction: discord.Interaction):
     else:
         embed.add_field(name="Thread Relays", value="No active thread bridges linked.", inline=False)
 
-    embed.add_field(name="Voice Bridges", value="No active voice bridges connected.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="send-bridge", description="Broadcast a message across connected bridge networks.")
-@app_commands.describe(message="The message to broadcast across the bridge")
-async def send_bridge(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message(
-        f"📢 **Bridge Broadcast**: {message}",
-        ephemeral=False
-    )
-
-@bot.tree.command(name="relay-info", description="View connected channels and status for a specific network code.")
-@app_commands.describe(network_code="The network code to inspect")
-async def relay_info(interaction: discord.Interaction, network_code: str):
-    code = network_code.strip().lower()
-    
-    text_channels = get_links("text_relays", code)
-    thread_channels = get_links("thread_relays", code)
-
-    if not text_channels and not thread_channels:
-        await interaction.response.send_message(
-            f"❌ Network code `{code}` is not active.",
-            ephemeral=True
-        )
+# ------------------------------------------------------------------------------
+# YOUTUBE / AUDIO PLAYBACK COMMANDS
+# ------------------------------------------------------------------------------
+@bot.tree.command(name="play", description="Play audio from a YouTube link or search query in your voice channel.")
+@app_commands.describe(search="YouTube URL or search keywords")
+async def play(interaction: discord.Interaction, search: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
         return
 
-    embed = discord.Embed(title=f"📡 Network Info: `{code}`", color=discord.Color.green())
+    voice_channel = interaction.user.voice.channel
+    await interaction.response.defer()
 
-    if text_channels:
-        ch_mentions = [f"• <#{cid}>" for cid in text_channels if bot.get_channel(cid)]
-        embed.add_field(name="Text Channels", value="\n".join(ch_mentions) if ch_mentions else "None", inline=False)
-
-    if thread_channels:
-        th_mentions = [f"• <#{tid}>" for tid in thread_channels if bot.get_channel(tid)]
-        embed.add_field(name="Threads", value="\n".join(th_mentions) if th_mentions else "None", inline=False)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="test-relay", description="Send a test ping across a linked relay network.")
-@app_commands.describe(network_code="The network code to test")
-async def test_relay(interaction: discord.Interaction, network_code: str):
-    code = network_code.strip().lower()
-
-    text_channels = get_links("text_relays", code)
-    thread_channels = get_links("thread_relays", code)
-
-    if not text_channels and not thread_channels:
-        await interaction.response.send_message(f"⚠️ Network `{code}` is not active.", ephemeral=True)
-        return
-
-    await interaction.response.send_message(f"🧪 Sending test signal across network `{code}`...", ephemeral=True)
-
-    targets = []
-    if interaction.channel.id in text_channels:
-        targets = [cid for cid in text_channels if cid != interaction.channel.id]
-    elif interaction.channel.id in thread_channels:
-        targets = [tid for tid in thread_channels if tid != interaction.channel.id]
-
-    delivered = 0
-    for target_id in set(targets):
-        target_channel = bot.get_channel(target_id)
-        if target_channel:
-            webhook = await get_or_create_webhook(target_channel)
-            if webhook:
-                try:
-                    kwargs = {
-                        "content": f"🔔 **LUX-NET Test**: Active from **{interaction.channel.name}** ({interaction.guild.name})!",
-                        "username": "LUX-NET Network Monitor",
-                        "avatar_url": bot.user.display_avatar.url
-                    }
-                    if isinstance(target_channel, discord.Thread):
-                        kwargs["thread"] = target_channel
-                    
-                    await webhook.send(**kwargs)
-                    delivered += 1
-                except Exception as e:
-                    logger.error(f"Test signal failed for {target_id}: {e}")
-
-    await interaction.followup.send(f"✅ Test complete! Delivered to **{delivered}** target(s).", ephemeral=True)
-
-@bot.tree.command(name="clear-relays", description="Remove all active text relay links for this server.")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def clear_relays(interaction: discord.Interaction):
-    guild_channels = {ch.id for ch in interaction.guild.text_channels}
-    
     try:
-        res = supabase.table("text_relays").select("network_code, channel_id").execute()
-        removed_count = 0
-        for row in res.data:
-            if row["channel_id"] in guild_channels:
-                supabase.table("text_relays").delete().eq("network_code", row["network_code"]).eq("channel_id", row["channel_id"]).execute()
-                removed_count += 1
+        if interaction.guild.voice_client is not None:
+            await interaction.guild.voice_client.move_to(voice_channel)
+        else:
+            await voice_channel.connect()
 
-        await interaction.response.send_message(
-            f"🧹 Cleared **{removed_count}** active text relay link(s) for this server.",
-            ephemeral=False
-        )
+        player = await YTDLSource.from_url(search, loop=bot.loop, stream=True)
+        
+        def after_playing(error):
+            if error:
+                logger.error(f"Player error: {error}")
+
+        interaction.guild.voice_client.play(player, after=after_playing)
+        await interaction.followup.send(f"🎶 Now playing: **{player.title}**")
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error clearing relays: {e}", ephemeral=True)
+        logger.error(f"Playback error: {e}")
+        await interaction.followup.send(f"❌ An error occurred while trying to play that video: {e}")
 
-@clear_relays.error
-async def clear_relays_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ You need the `Manage Channels` permission to run this command.", ephemeral=True)
+@bot.tree.command(name="stop", description="Stop playback and disconnect the bot from the voice channel.")
+async def stop(interaction: discord.Interaction):
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.disconnect()
+        await interaction.response.send_message("⏹️ Stopped playback and left the voice channel.", ephemeral=False)
+    else:
+        await interaction.response.send_message("⚠ The bot is not connected to a voice channel.", ephemeral=True)
+
+# ------------------------------------------------------------------------------
+# INTERNET SEARCH COMMAND
+# ------------------------------------------------------------------------------
+@bot.tree.command(name="search", description="Search the internet using DuckDuckGo.")
+@app_commands.describe(query="What would you like to search for?")
+async def search(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=5):
+                results.append(r)
+
+        if not results:
+            await interaction.followup.send(f"⚠️ No results found for `{query}`.")
+            return
+
+        embed = discord.Embed(
+            title=f"🔍 Search Results for: `{query}`",
+            color=discord.Color.green()
+        )
+
+        for i, res in enumerate(results[:5], 1):
+            title = res.get("title", "No Title")
+            href = res.get("href", "#")
+            body = res.get("body", "No description available.")
+            embed.add_field(name=f"{i}. {title[:100]}", value=f"{body[:150]}...\n[Link]({href})", inline=False)
+
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await interaction.followup.send(f"❌ An error occurred while performing the search: {e}")
 
 # ------------------------------------------------------------------------------
 # MAIN RUNNER
@@ -531,5 +552,4 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
-    main()
     main()
