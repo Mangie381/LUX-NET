@@ -229,12 +229,17 @@ async def on_message(message: discord.Message):
     if message.embeds:
         send_kwargs["embeds"] = message.embeds
 
-    # Fixed Robust Attachment Relaying
+    # Safe Attachment Relaying with Size Filter (10MB standard limit safeguard)
     files = []
+    skipped_files = []
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB limit (safe for basic servers; adjust if boosted)
+
     if message.attachments:
         for attachment in message.attachments:
+            if attachment.size > MAX_FILE_SIZE:
+                skipped_files.append(attachment.filename)
+                continue
             try:
-                # Read file bytes into memory to bypass expiring CDN URLs safely
                 file_bytes = await attachment.read()
                 file_obj = discord.File(
                     fp=io.BytesIO(file_bytes),
@@ -243,6 +248,13 @@ async def on_message(message: discord.Message):
                 files.append(file_obj)
             except Exception as e:
                 logger.error(f"Failed to process attachment {attachment.filename}: {e}")
+
+    if skipped_files:
+        skip_notice = f"\n*⚠️️ [Skipped oversized file(s): {', '.join(skipped_files)} - Exceeds Discord size limit]*"
+        if "content" in send_kwargs:
+            send_kwargs["content"] += skip_notice
+        else:
+            send_kwargs["content"] = skip_notice.strip()
 
     if files:
         send_kwargs["files"] = files
