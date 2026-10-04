@@ -68,6 +68,37 @@ def get_links(table: str, code: str):
         logger.error(f"CRITICAL Supabase fetch error in ({table}): {e}")
         return []
 
+# Persistent Message Mapping Helpers via Supabase (Replaces in-memory dicts)
+def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
+    try:
+        # Check if either message is already mapped to a root group
+        res = supabase.table("message_mappings").select("root_message_id").or_(f"message_id.eq.{source_msg_id},message_id.eq.{target_msg_id}").limit(1).execute()
+        if res.data:
+            root_id = res.data[0]["root_message_id"]
+        else:
+            root_id = source_msg_id
+
+        # Upsert both entries into Supabase
+        supabase.table("message_mappings").upsert([
+            {"root_message_id": root_id, "channel_id": target_channel_id, "message_id": target_msg_id},
+            {"root_message_id": root_id, "channel_id": source_msg_id, "message_id": source_msg_id} # self reference hook
+        ], on_conflict="channel_id,message_id").execute()
+    except Exception as e:
+        logger.error(f"Failed to register message mapping in Supabase: {e}")
+
+def get_mirrored_targets(msg_id: int):
+    try:
+        res = supabase.table("message_mappings").select("root_message_id").eq("message_id", msg_id).limit(1).execute()
+        if not res.data:
+            return []
+        root_id = res.data[0]["root_message_id"]
+
+        all_res = supabase.table("message_mappings").select("channel_id,message_id").eq("root_message_id", root_id).execute()
+        return [(row["channel_id"], row["message_id"]) for row in all_res.data]
+    except Exception as e:
+        logger.error(f"Failed to fetch message mapping from Supabase: {e}")
+        return []
+
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
 # ------------------------------------------------------------------------------
@@ -98,23 +129,8 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Dictionary to map original message IDs AND mirrored webhook message IDs back to their group network:
-MESSAGE_REVERSE_MAP = {}
-# { root_message_id: set((channel_id, msg_id)) }
-MESSAGE_MAP = {}
-
 # Set to track thread IDs that are currently being created by our webhook bridge to prevent re-triggering loops
 RELAYED_THREAD_IDS = set()
-
-def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
-    root_id = MESSAGE_REVERSE_MAP.get(source_msg_id, source_msg_id)
-    
-    if root_id not in MESSAGE_MAP:
-        MESSAGE_MAP[root_id] = set()
-    
-    MESSAGE_MAP[root_id].add((target_channel_id, target_msg_id))
-    MESSAGE_REVERSE_MAP[target_msg_id] = root_id
-    MESSAGE_REVERSE_MAP[source_msg_id] = root_id
 
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
@@ -167,11 +183,10 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
         return
 
     msg = reaction.message
-    root_id = MESSAGE_REVERSE_MAP.get(msg.id)
-    if not root_id:
+    mirrored_targets = get_mirrored_targets(msg.id)
+    if not mirrored_targets:
         return
 
-    mirrored_targets = MESSAGE_MAP.get(root_id, set())
     emoji = reaction.emoji
 
     for channel_id, target_msg_id in mirrored_targets:
@@ -193,11 +208,10 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
         return
 
     msg = reaction.message
-    root_id = MESSAGE_REVERSE_MAP.get(msg.id)
-    if not root_id:
+    mirrored_targets = get_mirrored_targets(msg.id)
+    if not mirrored_targets:
         return
 
-    mirrored_targets = MESSAGE_MAP.get(root_id, set())
     emoji = reaction.emoji
 
     for channel_id, target_msg_id in mirrored_targets:
