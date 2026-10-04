@@ -238,10 +238,10 @@ async def on_thread_create(thread: discord.Thread):
         post_title = thread.name
         post_body = starter_message.content or ""
 
+        # Strictly enforce Discord's 80-character maximum limit for webhook usernames
         webhook_username = f"{author_name} [{guild_name}]"
         if len(webhook_username) > 80:
-            available_len = max(10, 80 - len(author_name) - 3)
-            webhook_username = f"{author_name} [{guild_name[:available_len]}]"
+            webhook_username = webhook_username[:80]
 
         avatar_url = author.display_avatar.url
 
@@ -299,7 +299,6 @@ async def on_thread_create(thread: discord.Thread):
                     try:
                         sent_msg = await webhook.send(**send_kwargs)
                         if sent_msg:
-                            # Discord webhooks return a message object that can include a newly spawned thread reference
                             if sent_msg.thread:
                                 RELAYED_THREAD_IDS.add(sent_msg.thread.id)
                             MESSAGE_MAP[starter_message.id].add((target_forum.id, sent_msg.id))
@@ -322,7 +321,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages, DMs, and webhook messages
     if message.author.bot or not message.guild or message.webhook_id:
         return
 
@@ -381,10 +379,11 @@ async def on_message(message: discord.Message):
 
     author_name = message.author.display_name
     guild_name = message.guild.name
+
+    # Strictly enforce Discord's 80-character maximum limit for webhook usernames
     webhook_username = f"{author_name} [{guild_name}]"
     if len(webhook_username) > 80:
-        available_len = max(10, 80 - len(author_name) - 3)
-        webhook_username = f"{author_name} [{guild_name[:available_len]}]"
+        webhook_username = webhook_username[:80]
 
     raw_content = message.content or ""
     reply_prefix = ""
@@ -498,7 +497,6 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
 
     embed = discord.Embed(title=f"🌐 Bridge Status for Network: `{code}`", color=discord.Color.blurple())
 
-    # Text Channels
     text_desc = []
     for cid in text_ids:
         ch = bot.get_channel(cid)
@@ -508,7 +506,6 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
             text_desc.append(f"• ID: `{cid}` (Cached/Missing)")
     embed.add_field(name=f"💬 Text Channels ({len(text_ids)})", value="\n".join(text_desc) if text_desc else "None", inline=False)
 
-    # Threads
     thread_desc = []
     for tid in thread_ids:
         th = bot.get_channel(tid)
@@ -518,7 +515,6 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
             thread_desc.append(f"• ID: `{tid}` (Cached/Missing)")
     embed.add_field(name=f"🧵 Threads ({len(thread_ids)})", value="\n".join(thread_desc) if thread_desc else "None", inline=False)
 
-    # Forums
     forum_desc = []
     for fid in forum_ids:
         fch = bot.get_channel(fid)
@@ -772,7 +768,7 @@ async def search(interaction: discord.Interaction, query: str):
                 results.append(r)
 
         if not results:
-            await interaction.followup.send(f"⚠️️ No results found for `{query}`.")
+            await interaction.followup.send(f"⚠ No results found for `{query}`.")
             return
 
         embed = discord.Embed(
