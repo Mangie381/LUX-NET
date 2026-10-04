@@ -100,8 +100,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Dictionary to map original message IDs to sets of mirrored webhook message IDs: { source_msg_id: { (channel_id, webhook_msg_id) } }
 MESSAGE_MAP = {}
 
-# Set to track newly created forum threads and prevent duplicate relaying loops
-PROCESSED_FORUM_THREADS = set()
+# Set to track thread IDs that are currently being created by our webhook bridge to prevent re-triggering loops
+RELAYED_THREAD_IDS = set()
 
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
@@ -195,11 +195,12 @@ async def on_thread_create(thread: discord.Thread):
     if not isinstance(thread.parent, discord.ForumChannel):
         return
 
-    if thread.owner and thread.owner.id == bot.user.id:
+    # If this thread was just spawned by our own webhook bridge, ignore it completely to stop loops
+    if thread.id in RELAYED_THREAD_IDS:
         return
 
-    # Mark this thread as handled immediately to prevent duplicate triggers
-    PROCESSED_FORUM_THREADS.add(thread.id)
+    if thread.owner and thread.owner.id == bot.user.id:
+        return
 
     current_forum_id = thread.parent.id
 
@@ -298,6 +299,9 @@ async def on_thread_create(thread: discord.Thread):
                     try:
                         sent_msg = await webhook.send(**send_kwargs)
                         if sent_msg:
+                            # Discord webhooks return a message object that can include a newly spawned thread reference
+                            if sent_msg.thread:
+                                RELAYED_THREAD_IDS.add(sent_msg.thread.id)
                             MESSAGE_MAP[starter_message.id].add((target_forum.id, sent_msg.id))
                     except Exception as e:
                         logger.error(f"Error relaying forum post to {fid}: {e}")
@@ -322,20 +326,11 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild or message.webhook_id:
         return
 
+    await bot.process_commands(message)
+
     current_channel = message.channel
     is_thread = isinstance(current_channel, discord.Thread)
     is_forum_thread = is_thread and isinstance(current_channel.parent, discord.ForumChannel)
-
-    # If this is the starter message of a newly created forum thread, skip it here 
-    # because on_thread_create already handled it, preventing duplicates.
-    if is_forum_thread:
-        if current_channel.id in PROCESSED_FORUM_THREADS:
-            return
-        # If it's a subsequent message inside an already created forum thread, allow it through:
-        # (We can also add it to PROCESSED_FORUM_THREADS so future messages aren't treated as starters)
-        PROCESSED_FORUM_THREADS.add(current_channel.id)
-
-    await bot.process_commands(message)
 
     target_channel_ids = []
     target_thread_ids = []
@@ -777,7 +772,7 @@ async def search(interaction: discord.Interaction, query: str):
                 results.append(r)
 
         if not results:
-            await interaction.followup.send(f"⚠️ No results found for `{query}`.")
+            await interaction.followup.send(f"⚠️️ No results found for `{query}`.")
             return
 
         embed = discord.Embed(
