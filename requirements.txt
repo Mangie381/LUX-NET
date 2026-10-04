@@ -4,3 +4,5 @@ gTTS
 flask
 gunicorn
 supabase
+yt-dlp
+duckduckgo-search
