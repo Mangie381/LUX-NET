@@ -97,11 +97,25 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Dictionary to map original message IDs to sets of mirrored webhook message IDs: { source_msg_id: { (channel_id, webhook_msg_id) } }
+# Dictionary to map original message IDs AND mirrored webhook message IDs back to their group network:
+# { msg_id: root_message_id }
+MESSAGE_REVERSE_MAP = {}
+# { root_message_id: set((channel_id, msg_id)) }
 MESSAGE_MAP = {}
 
 # Set to track thread IDs that are currently being created by our webhook bridge to prevent re-triggering loops
 RELAYED_THREAD_IDS = set()
+
+def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
+    # Find root source message id if it exists, otherwise source_msg_id is the root
+    root_id = MESSAGE_REVERSE_MAP.get(source_msg_id, source_msg_id)
+    
+    if root_id not in MESSAGE_MAP:
+        MESSAGE_MAP[root_id] = set()
+    
+    MESSAGE_MAP[root_id].add((target_channel_id, target_msg_id))
+    MESSAGE_REVERSE_MAP[target_msg_id] = root_id
+    MESSAGE_REVERSE_MAP[source_msg_id] = root_id
 
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
@@ -153,49 +167,59 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
     if user.bot:
         return
 
-    source_msg = reaction.message
-    mirrored_targets = MESSAGE_MAP.get(source_msg.id)
-    if not mirrored_targets:
+    msg = reaction.message
+    root_id = MESSAGE_REVERSE_MAP.get(msg.id)
+    if not root_id:
         return
 
+    mirrored_targets = MESSAGE_MAP.get(root_id, set())
     emoji = reaction.emoji
-    for channel_id, msg_id in mirrored_targets:
+
+    for channel_id, target_msg_id in mirrored_targets:
+        # Do not re-react to the same message where the reaction was originally added
+        if channel_id == msg.channel.id and target_msg_id == msg.id:
+            continue
+
         try:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
             if channel:
-                target_msg = await channel.fetch_message(msg_id)
+                target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
                     await target_msg.add_reaction(emoji)
         except Exception as e:
-            logger.error(f"Failed to add cross-server reaction to message {msg_id}: {e}")
+            logger.error(f"Failed to add cross-server reaction to message {target_msg_id}: {e}")
 
 @bot.event
 async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | discord.Member):
     if user.bot:
         return
 
-    source_msg = reaction.message
-    mirrored_targets = MESSAGE_MAP.get(source_msg.id)
-    if not mirrored_targets:
+    msg = reaction.message
+    root_id = MESSAGE_REVERSE_MAP.get(msg.id)
+    if not root_id:
         return
 
+    mirrored_targets = MESSAGE_MAP.get(root_id, set())
     emoji = reaction.emoji
-    for channel_id, msg_id in mirrored_targets:
+
+    for channel_id, target_msg_id in mirrored_targets:
+        if channel_id == msg.channel.id and target_msg_id == msg.id:
+            continue
+
         try:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
             if channel:
-                target_msg = await channel.fetch_message(msg_id)
+                target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
                     await target_msg.remove_reaction(emoji, bot.user)
         except Exception as e:
-            logger.error(f"Failed to remove cross-server reaction from message {msg_id}: {e}")
+            logger.error(f"Failed to remove cross-server reaction from message {target_msg_id}: {e}")
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
     if not isinstance(thread.parent, discord.ForumChannel):
         return
 
-    # Check memory cache first
     if thread.id in RELAYED_THREAD_IDS:
         return
 
@@ -205,10 +229,7 @@ async def on_thread_create(thread: discord.Thread):
         return
 
     try:
-        # Give Discord a moment to fully register the thread and its starter message
         await asyncio.sleep(1.0)
-
-        # Fetch webhooks for this forum to identify if this thread was created by our bridge
         try:
             webhooks = await thread.parent.webhooks()
             webhook_ids = {wh.id for wh in webhooks}
@@ -221,7 +242,6 @@ async def on_thread_create(thread: discord.Thread):
             break
 
         if starter_message:
-            # If the starter message belongs to our bridge webhook or any bot, ignore it to stop loops & duplication
             if (starter_message.webhook_id and starter_message.webhook_id in webhook_ids) or starter_message.author.bot:
                 RELAYED_THREAD_IDS.add(thread.id)
                 return
@@ -253,7 +273,6 @@ async def on_thread_create(thread: discord.Thread):
         post_title = thread.name
         post_body = starter_message.content or ""
 
-        # Strictly enforce Discord's 80-character maximum limit for webhook usernames
         webhook_username = f"{author_name} [{guild_name}]"
         if len(webhook_username) > 80:
             webhook_username = webhook_username[:80]
@@ -271,10 +290,7 @@ async def on_thread_create(thread: discord.Thread):
                     continue
                 try:
                     file_bytes = await attachment.read()
-                    file_obj = discord.File(
-                        fp=io.BytesIO(file_bytes),
-                        filename=attachment.filename
-                    )
+                    file_obj = discord.File(fp=io.BytesIO(file_bytes), filename=attachment.filename)
                     files.append(file_obj)
                 except Exception as e:
                     logger.error(f"Failed to process attachment {attachment.filename}: {e}")
@@ -303,9 +319,6 @@ async def on_thread_create(thread: discord.Thread):
         if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
             send_kwargs["content"] = f"*[Forum Post: {post_title}]*"
 
-        if starter_message.id not in MESSAGE_MAP:
-            MESSAGE_MAP[starter_message.id] = set()
-
         for fid in target_forum_ids:
             target_forum = bot.get_channel(fid)
             if target_forum and isinstance(target_forum, discord.ForumChannel):
@@ -319,7 +332,7 @@ async def on_thread_create(thread: discord.Thread):
                             elif sent_msg.thread:
                                 RELAYED_THREAD_IDS.add(sent_msg.thread.id)
                                 
-                            MESSAGE_MAP[starter_message.id].add((target_forum.id, sent_msg.id))
+                            register_message_mapping(starter_message.id, target_forum.id, sent_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying forum post to {fid}: {e}")
     except Exception as e:
@@ -398,7 +411,6 @@ async def on_message(message: discord.Message):
     author_name = message.author.display_name
     guild_name = message.guild.name
 
-    # Strictly enforce Discord's 80-character maximum limit for webhook usernames
     webhook_username = f"{author_name} [{guild_name}]"
     if len(webhook_username) > 80:
         webhook_username = webhook_username[:80]
@@ -442,10 +454,7 @@ async def on_message(message: discord.Message):
                 continue
             try:
                 file_bytes = await attachment.read()
-                file_obj = discord.File(
-                    fp=io.BytesIO(file_bytes),
-                    filename=attachment.filename
-                )
+                file_obj = discord.File(fp=io.BytesIO(file_bytes), filename=attachment.filename)
                 files.append(file_obj)
             except Exception as e:
                 logger.error(f"Failed to process attachment {attachment.filename}: {e}")
@@ -466,9 +475,6 @@ async def on_message(message: discord.Message):
         else:
             return
 
-    if message.id not in MESSAGE_MAP:
-        MESSAGE_MAP[message.id] = set()
-
     if target_thread_ids:
         for tid in target_thread_ids:
             t_channel = bot.get_channel(tid)
@@ -478,7 +484,7 @@ async def on_message(message: discord.Message):
                     try:
                         sent_msg = await webhook.send(thread=t_channel, **send_kwargs)
                         if sent_msg:
-                            MESSAGE_MAP[message.id].add((t_channel.id, sent_msg.id))
+                            register_message_mapping(message.id, t_channel.id, sent_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying thread message to {tid}: {e}")
 
@@ -491,7 +497,7 @@ async def on_message(message: discord.Message):
                     try:
                         sent_msg = await webhook.send(**send_kwargs)
                         if sent_msg:
-                            MESSAGE_MAP[message.id].add((target_channel.id, sent_msg.id))
+                            register_message_mapping(message.id, target_channel.id, sent_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
@@ -690,7 +696,7 @@ async def unlink_thread(interaction: discord.Interaction):
                 ephemeral=False
             )
         else:
-            await interaction.response.send_message("⚠️️ This thread is not currently linked to any network.", ephemeral=True)
+            await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
