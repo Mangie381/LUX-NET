@@ -192,7 +192,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
 
         try:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-            if channel:
+            if channel and not isinstance(channel, discord.ForumChannel):
                 target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
                     source_count = 1
@@ -230,7 +230,7 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
 
         try:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-            if channel:
+            if channel and not isinstance(channel, discord.ForumChannel):
                 target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
                     source_count = 0
@@ -610,7 +610,7 @@ async def unlink_relay(interaction: discord.Interaction):
             )
         else:
             await interaction.response.send_message(
-                f"⚠️ **#{interaction.channel.name}** is not currently linked to any relay network.",
+                f"⚠️️ **#{interaction.channel.name}** is not currently linked to any relay network.",
                 ephemeral=True
             )
     except Exception as e:
@@ -732,6 +732,17 @@ async def unlink_thread(interaction: discord.Interaction):
 # ------------------------------------------------------------------------------
 # YOUTUBE & WEB SEARCH COMMANDS
 # ------------------------------------------------------------------------------
+class YouTubeDropdown(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Select the correct video from the search...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_url = self.values[0]
+        await interaction.response.send_message(
+            f"✅ You selected: {selected_url}\n(Click the link to open and watch the full video directly!)",
+            ephemeral=False
+        )
+
 class YouTubeSelectView(discord.ui.View):
     def __init__(self, entries):
         super().__init__(timeout=60)
@@ -748,17 +759,6 @@ class YouTubeSelectView(discord.ui.View):
                 )
             )
         self.add_item(YouTubeDropdown(options))
-
-class YouTubeDropdown(discord.ui.Select):
-    def __init__(self, options):
-        super().__init__(placeholder="Select the correct video from the search...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_url = self.values[0]
-        await interaction.response.send_message(
-            f"✅ You selected: {selected_url}\n(Click the link to open and watch the full video directly!)",
-            ephemeral=False
-        )
 
 @bot.tree.command(name="play", description="Search YouTube or paste a direct YouTube URL.")
 @app_commands.describe(search="Search keywords or paste a YouTube URL")
