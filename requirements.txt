@@ -1,9 +1,8 @@
-discord.py[voice]
-edge-tts
-gTTS
+discord.py[voice]>=2.7.1
+discord-ext-voice-recv>=0.5.2a179
+audioop-lts; python_version >= "3.13"
 flask
 gunicorn
 supabase
 yt-dlp>=2026.03.00
 duckduckgo-search
-googlesearch-python
