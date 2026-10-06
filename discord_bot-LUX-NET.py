@@ -68,7 +68,7 @@ def get_links(table: str, code: str):
         logger.error(f"CRITICAL Supabase fetch error in ({table}): {e}")
         return []
 
-# Persistent Message Mapping Helpers via Supabase (Replaces in-memory dicts)
+# Persistent Message Mapping Helpers via Supabase
 def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
     try:
         res = supabase.table("message_mappings").select("root_message_id").or_(f"message_id.eq.{source_msg_id},message_id.eq.{target_msg_id}").limit(1).execute()
@@ -195,20 +195,10 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
             if channel and not isinstance(channel, discord.ForumChannel):
                 target_msg = await channel.fetch_message(target_msg_id)
                 if target_msg:
-                    source_count = 1
-                    for r in msg.reactions:
-                        if str(r.emoji) == str(emoji):
-                            source_count = r.count
-                            break
-
-                    target_count = 0
-                    for r in target_msg.reactions:
-                        if str(r.emoji) == str(emoji):
-                            target_count = r.count
-                            break
-
-                    if source_count > target_count:
+                    try:
                         await target_msg.add_reaction(emoji)
+                    except discord.HTTPException:
+                        pass  # Reaction already exists or cannot be added
         except Exception as e:
             logger.error(f"Failed to add cross-server reaction to message {target_msg_id}: {e}")
 
@@ -240,7 +230,10 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
                             break
 
                     if source_count == 0:
-                        await target_msg.remove_reaction(emoji, bot.user)
+                        try:
+                            await target_msg.remove_reaction(emoji, bot.user)
+                        except discord.HTTPException:
+                            pass
         except Exception as e:
             logger.error(f"Failed to remove cross-server reaction from message {target_msg_id}: {e}")
 
@@ -319,7 +312,9 @@ async def on_thread_create(thread: discord.Thread):
                     continue
                 try:
                     file_bytes = await attachment.read()
-                    file_obj = discord.File(fp=io.BytesIO(file_bytes), filename=attachment.filename)
+                    fp = io.BytesIO(file_bytes)
+                    fp.seek(0)
+                    file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
                     files.append(file_obj)
                 except Exception as e:
                     logger.error(f"Failed to process attachment {attachment.filename}: {e}")
@@ -483,7 +478,9 @@ async def on_message(message: discord.Message):
                 continue
             try:
                 file_bytes = await attachment.read()
-                file_obj = discord.File(fp=io.BytesIO(file_bytes), filename=attachment.filename)
+                fp = io.BytesIO(file_bytes)
+                fp.seek(0)
+                file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
                 files.append(file_obj)
             except Exception as e:
                 logger.error(f"Failed to process attachment {attachment.filename}: {e}")
@@ -610,7 +607,7 @@ async def unlink_relay(interaction: discord.Interaction):
             )
         else:
             await interaction.response.send_message(
-                f"⚠️️ **#{interaction.channel.name}** is not currently linked to any relay network.",
+                f"⚠ **#{interaction.channel.name}** is not currently linked to any relay network.",
                 ephemeral=True
             )
     except Exception as e:
@@ -730,7 +727,7 @@ async def unlink_thread(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# YOUTUBE & WEB SEARCH COMMANDS
+# YOUTUBE & WEB SEARCH COMMANDS (MEMORY EFFICIENT & ROBUST)
 # ------------------------------------------------------------------------------
 class YouTubeDropdown(discord.ui.Select):
     def __init__(self, options):
@@ -739,7 +736,7 @@ class YouTubeDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_url = self.values[0]
         await interaction.response.send_message(
-            f"✅ You selected: {selected_url}\n(Click the link to open and watch the full video directly!)",
+            f"✅ You selected: {selected_url}\n(Click the link to open and watch the video directly!)",
             ephemeral=False
         )
 
@@ -776,15 +773,16 @@ async def play(interaction: discord.Interaction, search: str):
         try:
             search_opts = {
                 'extract_flat': True,
-                'default_search': 'ytsearch5',
                 'quiet': True,
             }
+            query = f"ytsearch5:{search}"
             loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(search, download=False))
+            data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(query, download=False))
             entries = data.get('entries', [])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"yt_dlp search error: {e}")
 
+        # Fallback to DuckDuckGo video search if yt_dlp fails
         if not entries:
             try:
                 with DDGS() as ddgs:
@@ -797,11 +795,11 @@ async def play(interaction: discord.Interaction, search: str):
                                 'webpage_url': href
                             })
             except Exception as e:
-                logger.error(f"Fallback search error: {e}")
+                logger.error(f"Fallback video search error: {e}")
 
     if not entries:
         await interaction.followup.send(
-            f"⚠️ Could not find any videos for `{search}`. Try pasting the direct YouTube URL directly!", 
+            f"⚠️ Could not find any videos for `{search}`. Try pasting the direct YouTube URL!", 
             ephemeral=True
         )
         return
@@ -817,7 +815,7 @@ async def search(interaction: discord.Interaction, query: str):
     try:
         results = []
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=5, backend="lite"):
+            for r in ddgs.text(query, max_results=5):
                 results.append(r)
 
         if not results:
@@ -837,6 +835,7 @@ async def search(interaction: discord.Interaction, query: str):
 
         await interaction.followup.send(embed=embed)
     except Exception as e:
+    
         logger.error(f"Search error: {e}")
         await interaction.followup.send(f"❌ An error occurred while performing the search: {e}")
 
