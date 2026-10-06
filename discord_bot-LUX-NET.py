@@ -12,7 +12,8 @@ from discord.ext import commands
 from flask import Flask
 from supabase import create_client, Client
 import yt_dlp
-from duckduckgo_search import DDGS  # using duckduckgo-search package
+from duckduckgo_search import DDGS  # using duckduckgo_search package with underscore
+
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
 # ------------------------------------------------------------------------------
@@ -98,20 +99,30 @@ def get_mirrored_targets(msg_id: int):
         return []
 
 # ------------------------------------------------------------------------------
-# SEARCH HELPER (DUCKDUCKGO WITH FALLBACK)
+# SEARCH HELPER (DUCKDUCKGO RETURNING TITLES, URLS, & BODIES)
 # ------------------------------------------------------------------------------
 def google_search(query: str, num_results: int = 5):
     results = []
     try:
         with DDGS() as ddgs:
             res = list(ddgs.text(query, max_results=num_results))
-            if res:
-                results = [r.get("href") for r in res if "href" in r]
+            for r in res:
+                if "href" in r:
+                    results.append({
+                        "title": r.get("title", "No Title"),
+                        "href": r.get("href"),
+                        "body": r.get("body", "No description available.")
+                    })
     except Exception as e:
         logger.error(f"DuckDuckGo Search error: {e}")
 
+    # Fallback if no results were found
     if not results:
-        results = [f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"]
+        results = [{
+            "title": f"DuckDuckGo Search: {query}",
+            "href": f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}",
+            "body": "Click to view search results directly on DuckDuckGo."
+        }]
         
     return results
 
@@ -498,7 +509,7 @@ async def on_message(message: discord.Message):
                 file_bytes = await attachment.read()
                 fp = io.BytesIO(file_bytes)
                 fp.seek(0)
-                # Preserve exact filename extension (ensuring video files embed and preview correctly)
+                # Preserve exact lowercase filename extension for video previews
                 file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
                 files.append(file_obj)
             except Exception as e:
@@ -574,7 +585,6 @@ async def poll(
 ):
     await interaction.response.defer()
 
-    # Construct native Discord Poll object
     p = discord.Poll(
         question=question, 
         duration=timedelta(hours=duration_hours)
@@ -586,10 +596,8 @@ async def poll(
     if option4:
         p.add_answer(text=option4)
 
-    # Send poll in the current interaction channel
     temp_msg = await interaction.followup.send(poll=p, wait=True)
 
-    # Check for connected text channel relays to broadcast the native poll
     channel_id = interaction.channel.id
     try:
         res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
@@ -720,8 +728,6 @@ async def link_forum(interaction: discord.Interaction, network_code: str, forum_
         return
 
     code = network_code.strip().lower()
-    logger.info(f"Attempting to link forum ID {target_forum.id} ({target_forum.name}) to code {code}")
-    
     add_link("forum_relays", code, target_forum.id)
     forums = get_links("forum_relays", code)
     
@@ -869,10 +875,11 @@ async def play(interaction: discord.Interaction, search: str):
 
         if not entries:
             try:
-                for url in google_search(f"{search} site:youtube.com/watch", num_results=5):
+                for item in google_search(f"{search} site:youtube.com/watch", num_results=5):
+                    url = item.get("href", "")
                     if "youtube.com/watch" in url:
                         entries.append({
-                            'title': 'YouTube Video Result',
+                            'title': item.get("title", 'YouTube Video Result'),
                             'uploader': 'Google Search',
                             'webpage_url': url
                         })
@@ -896,9 +903,9 @@ async def search(interaction: discord.Interaction, query: str):
 
     try:
         loop = asyncio.get_event_loop()
-        urls = await loop.run_in_executor(None, lambda: google_search(query, num_results=5))
+        results = await loop.run_in_executor(None, lambda: google_search(query, num_results=5))
 
-        if not urls:
+        if not results:
             await interaction.followup.send(f"⚠ No results found for `{query}`.")
             return
 
@@ -907,8 +914,13 @@ async def search(interaction: discord.Interaction, query: str):
             color=discord.Color.green()
         )
 
-        for i, url in enumerate(urls[:5], 1):
-            embed.add_field(name=f"{i}. Result", value=f"[Click here to visit]({url})", inline=False)
+        for i, item in enumerate(results[:5], 1):
+            title = item.get("title", "Result")
+            url = item.get("href", "#")
+            body = item.get("body", "")[:250]  # Snippet description
+            
+            field_value = f"[{title}]({url})\n{body}"
+            embed.add_field(name=f"Result {i}", value=field_value, inline=False)
 
         await interaction.followup.send(embed=embed)
     except Exception as e:
