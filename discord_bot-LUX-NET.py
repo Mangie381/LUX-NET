@@ -12,8 +12,7 @@ from discord.ext import commands
 from flask import Flask
 from supabase import create_client, Client
 import yt_dlp
-from duckduckgo-search import DDGS  # using duckduckgo-search package
-
+from duckduckgo_search import DDGS  # using duckduckgo-search package
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
 # ------------------------------------------------------------------------------
