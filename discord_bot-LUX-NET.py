@@ -4,7 +4,7 @@ import asyncio
 import logging
 import io
 from threading import Thread
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -12,7 +12,7 @@ from discord.ext import commands
 from flask import Flask
 from supabase import create_client, Client
 import yt_dlp
-from duckduckgo_search import DDGS
+from googlesearch import search as google_search
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -97,36 +97,6 @@ def get_mirrored_targets(msg_id: int):
     except Exception as e:
         logger.error(f"Failed to fetch message mapping from Supabase: {e}")
         return []
-
-# Poll Database Helpers
-def cast_vote(poll_id: int, user_id: int, rating: int):
-    try:
-        supabase.table("poll_votes").upsert(
-            {"poll_id": poll_id, "user_id": str(user_id), "rating": rating},
-            on_conflict="poll_id,user_id"
-        ).execute()
-    except Exception as e:
-        logger.error(f"Failed to cast vote in Supabase: {e}")
-
-def get_poll_results(poll_id: int):
-    try:
-        res = supabase.table("poll_votes").select("rating").eq("poll_id", poll_id).execute()
-        votes = res.data
-        counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-        total_votes = len(votes)
-        total_score = 0
-
-        for v in votes:
-            r = v["rating"]
-            if r in counts:
-                counts[r] += 1
-                total_score += r
-
-        avg = round(total_score / total_votes, 2) if total_votes > 0 else 0.0
-        return counts, total_votes, avg
-    except Exception as e:
-        logger.error(f"Failed to fetch poll results: {e}")
-        return {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}, 0, 0.0
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -511,6 +481,7 @@ async def on_message(message: discord.Message):
                 file_bytes = await attachment.read()
                 fp = io.BytesIO(file_bytes)
                 fp.seek(0)
+                # Preserve exact filename extension (ensuring video files embed and preview correctly)
                 file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
                 files.append(file_obj)
             except Exception as e:
@@ -559,56 +530,6 @@ async def on_message(message: discord.Message):
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# POLL VIEW & BUTTONS
-# ------------------------------------------------------------------------------
-class PollView(discord.ui.View):
-    def __init__(self, poll_id: int):
-        super().__init__(timeout=None)
-        self.poll_id = poll_id
-
-    async def handle_vote(self, interaction: discord.Interaction, rating: int):
-        user_id = interaction.user.id
-        cast_vote(self.poll_id, user_id, rating)
-        
-        counts, total, avg = get_poll_results(self.poll_id)
-        
-        embed = interaction.message.embeds[0]
-        result_desc = (
-            f"In case you aren’t aware, these are the ratings:\n"
-            f"- **1 star**, the worst rating ({counts[1]} votes)\n"
-            f"- **2 stars**, a bad rating ({counts[2]} votes)\n"
-            f"- **3 stars**, a neutral rating ({counts[3]} votes)\n"
-            f"- **4 stars**, a good rating ({counts[4]} votes)\n"
-            f"- **5 stars**, the best rating ({counts[5]} votes)\n\n"
-            f"⭐ **Total Votes:** {total} | 📊 **Average Rating:** {avg} / 5.0\n\n"
-            f"So go on and react to television programs by reacting one of the five ratings mentioned!"
-        )
-        embed.description = result_desc
-        
-        await interaction.response.edit_message(embed=embed, view=self)
-        await interaction.followup.send(f"✅ Your **{rating}-star** vote has been recorded successfully!", ephemeral=True)
-
-    @discord.ui.button(label="1 ⭐", style=discord.ButtonStyle.secondary, custom_id="poll_1")
-    async def vote_1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, 1)
-
-    @discord.ui.button(label="2 ⭐", style=discord.ButtonStyle.secondary, custom_id="poll_2")
-    async def vote_2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, 2)
-
-    @discord.ui.button(label="3 ⭐", style=discord.ButtonStyle.primary, custom_id="poll_3")
-    async def vote_3(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, 3)
-
-    @discord.ui.button(label="4 ⭐", style=discord.ButtonStyle.primary, custom_id="poll_4")
-    async def vote_4(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, 4)
-
-    @discord.ui.button(label="5 ⭐", style=discord.ButtonStyle.success, custom_id="poll_5")
-    async def vote_5(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, 5)
-
-# ------------------------------------------------------------------------------
 # SLASH COMMANDS (BRIDGES, POLLS, YOUTUBE, & SEARCH)
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check the bot's latency.")
@@ -616,35 +537,71 @@ async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"Pong! 🏓 `{latency}ms`", ephemeral=True)
 
-@bot.tree.command(name="poll", description="Create a movie/television rating poll.")
-@app_commands.describe(title="Title of the review or forum post overview")
-async def poll(interaction: discord.Interaction, title: str = "Movie reaction ratings overview"):
+@bot.tree.command(name="poll", description="Create a native poll and broadcast it across connected relay channels.")
+@app_commands.describe(
+    question="The question for your poll",
+    option1="First option",
+    option2="Second option",
+    option3="Third option (optional)",
+    option4="Fourth option (optional)",
+    duration_hours="How many hours the poll should stay open (default 24)"
+)
+async def poll(
+    interaction: discord.Interaction, 
+    question: str, 
+    option1: str, 
+    option2: str, 
+    option3: str = None, 
+    option4: str = None, 
+    duration_hours: int = 24
+):
     await interaction.response.defer()
 
-    now_str = datetime.now().strftime("%m/%d/%Y, %H:%M")
-    author_name = interaction.user.display_name
-
-    embed = discord.Embed(
-        title=f"⭐ {title}",
-        description=(
-            f"In case you aren’t aware, these are the ratings:\n"
-            f"- **1 star**, the worst rating (0 votes)\n"
-            f"- **2 stars**, a bad rating (0 votes)\n"
-            f"- **3 stars**, a neutral rating (0 votes)\n"
-            f"- **4 stars**, a good rating (0 votes)\n"
-            f"- **5 stars**, the best rating (0 votes)\n\n"
-            f"⭐ **Total Votes:** 0 | 📊 **Average Rating:** 0.0 / 5.0\n\n"
-            f"So go on and react to television programs by reacting one of the five ratings mentioned!"
-        ),
-        color=discord.Color.gold()
+    # Construct native Discord Poll object
+    p = discord.Poll(
+        question=question, 
+        duration=timedelta(hours=duration_hours)
     )
-    embed.set_author(name=f"{author_name}, OP", icon_url=interaction.user.display_avatar.url)
-    embed.set_footer(text=f"— {now_str}")
+    p.add_answer(text=option1)
+    p.add_answer(text=option2)
+    if option3:
+        p.add_answer(text=option3)
+    if option4:
+        p.add_answer(text=option4)
 
-    temp_msg = await interaction.followup.send(embed=embed, wait=True)
-    
-    view = PollView(temp_msg.id)
-    await temp_msg.edit(view=view)
+    # Send poll in the current interaction channel
+    temp_msg = await interaction.followup.send(poll=p, wait=True)
+
+    # Check for connected text channel relays to broadcast the native poll
+    channel_id = interaction.channel.id
+    try:
+        res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
+        codes = [row["network_code"] for row in res.data]
+
+        if codes:
+            target_channel_ids = []
+            for code in codes:
+                c_res = supabase.table("text_relays").select("channel_id").eq("network_code", code).neq("channel_id", channel_id).execute()
+                target_channel_ids.extend([row["channel_id"] for row in c_res.data])
+
+            target_channel_ids = list(set(target_channel_ids))
+            webhook_username = f"{interaction.user.display_name} [{interaction.guild.name}] (Poll)"
+
+            for target_id in target_channel_ids:
+                target_channel = bot.get_channel(target_id)
+                if target_channel and isinstance(target_channel, discord.TextChannel):
+                    webhook = await get_or_create_webhook(target_channel)
+                    if webhook:
+                        try:
+                            await webhook.send(
+                                username=webhook_username[:80],
+                                avatar_url=interaction.user.display_avatar.url,
+                                poll=p
+                            )
+                        except Exception as e:
+                            logger.error(f"Error broadcasting poll to channel {target_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error handling cross-server poll relay: {e}")
 
 @bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
 @app_commands.describe(network_code="The network code to inspect")
@@ -895,15 +852,13 @@ async def play(interaction: discord.Interaction, search: str):
 
         if not entries:
             try:
-                with DDGS() as ddgs:
-                    for r in ddgs.text(f"{search} site:youtube.com/watch", max_results=5):
-                        href = r.get("href", "")
-                        if "youtube.com/watch" in href:
-                            entries.append({
-                                'title': r.get("title", "YouTube Video"),
-                                'uploader': "Web Result",
-                                'webpage_url': href
-                            })
+                for url in google_search(f"{search} site:youtube.com/watch", num_results=5):
+                    if "youtube.com/watch" in url:
+                        entries.append({
+                            'title': 'YouTube Video Result',
+                            'uploader': 'Google Search',
+                            'webpage_url': url
+                        })
             except Exception as e:
                 logger.error(f"Fallback video search error: {e}")
 
@@ -917,31 +872,32 @@ async def play(interaction: discord.Interaction, search: str):
     view = YouTubeSelectView(entries)
     await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
-@bot.tree.command(name="search", description="Perform a fast web search via DuckDuckGo.")
+@bot.tree.command(name="search", description="Perform a fast web search via Google.")
 @app_commands.describe(query="What would you like to search for?")
 async def search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
     try:
         results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=5):
-                results.append(r)
+        loop = asyncio.get_event_loop()
+        urls = await loop.run_in_executor(None, lambda: list(google_search(query, num_results=5)))
+
+        for url in urls:
+            results.append({"title": url, "href": url, "body": "Google Search Result Link"})
 
         if not results:
             await interaction.followup.send(f"⚠ No results found for `{query}`.")
             return
 
         embed = discord.Embed(
-            title=f"🔍 Search Results for: `{query}`",
+            title=f"🔍 Google Search Results for: `{query}`",
             color=discord.Color.green()
         )
 
         for i, res in enumerate(results[:5], 1):
             title = res.get("title", "No Title")
             href = res.get("href", "#")
-            body = res.get("body", "No description available.")
-            embed.add_field(name=f"{i}. {title[:100]}", value=f"{body[:150]}...\n[Link]({href})", inline=False)
+            embed.add_field(name=f"{i}. Result", value=f"[Click here to visit]({href})", inline=False)
 
         await interaction.followup.send(embed=embed)
     except Exception as e:
