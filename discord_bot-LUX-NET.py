@@ -3,6 +3,9 @@ import sys
 import asyncio
 import logging
 import io
+import resource
+import urllib.request
+from collections import deque
 from threading import Thread
 from datetime import datetime, timedelta
 
@@ -10,6 +13,22 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
+
+# Voice relay dependencies are optional: if they are missing the bot still runs
+# all text/forum/thread features and simply disables the voice commands.
+try:
+    import audioop  # stdlib <=3.12, provided by `audioop-lts` on 3.13+
+    from discord.ext import voice_recv
+    VOICE_OK = True
+except ImportError:
+    audioop = None
+    voice_recv = None
+    VOICE_OK = False
+
+try:
+    import davey  # Discord's E2EE (DAVE) implementation; installed with discord.py[voice] 2.7+
+except ImportError:
+    davey = None
 from supabase import create_client, Client
 import yt_dlp
 from duckduckgo_search import DDGS  # using duckduckgo_search package with underscore
@@ -39,9 +58,17 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Which column identifies the linked item in each relay table.
+_LINK_COLS = {
+    "forum_relays": "forum_channel_id",
+    "text_relays": "channel_id",
+    "thread_relays": "thread_id",
+    "vc_code_relays": "vc_id",
+}
+
 def add_link(table: str, code: str, item_id: int):
     try:
-        col = "forum_channel_id" if table == "forum_relays" else ("channel_id" if table == "text_relays" else "thread_id")
+        col = _LINK_COLS.get(table, "thread_id")
         
         supabase.table(table).upsert(
             {"network_code": code, col: item_id}, 
@@ -53,14 +80,14 @@ def add_link(table: str, code: str, item_id: int):
 
 def remove_link(table: str, code: str, item_id: int):
     try:
-        col = "forum_channel_id" if table == "forum_relays" else ("channel_id" if table == "text_relays" else "thread_id")
+        col = _LINK_COLS.get(table, "thread_id")
         supabase.table(table).delete().eq("network_code", code).eq(col, item_id).execute()
     except Exception as e:
         logger.error(f"Failed to remove link from Supabase ({table}): {e}")
 
 def get_links(table: str, code: str):
     try:
-        col = "forum_channel_id" if table == "forum_relays" else ("channel_id" if table == "text_relays" else "thread_id")
+        col = _LINK_COLS.get(table, "thread_id")
         
         response = supabase.table(table).select(col).eq("network_code", code).execute()
         logger.info(f"Supabase fetch response for {table} code '{code}': {response.data}")
@@ -154,7 +181,20 @@ intents.voice_states = True
 intents.reactions = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Memory trims for the free tier:
+#  - cache only members that are in a voice channel (needed to resolve who is speaking)
+#  - don't download the full member list of every guild at startup
+#  - keep a small message cache (default is 1000 messages)
+member_cache = discord.MemberCacheFlags.none()
+member_cache.voice = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    member_cache_flags=member_cache,
+    chunk_guilds_at_startup=False,
+    max_messages=100,
+)
 
 RELAYED_THREAD_IDS = set()
 
@@ -186,9 +226,21 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
 # ------------------------------------------------------------------------------
 # BOT EVENTS (TEXT, THREADS, FORUMS, VOICE, & REACTIONS)
 # ------------------------------------------------------------------------------
+_ready_done = False
+
 @bot.event
 async def on_ready():
+    global _ready_done
     logger.info(f"Connected to Discord as {bot.user} in {len(bot.guilds)} servers")
+
+    # on_ready fires again after every gateway reconnect; only sync/start tasks once.
+    if _ready_done:
+        return
+    _ready_done = True
+
+    if VOICE_OK and not ensure_opus():
+        logger.warning("libopus not found - voice bridge disabled until it is installed (see Dockerfile).")
+    asyncio.create_task(keepalive_loop())
 
     for guild in bot.guilds:
         try:
@@ -391,17 +443,297 @@ async def on_thread_create(thread: discord.Thread):
     except Exception as e:
         logger.error(f"Failed to relay new forum post: {e}")
 
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if member.bot:
+# ------------------------------------------------------------------------------
+# VOICE BRIDGE (LIVE AUDIO RELAY BETWEEN LINKED VOICE CHANNELS)
+#
+# Design for a ~512MB / shared-CPU free tier:
+#  * The bot only holds a voice connection while a human is in a linked VC, and
+#    leaves as soon as the last human leaves.
+#  * Audio never touches disk or the database. Per speaker we keep a tiny bounded
+#    deque (~6 frames = ~120ms); when a consumer falls behind, the oldest frames
+#    are dropped instead of queueing up.
+#  * The playback thread stops itself after ~1s of silence and is restarted by the
+#    next incoming frame, so an idle call costs ~no CPU.
+#  * Supabase is only queried on join/leave/link, never per audio frame.
+# ------------------------------------------------------------------------------
+FRAME_BYTES = 3840                 # 20ms of 48kHz / 16-bit / stereo PCM
+SILENCE = b"\x00" * FRAME_BYTES
+MAX_BUFFERED_FRAMES = 6            # per-speaker jitter buffer cap (~120ms)
+IDLE_FRAMES_BEFORE_STOP = 50       # ~1s of nothing to play -> stop the player
+MAX_VOICE_SESSIONS = int(os.environ.get("MAX_VOICE_SESSIONS", "4"))
+
+voice_sessions: dict = {}          # guild_id -> VoiceSession
+_voice_connecting: set = set()     # guild_ids with a connect in flight
+_opus_warned = False
+
+
+def ensure_opus() -> bool:
+    if discord.opus.is_loaded():
+        return True
+    for name in ("libopus.so.0", "libopus.so", "opus"):
+        try:
+            discord.opus.load_opus(name)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def keepalive_loop():
+    """Render's free web service sleeps without inbound HTTP traffic. Voice calls
+    generate none, so ping our own public URL every 10 minutes."""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
         return
 
-    if after.channel:
-        joined_vc_id = after.channel.id
+    def ping():
+        with urllib.request.urlopen(url, timeout=10) as r:
+            r.read(16)
+
+    while True:
+        await asyncio.sleep(600)
         try:
-            supabase.table("vc_code_relays").select("network_code").eq("vc_id", joined_vc_id).execute()
+            await asyncio.to_thread(ping)
         except Exception as e:
-            logger.error(f"Error checking VC bridge database: {e}")
+            logger.warning(f"Keep-alive ping failed: {e}")
+
+
+OPUS_SILENCE = b"\xf8\xff\xfe"
+DAVE_FOOTER = b"\xfa\xfa"
+
+
+def install_dave_receive(vc):
+    """Discord now end-to-end encrypts all voice (DAVE). discord.py 2.7 handles that
+    for *sending*, but discord-ext-voice-recv only removes the transport encryption,
+    so received frames would still be DAVE-encrypted (decoded as noise/nothing).
+    This wraps the extension's RTP decryptor to also strip the DAVE layer using the
+    voice connection's DAVE session. Anything that isn't a DAVE frame (e.g. silence
+    packets) passes through untouched; frames that can't be decrypted become silence."""
+    reader = getattr(vc, "_reader", None)
+    if reader is None or davey is None:
+        return
+    inner = reader.decryptor.decrypt_rtp
+
+    def decrypt_rtp(packet):
+        data = inner(packet)
+        if data[-2:] != DAVE_FOOTER:
+            return data
+        session = getattr(vc._connection, "dave_session", None)
+        user_id = vc._get_id_from_ssrc(packet.ssrc)
+        if session is None or not session.ready or user_id is None:
+            return OPUS_SILENCE
+        try:
+            return bytes(session.decrypt(user_id, davey.MediaType.audio, bytes(data)))
+        except Exception:
+            return OPUS_SILENCE
+
+    reader.decryptor.decrypt_rtp = decrypt_rtp
+
+
+if VOICE_OK:
+
+    class MixerSource(discord.AudioSource):
+        """Mixes per-speaker PCM buffers into one 20ms frame per read()."""
+
+        def __init__(self):
+            self.buffers: dict = {}   # speaker_id -> deque[bytes]
+            self.idle = 0
+            self.playing = False      # True while a player thread owns this source
+
+        def feed(self, speaker_id: int, pcm: bytes):
+            dq = self.buffers.get(speaker_id)
+            if dq is None:
+                dq = self.buffers[speaker_id] = deque(maxlen=MAX_BUFFERED_FRAMES)
+            dq.append(pcm)
+
+        def read(self) -> bytes:
+            frames = []
+            for dq in list(self.buffers.values()):
+                try:
+                    frames.append(dq.popleft())
+                except IndexError:
+                    pass
+
+            if not frames:
+                self.idle += 1
+                if self.idle >= IDLE_FRAMES_BEFORE_STOP:
+                    # drop empty buffers of speakers who stopped talking, end the player
+                    self.buffers.clear()
+                    return b""
+                return SILENCE
+
+            self.idle = 0
+            out = frames[0]
+            for f in frames[1:]:
+                out = audioop.add(out, f, 2)
+            return out
+
+        def is_opus(self) -> bool:
+            return False
+
+        def cleanup(self):
+            pass
+
+    class VoiceSession:
+        __slots__ = ("guild_id", "vc", "channel_id", "codes", "mixer",
+                     "frames_in", "frames_out", "loop")
+
+        def __init__(self, guild_id, vc, channel_id, codes, loop):
+            self.guild_id = guild_id
+            self.vc = vc
+            self.channel_id = channel_id
+            self.codes = codes
+            self.mixer = MixerSource()
+            self.frames_in = 0
+            self.frames_out = 0
+            self.loop = loop
+
+        # runs on the event loop
+        def ensure_playing(self):
+            if self.mixer.playing or not self.vc.is_connected():
+                return
+            self.mixer.playing = True
+            self.mixer.idle = 0
+            try:
+                self.vc.play(self.mixer, after=self._after_play)
+            except Exception as e:
+                self.mixer.playing = False
+                logger.error(f"Could not start voice playback in guild {self.guild_id}: {e}")
+
+        # called from the player thread when the mixer ends or errors
+        def _after_play(self, error):
+            if error:
+                logger.error(f"Voice playback error in guild {self.guild_id}: {error}")
+            self.loop.call_soon_threadsafe(self._on_play_end)
+
+        def _on_play_end(self):
+            self.mixer.playing = False
+            # frames may have arrived in the gap between "mixer ended" and now
+            if any(self.mixer.buffers.values()):
+                self.ensure_playing()
+
+    def route_audio(src: "VoiceSession", speaker_id: int, pcm: bytes):
+        """Called from the voice-receive thread for every decoded 20ms frame."""
+        src.frames_in += 1
+        for dst in list(voice_sessions.values()):
+            if dst is src or not (dst.codes & src.codes):
+                continue
+            dst.mixer.feed(speaker_id, pcm)
+            dst.frames_out += 1
+            if not dst.mixer.playing:
+                dst.loop.call_soon_threadsafe(dst.ensure_playing)
+
+    class RelaySink(voice_recv.AudioSink):
+        def __init__(self, session: VoiceSession):
+            super().__init__()
+            self.session = session
+
+        def wants_opus(self) -> bool:
+            return False  # we need decoded PCM so speakers can be mixed
+
+        def write(self, user, data):
+            # Ignore unknown speakers and bots (this also prevents echo loops).
+            if user is None or user.bot:
+                return
+            pcm = data.pcm
+            if pcm and len(pcm) == FRAME_BYTES:
+                route_audio(self.session, user.id, pcm)
+
+        def cleanup(self):
+            pass
+
+
+async def get_vc_codes(channel_id: int) -> set:
+    def query():
+        res = supabase.table("vc_code_relays").select("network_code").eq("vc_id", channel_id).execute()
+        return {row["network_code"] for row in res.data}
+    try:
+        return await asyncio.to_thread(query)
+    except Exception as e:
+        logger.error(f"Error checking VC bridge database: {e}")
+        return set()
+
+
+def humans_in(channel: discord.VoiceChannel) -> int:
+    # voice_states is keyed by user id and doesn't depend on the member cache
+    return sum(1 for uid in channel.voice_states if uid != bot.user.id)
+
+
+async def end_voice_session(guild_id: int):
+    session = voice_sessions.pop(guild_id, None)
+    if not session:
+        return
+    try:
+        if session.vc.is_listening():
+            session.vc.stop_listening()
+    except Exception:
+        pass
+    try:
+        await session.vc.disconnect(force=True)
+    except Exception as e:
+        logger.error(f"Error disconnecting voice in guild {guild_id}: {e}")
+    session.mixer.buffers.clear()
+    logger.info(f"Voice session ended in guild {guild_id}")
+
+
+async def maybe_join_voice(channel: discord.VoiceChannel):
+    global _opus_warned
+    if not VOICE_OK or not isinstance(channel, discord.VoiceChannel):
+        return
+    gid = channel.guild.id
+    if gid in voice_sessions or gid in _voice_connecting:
+        return
+    if len(voice_sessions) >= MAX_VOICE_SESSIONS:
+        return
+    codes = await get_vc_codes(channel.id)
+    if not codes:
+        return
+    if not ensure_opus():
+        if not _opus_warned:
+            logger.error("Cannot start voice bridge: libopus is not installed.")
+            _opus_warned = True
+        return
+
+    _voice_connecting.add(gid)
+    try:
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, timeout=30)
+        session = VoiceSession(gid, vc, channel.id, codes, asyncio.get_running_loop())
+        voice_sessions[gid] = session
+        vc.listen(RelaySink(session))
+        install_dave_receive(vc)
+        logger.info(f"Voice session started in guild {gid} on #{channel.name} (codes: {sorted(codes)})")
+    except Exception as e:
+        logger.error(f"Failed to join voice channel {channel.id}: {e}")
+        try:
+            if channel.guild.voice_client:
+                await channel.guild.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+    finally:
+        _voice_connecting.discard(gid)
+
+
+async def maybe_leave_voice(channel: discord.abc.GuildChannel):
+    session = voice_sessions.get(channel.guild.id)
+    if session and session.channel_id == channel.id and humans_in(channel) == 0:
+        await end_voice_session(channel.guild.id)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # The bot itself was disconnected/kicked: drop our session state.
+    if bot.user and member.id == bot.user.id:
+        if before.channel and after.channel is None:
+            await end_voice_session(member.guild.id)
+        return
+
+    if member.bot or not VOICE_OK:
+        return
+
+    if after.channel and after.channel != before.channel:
+        await maybe_join_voice(after.channel)
+    if before.channel and before.channel != after.channel:
+        await maybe_leave_voice(before.channel)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -816,6 +1148,112 @@ async def unlink_thread(interaction: discord.Interaction):
             await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
+
+# ------------------------------------------------------------------------------
+# VOICE BRIDGE COMMANDS
+# ------------------------------------------------------------------------------
+def _resolve_voice_channel(interaction: discord.Interaction, chosen):
+    if chosen:
+        return chosen
+    user_voice = getattr(interaction.user, "voice", None)
+    if user_voice and isinstance(user_voice.channel, discord.VoiceChannel):
+        return user_voice.channel
+    return None
+
+@bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice call network.")
+@app_commands.describe(
+    network_code="The shared network code for this voice bridge",
+    voice_channel="Voice channel to link (optional, defaults to the one you're in)"
+)
+async def link_vc(interaction: discord.Interaction, network_code: str, voice_channel: discord.VoiceChannel = None):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        return
+    if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need the **Manage Channels** permission to link a voice channel.", ephemeral=True)
+        return
+
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message(
+            "❌ Pick a `voice_channel` in the option, or join the voice channel you want to link first.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    code = network_code.strip().lower()
+    await asyncio.to_thread(add_link, "vc_code_relays", code, target.id)
+    linked = await asyncio.to_thread(get_links, "vc_code_relays", code)
+
+    await interaction.followup.send(
+        f"🎙️ Linked voice channel **{target.name}** to voice network `{code}`! "
+        f"({len(linked)} channels connected)\n"
+        f"The bot joins automatically when someone enters a linked channel and leaves when it's empty."
+    )
+
+    # If people are already in the channel, join now.
+    if humans_in(target) > 0:
+        await maybe_join_voice(target)
+
+@bot.tree.command(name="unlink-vc", description="Disconnect a voice channel from its voice call network.")
+@app_commands.describe(voice_channel="Voice channel to unlink (optional, defaults to the one you're in)")
+async def unlink_vc(interaction: discord.Interaction, voice_channel: discord.VoiceChannel = None):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        return
+    if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need the **Manage Channels** permission to unlink a voice channel.", ephemeral=True)
+        return
+
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message(
+            "❌ Pick a `voice_channel` in the option, or join the voice channel you want to unlink first.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    codes = await get_vc_codes(target.id)
+    if not codes:
+        await interaction.followup.send(f"⚠️ **{target.name}** is not linked to any voice network.", ephemeral=True)
+        return
+
+    for code in codes:
+        await asyncio.to_thread(remove_link, "vc_code_relays", code, target.id)
+
+    session = voice_sessions.get(interaction.guild.id)
+    if session and session.channel_id == target.id:
+        await end_voice_session(interaction.guild.id)
+
+    await interaction.followup.send(f"🔌 Disconnected voice channel **{target.name}** from the voice network.")
+
+@bot.tree.command(name="voice-status", description="Show the live status of the voice bridge in this server.")
+async def voice_status(interaction: discord.Interaction):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        return
+
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # Linux: KB -> MB (peak)
+    lines = [
+        f"Active voice sessions (all servers): `{len(voice_sessions)}/{MAX_VOICE_SESSIONS}`",
+        f"libopus loaded: `{discord.opus.is_loaded()}`",
+        f"Peak memory: `{rss_mb:.0f} MB`",
+    ]
+
+    session = voice_sessions.get(interaction.guild.id) if interaction.guild else None
+    if session:
+        peers = [s for s in voice_sessions.values() if s is not session and (s.codes & session.codes)]
+        lines += [
+            f"This server: connected to <#{session.channel_id}>, networks `{', '.join(sorted(session.codes))}`",
+            f"Other servers on a call with you: `{len(peers)}`",
+            f"Audio frames heard here: `{session.frames_in}` · frames played here: `{session.frames_out}`",
+        ]
+        if session.frames_in == 0:
+            lines.append("_No audio received yet. If people are talking and this stays 0, receive is failing (check the logs / DAVE note)._")
+    else:
+        lines.append("This server: not in a call right now (the bot joins when someone enters a linked voice channel).")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # ------------------------------------------------------------------------------
 # YOUTUBE & WEB SEARCH COMMANDS
