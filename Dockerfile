@@ -14,5 +14,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY discord_bot_voice.py .
-CMD ["python", "discord_bot_voice.py"]
+COPY discord_bot-LUX-NET.py .
+CMD ["python", "discord_bot-LUX-NET.py"]
