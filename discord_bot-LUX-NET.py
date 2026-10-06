@@ -501,6 +501,44 @@ async def keepalive_loop():
 OPUS_SILENCE = b"\xf8\xff\xfe"
 DAVE_FOOTER = b"\xfa\xfa"
 
+# Diagnostics shown in /voice-status (plain ints, updated from voice threads).
+voice_stats = {"dave_ok": 0, "dave_fail": 0, "plain": 0, "decode_err": 0}
+
+
+def patch_opus_decode_safety():
+    """discord-ext-voice-recv decodes *every* RTP packet it receives as Opus, and a
+    single undecodable packet (corrupted data, a non-audio stream, a packet from a
+    key transition...) raises OpusError inside its packet-router thread, which kills
+    the thread and permanently stops receiving for that call. Make a bad packet
+    cost one 20ms gap of silence instead."""
+    if not VOICE_OK:
+        return
+    try:
+        from discord.ext.voice_recv import opus as vr_opus
+    except Exception as e:
+        logger.warning(f"Could not apply decode safety patch: {e!r}")
+        return
+
+    original = vr_opus.PacketDecoder._decode_packet
+
+    def safe_decode(self, packet):
+        try:
+            return original(self, packet)
+        except discord.opus.OpusError as e:
+            voice_stats["decode_err"] += 1
+            if voice_stats["decode_err"] <= 5:
+                d = getattr(packet, "decrypted_data", None) or b""
+                logger.warning(
+                    f"Skipped undecodable voice packet ({e}): ssrc={self.ssrc} len={len(d)} "
+                    f"head={d[:6].hex()} tail={d[-4:].hex()}"
+                )
+            return packet, SILENCE
+
+    vr_opus.PacketDecoder._decode_packet = safe_decode
+
+
+patch_opus_decode_safety()
+
 
 def install_dave_receive(vc):
     """Discord now end-to-end encrypts all voice (DAVE). discord.py 2.7 handles that
@@ -517,14 +555,21 @@ def install_dave_receive(vc):
     def decrypt_rtp(packet):
         data = inner(packet)
         if data[-2:] != DAVE_FOOTER:
+            voice_stats["plain"] += 1
             return data
         session = getattr(vc._connection, "dave_session", None)
         user_id = vc._get_id_from_ssrc(packet.ssrc)
         if session is None or not session.ready or user_id is None:
+            voice_stats["dave_fail"] += 1
             return OPUS_SILENCE
         try:
-            return bytes(session.decrypt(user_id, davey.MediaType.audio, bytes(data)))
-        except Exception:
+            out = bytes(session.decrypt(user_id, davey.MediaType.audio, bytes(data)))
+            voice_stats["dave_ok"] += 1
+            return out
+        except Exception as e:
+            voice_stats["dave_fail"] += 1
+            if voice_stats["dave_fail"] <= 5:
+                logger.warning(f"DAVE decrypt failed for user {user_id}: {e!r}")
             return OPUS_SILENCE
 
     reader.decryptor.decrypt_rtp = decrypt_rtp
@@ -595,7 +640,16 @@ if VOICE_OK:
             self.mixer.playing = True
             self.mixer.idle = 0
             try:
-                self.vc.play(self.mixer, after=self._after_play)
+                # Voice-tuned encoder: less CPU and bandwidth than discord.py's music-oriented defaults.
+                self.vc.play(
+                    self.mixer,
+                    after=self._after_play,
+                    application="voip",
+                    bitrate=64,
+                    fec=True,
+                    expected_packet_loss=0.05,
+                    signal_type="voice",
+                )
             except Exception as e:
                 self.mixer.playing = False
                 logger.error(f"Could not start voice playback in guild {self.guild_id}: {e}")
@@ -701,6 +755,7 @@ async def maybe_join_voice(channel: discord.VoiceChannel):
         voice_sessions[gid] = session
         vc.listen(RelaySink(session))
         install_dave_receive(vc)
+        logger.info(f"DAVE receive patch active: {davey is not None}")
         logger.info(f"Voice session started in guild {gid} on #{channel.name} (codes: {sorted(codes)})")
     except Exception as e:
         logger.error(f"Failed to join voice channel {channel.id}: {e}")
@@ -723,7 +778,9 @@ async def maybe_leave_voice(channel: discord.abc.GuildChannel):
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     # The bot itself was disconnected/kicked: drop our session state.
     if bot.user and member.id == bot.user.id:
-        if before.channel and after.channel is None:
+        session = voice_sessions.get(member.guild.id)
+        # disconnected, or dragged to a different channel by an admin: drop our session state
+        if session and (after.channel is None or after.channel.id != session.channel_id):
             await end_voice_session(member.guild.id)
         return
 
@@ -1247,6 +1304,8 @@ async def voice_status(interaction: discord.Interaction):
             f"This server: connected to <#{session.channel_id}>, networks `{', '.join(sorted(session.codes))}`",
             f"Other servers on a call with you: `{len(peers)}`",
             f"Audio frames heard here: `{session.frames_in}` · frames played here: `{session.frames_out}`",
+            f"Decrypt/decode (all servers): DAVE ok `{voice_stats['dave_ok']}`, DAVE failed `{voice_stats['dave_fail']}`, "
+            f"unencrypted `{voice_stats['plain']}`, bad packets skipped `{voice_stats['decode_err']}`",
         ]
         if session.frames_in == 0:
             lines.append("_No audio received yet. If people are talking and this stays 0, receive is failing (check the logs / DAVE note)._")
