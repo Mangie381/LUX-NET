@@ -407,7 +407,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot || not message.guild || message.webhook_id:
+    if message.author.bot or not message.guild or message.webhook_id:
         return
 
     await bot.process_commands(message)
@@ -572,7 +572,6 @@ class PollView(discord.ui.View):
         
         counts, total, avg = get_poll_results(self.poll_id)
         
-        # Build updated embed text
         embed = interaction.message.embeds[0]
         result_desc = (
             f"In case you aren’t aware, these are the ratings:\n"
@@ -622,7 +621,6 @@ async def ping(interaction: discord.Interaction):
 async def poll(interaction: discord.Interaction, title: str = "Movie reaction ratings overview"):
     await interaction.response.defer()
 
-    # Send message first to get message id for poll mapping
     now_str = datetime.now().strftime("%m/%d/%Y, %H:%M")
     author_name = interaction.user.display_name
 
@@ -645,7 +643,6 @@ async def poll(interaction: discord.Interaction, title: str = "Movie reaction ra
 
     temp_msg = await interaction.followup.send(embed=embed, wait=True)
     
-    # Use message id as poll id
     view = PollView(temp_msg.id)
     await temp_msg.edit(view=view)
 
