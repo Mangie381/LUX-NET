@@ -4,6 +4,7 @@ import asyncio
 import logging
 import io
 from threading import Thread
+from datetime import datetime
 
 import discord
 from discord import app_commands
@@ -96,6 +97,36 @@ def get_mirrored_targets(msg_id: int):
     except Exception as e:
         logger.error(f"Failed to fetch message mapping from Supabase: {e}")
         return []
+
+# Poll Database Helpers
+def cast_vote(poll_id: int, user_id: int, rating: int):
+    try:
+        supabase.table("poll_votes").upsert(
+            {"poll_id": poll_id, "user_id": str(user_id), "rating": rating},
+            on_conflict="poll_id,user_id"
+        ).execute()
+    except Exception as e:
+        logger.error(f"Failed to cast vote in Supabase: {e}")
+
+def get_poll_results(poll_id: int):
+    try:
+        res = supabase.table("poll_votes").select("rating").eq("poll_id", poll_id).execute()
+        votes = res.data
+        counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        total_votes = len(votes)
+        total_score = 0
+
+        for v in votes:
+            r = v["rating"]
+            if r in counts:
+                counts[r] += 1
+                total_score += r
+
+        avg = round(total_score / total_votes, 2) if total_votes > 0 else 0.0
+        return counts, total_votes, avg
+    except Exception as e:
+        logger.error(f"Failed to fetch poll results: {e}")
+        return {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}, 0, 0.0
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -198,7 +229,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
                     try:
                         await target_msg.add_reaction(emoji)
                     except discord.HTTPException:
-                        pass  # Reaction already exists or cannot be added
+                        pass
         except Exception as e:
             logger.error(f"Failed to add cross-server reaction to message {target_msg_id}: {e}")
 
@@ -376,7 +407,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild or message.webhook_id:
+    if message.author.bot || not message.guild || message.webhook_id:
         return
 
     await bot.process_commands(message)
@@ -528,12 +559,95 @@ async def on_message(message: discord.Message):
                         logger.error(f"Error relaying message to {target_channel.id}: {e}")
 
 # ------------------------------------------------------------------------------
-# SLASH COMMANDS (TEXT, THREADS, FORUMS, & VOICE BRIDGES)
+# POLL VIEW & BUTTONS
+# ------------------------------------------------------------------------------
+class PollView(discord.ui.View):
+    def __init__(self, poll_id: int):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+
+    async def handle_vote(self, interaction: discord.Interaction, rating: int):
+        user_id = interaction.user.id
+        cast_vote(self.poll_id, user_id, rating)
+        
+        counts, total, avg = get_poll_results(self.poll_id)
+        
+        # Build updated embed text
+        embed = interaction.message.embeds[0]
+        result_desc = (
+            f"In case you aren’t aware, these are the ratings:\n"
+            f"- **1 star**, the worst rating ({counts[1]} votes)\n"
+            f"- **2 stars**, a bad rating ({counts[2]} votes)\n"
+            f"- **3 stars**, a neutral rating ({counts[3]} votes)\n"
+            f"- **4 stars**, a good rating ({counts[4]} votes)\n"
+            f"- **5 stars**, the best rating ({counts[5]} votes)\n\n"
+            f"⭐ **Total Votes:** {total} | 📊 **Average Rating:** {avg} / 5.0\n\n"
+            f"So go on and react to television programs by reacting one of the five ratings mentioned!"
+        )
+        embed.description = result_desc
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.followup.send(f"✅ Your **{rating}-star** vote has been recorded successfully!", ephemeral=True)
+
+    @discord.ui.button(label="1 ⭐", style=discord.ButtonStyle.secondary, custom_id="poll_1")
+    async def vote_1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_vote(interaction, 1)
+
+    @discord.ui.button(label="2 ⭐", style=discord.ButtonStyle.secondary, custom_id="poll_2")
+    async def vote_2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_vote(interaction, 2)
+
+    @discord.ui.button(label="3 ⭐", style=discord.ButtonStyle.primary, custom_id="poll_3")
+    async def vote_3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_vote(interaction, 3)
+
+    @discord.ui.button(label="4 ⭐", style=discord.ButtonStyle.primary, custom_id="poll_4")
+    async def vote_4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_vote(interaction, 4)
+
+    @discord.ui.button(label="5 ⭐", style=discord.ButtonStyle.success, custom_id="poll_5")
+    async def vote_5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_vote(interaction, 5)
+
+# ------------------------------------------------------------------------------
+# SLASH COMMANDS (BRIDGES, POLLS, YOUTUBE, & SEARCH)
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"Pong! 🏓 `{latency}ms`", ephemeral=True)
+
+@bot.tree.command(name="poll", description="Create a movie/television rating poll.")
+@app_commands.describe(title="Title of the review or forum post overview")
+async def poll(interaction: discord.Interaction, title: str = "Movie reaction ratings overview"):
+    await interaction.response.defer()
+
+    # Send message first to get message id for poll mapping
+    now_str = datetime.now().strftime("%m/%d/%Y, %H:%M")
+    author_name = interaction.user.display_name
+
+    embed = discord.Embed(
+        title=f"⭐ {title}",
+        description=(
+            f"In case you aren’t aware, these are the ratings:\n"
+            f"- **1 star**, the worst rating (0 votes)\n"
+            f"- **2 stars**, a bad rating (0 votes)\n"
+            f"- **3 stars**, a neutral rating (0 votes)\n"
+            f"- **4 stars**, a good rating (0 votes)\n"
+            f"- **5 stars**, the best rating (0 votes)\n\n"
+            f"⭐ **Total Votes:** 0 | 📊 **Average Rating:** 0.0 / 5.0\n\n"
+            f"So go on and react to television programs by reacting one of the five ratings mentioned!"
+        ),
+        color=discord.Color.gold()
+    )
+    embed.set_author(name=f"{author_name}, OP", icon_url=interaction.user.display_avatar.url)
+    embed.set_footer(text=f"— {now_str}")
+
+    temp_msg = await interaction.followup.send(embed=embed, wait=True)
+    
+    # Use message id as poll id
+    view = PollView(temp_msg.id)
+    await temp_msg.edit(view=view)
 
 @bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
 @app_commands.describe(network_code="The network code to inspect")
@@ -727,7 +841,7 @@ async def unlink_thread(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
-# YOUTUBE & WEB SEARCH COMMANDS (MEMORY EFFICIENT & ROBUST)
+# YOUTUBE & WEB SEARCH COMMANDS
 # ------------------------------------------------------------------------------
 class YouTubeDropdown(discord.ui.Select):
     def __init__(self, options):
@@ -782,7 +896,6 @@ async def play(interaction: discord.Interaction, search: str):
         except Exception as e:
             logger.error(f"yt_dlp search error: {e}")
 
-        # Fallback to DuckDuckGo video search if yt_dlp fails
         if not entries:
             try:
                 with DDGS() as ddgs:
@@ -835,7 +948,6 @@ async def search(interaction: discord.Interaction, query: str):
 
         await interaction.followup.send(embed=embed)
     except Exception as e:
-    
         logger.error(f"Search error: {e}")
         await interaction.followup.send(f"❌ An error occurred while performing the search: {e}")
 
