@@ -12,7 +12,7 @@ from discord.ext import commands
 from flask import Flask
 from supabase import create_client, Client
 import yt_dlp
-from googlesearch import search as google_search
+from duckduckgo-search import DDGS  # using duckduckgo-search package
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -97,6 +97,24 @@ def get_mirrored_targets(msg_id: int):
     except Exception as e:
         logger.error(f"Failed to fetch message mapping from Supabase: {e}")
         return []
+
+# ------------------------------------------------------------------------------
+# SEARCH HELPER (DUCKDUCKGO WITH FALLBACK)
+# ------------------------------------------------------------------------------
+def google_search(query: str, num_results: int = 5):
+    results = []
+    try:
+        with DDGS() as ddgs:
+            res = list(ddgs.text(query, max_results=num_results))
+            if res:
+                results = [r.get("href") for r in res if "href" in r]
+    except Exception as e:
+        logger.error(f"DuckDuckGo Search error: {e}")
+
+    if not results:
+        results = [f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"]
+        
+    return results
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -872,32 +890,26 @@ async def play(interaction: discord.Interaction, search: str):
     view = YouTubeSelectView(entries)
     await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
-@bot.tree.command(name="search", description="Perform a fast web search via Google.")
+@bot.tree.command(name="search", description="Perform a fast web search via DuckDuckGo.")
 @app_commands.describe(query="What would you like to search for?")
 async def search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
     try:
-        results = []
         loop = asyncio.get_event_loop()
-        urls = await loop.run_in_executor(None, lambda: list(google_search(query, num_results=5)))
+        urls = await loop.run_in_executor(None, lambda: google_search(query, num_results=5))
 
-        for url in urls:
-            results.append({"title": url, "href": url, "body": "Google Search Result Link"})
-
-        if not results:
+        if not urls:
             await interaction.followup.send(f"⚠ No results found for `{query}`.")
             return
 
         embed = discord.Embed(
-            title=f"🔍 Google Search Results for: `{query}`",
+            title=f"🔍 Search Results for: `{query}`",
             color=discord.Color.green()
         )
 
-        for i, res in enumerate(results[:5], 1):
-            title = res.get("title", "No Title")
-            href = res.get("href", "#")
-            embed.add_field(name=f"{i}. Result", value=f"[Click here to visit]({href})", inline=False)
+        for i, url in enumerate(urls[:5], 1):
+            embed.add_field(name=f"{i}. Result", value=f"[Click here to visit]({url})", inline=False)
 
         await interaction.followup.send(embed=embed)
     except Exception as e:
