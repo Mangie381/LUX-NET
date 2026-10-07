@@ -4,10 +4,13 @@ import asyncio
 import logging
 import io
 import resource
+import math
+import re
+import uuid
 import urllib.request
 from collections import deque
-from threading import Thread
-from datetime import datetime, timedelta
+from threading import Thread, Lock
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -128,17 +131,33 @@ def get_mirrored_targets(msg_id: int):
 # ------------------------------------------------------------------------------
 # GLOBAL BOT BAN HELPERS
 # ------------------------------------------------------------------------------
-def is_user_banned(user_id: int) -> bool:
+# Bans are kept in memory and refreshed in the background. is_user_banned() is called for
+# every message, reaction, button click and (most importantly) every 20 ms voice frame, so it
+# must never touch the network.
+_banned_ids: set = set()
+
+def refresh_ban_cache() -> bool:
+    global _banned_ids
     try:
-        res = supabase.table("bot_bans").select("user_id").eq("user_id", user_id).limit(1).execute()
-        return len(res.data) > 0
+        res = supabase.table("bot_bans").select("user_id").execute()
+        _banned_ids = {int(row["user_id"]) for row in res.data}
+        return True
     except Exception as e:
-        logger.error(f"Error checking bot ban for {user_id}: {e}")
+        logger.error(f"Failed to refresh bot ban cache: {e}")
         return False
+
+def is_user_banned(user_id: int) -> bool:
+    return user_id in _banned_ids
+
+async def ban_cache_loop():
+    while True:
+        await asyncio.sleep(60)
+        await asyncio.to_thread(refresh_ban_cache)
 
 def add_bot_ban(user_id: int):
     try:
         supabase.table("bot_bans").upsert({"user_id": user_id}, on_conflict="user_id").execute()
+        _banned_ids.add(user_id)
         logger.info(f"Globally banned user ID {user_id} from using the bot.")
     except Exception as e:
         logger.error(f"Failed to add bot ban for {user_id}: {e}")
@@ -146,6 +165,7 @@ def add_bot_ban(user_id: int):
 def remove_bot_ban(user_id: int):
     try:
         supabase.table("bot_bans").delete().eq("user_id", user_id).execute()
+        _banned_ids.discard(user_id)
         logger.info(f"Removed global ban for user ID {user_id}.")
     except Exception as e:
         logger.error(f"Failed to remove bot ban for {user_id}: {e}")
@@ -260,6 +280,272 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
         return None
 
 # ------------------------------------------------------------------------------
+# STAR RATING POLLS (1-5 stars, persistent buttons, synced across relayed channels)
+# Needs the tables in rating_poll_setup.sql.
+# ------------------------------------------------------------------------------
+RATING_INTRO = "In case you aren\u2019t aware, these are the ratings:"
+RATING_DEFAULT_PROMPT = "So go on and react to television programs by reacting one of the five ratings mentioned!"
+RATING_TEXT = {
+    1: ("1 star", "the worst rating"),
+    2: ("2 stars", "a bad rating"),
+    3: ("3 stars", "a neutral rating"),
+    4: ("4 stars", "a good rating"),
+    5: ("5 stars", "the best rating"),
+}
+RATING_STYLES = {
+    1: discord.ButtonStyle.secondary,
+    2: discord.ButtonStyle.secondary,
+    3: discord.ButtonStyle.primary,
+    4: discord.ButtonStyle.primary,
+    5: discord.ButtonStyle.success,
+}
+_rating_meta: dict = {}
+
+
+def _parse_ts(value: str) -> datetime:
+    """Tolerant ISO parser (Postgres can return 5-digit fractions, which older Pythons reject)."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        m = re.match(r"^(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d)(?:\.(\d+))?(.*)$", value)
+        if not m:
+            return datetime.now(timezone.utc)
+        frac = (m.group(2) or "0")[:6].ljust(6, "0")
+        tz = (m.group(3) or "+00:00").replace("Z", "+00:00")
+        return datetime.fromisoformat(f"{m.group(1)}.{frac}{tz}")
+
+
+def build_rating_embed(title: str, prompt: str, counts: dict, created_at: datetime) -> discord.Embed:
+    total = sum(counts.get(n, 0) for n in range(1, 6))
+    average = (sum(n * counts.get(n, 0) for n in range(1, 6)) / total) if total else 0.0
+
+    lines = [RATING_INTRO]
+    for n in range(1, 6):
+        name, blurb = RATING_TEXT[n]
+        lines.append(f"- **{name}**, {blurb} ({counts.get(n, 0)} votes)")
+
+    description = (
+        "\n".join(lines)
+        + f"\n\n\u2b50 **Total Votes:** {total} | \U0001F4CA **Average Rating:** {average:.1f} / 5.0"
+        + f"\n\n{prompt}"
+    )
+    # No footer text: Discord renders the timestamp on its own as "\u2014 dd/mm/yyyy, hh:mm".
+    return discord.Embed(
+        title=f"\u2b50 {title}"[:256],
+        description=description[:4000],
+        color=discord.Color.gold(),
+        timestamp=created_at,
+    )
+
+
+class RatingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"lux_rate:(?P<poll>[0-9a-f]{8,32}):(?P<n>[1-5])"):
+    """One star button. Registered as a dynamic item so it keeps working after bot restarts."""
+
+    def __init__(self, poll_id: str, n: int):
+        super().__init__(
+            discord.ui.Button(
+                style=RATING_STYLES[n],
+                label=f"{n} \u2b50",
+                custom_id=f"lux_rate:{poll_id}:{n}",
+            )
+        )
+        self.poll_id = poll_id
+        self.n = n
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match, /):
+        return cls(match["poll"], int(match["n"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if is_user_banned(interaction.user.id):
+            await interaction.response.send_message("\u274c You are globally banned from using this bot.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        try:
+            result = await asyncio.to_thread(rating_vote, self.poll_id, interaction.user.id, self.n)
+        except Exception as e:
+            logger.error(f"Rating vote failed for poll {self.poll_id}: {e}")
+            await interaction.followup.send("\u274c Couldn't record your vote, please try again.", ephemeral=True)
+            return
+
+        if result is None:
+            await interaction.followup.send("\u274c This rating poll no longer exists.", ephemeral=True)
+            return
+
+        meta, counts, my_vote, targets = result
+        embed = build_rating_embed(meta["title"], meta["prompt"], counts, meta["created_at"])
+        try:
+            await interaction.edit_original_response(embed=embed)
+        except Exception as e:
+            logger.warning(f"Could not update clicked rating poll message: {e}")
+
+        if my_vote is None:
+            note = "\u21a9\ufe0f Your rating was removed."
+        else:
+            note = f"\u2705 You rated this **{my_vote} \u2b50**."
+        await interaction.followup.send(note, ephemeral=True)
+
+        clicked_id = interaction.message.id if interaction.message else None
+        asyncio.create_task(sync_rating_copies(embed, targets, exclude_message_id=clicked_id))
+
+
+def build_rating_view(poll_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for n in range(1, 6):
+        view.add_item(RatingButton(poll_id, n))
+    return view
+
+
+async def _setup_hook():
+    bot.add_dynamic_items(RatingButton)
+
+bot.setup_hook = _setup_hook
+
+
+def rating_db_create(poll_id: str, title: str, prompt: str, created_at: datetime, author_id: int) -> bool:
+    try:
+        supabase.table("rating_polls").insert({
+            "poll_id": poll_id,
+            "title": title,
+            "prompt": prompt,
+            "created_by": author_id,
+            "created_at": created_at.isoformat(),
+        }).execute()
+        _rating_meta[poll_id] = {"title": title, "prompt": prompt, "created_at": created_at}
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create rating poll (did you run rating_poll_setup.sql?): {e}")
+        return False
+
+
+def rating_db_add_message(poll_id: str, channel_id: int, message_id: int):
+    try:
+        supabase.table("rating_poll_messages").insert(
+            {"poll_id": poll_id, "channel_id": channel_id, "message_id": message_id}
+        ).execute()
+    except Exception as e:
+        logger.error(f"Failed to store rating poll message: {e}")
+
+
+def _rating_get_meta(poll_id: str):
+    meta = _rating_meta.get(poll_id)
+    if meta:
+        return meta
+    res = supabase.table("rating_polls").select("title,prompt,created_at").eq("poll_id", poll_id).limit(1).execute()
+    if not res.data:
+        return None
+    row = res.data[0]
+    meta = {"title": row["title"], "prompt": row["prompt"], "created_at": _parse_ts(row["created_at"])}
+    _rating_meta[poll_id] = meta
+    return meta
+
+
+def _rating_counts(poll_id: str) -> dict:
+    counts = {n: 0 for n in range(1, 6)}
+    try:
+        res = supabase.rpc("rating_counts", {"p_poll_id": poll_id}).execute()
+        for row in res.data:
+            counts[int(row["star"])] = int(row["votes"])
+        return counts
+    except Exception:
+        # Fallback if the rating_counts() SQL function was not created.
+        counts = {n: 0 for n in range(1, 6)}
+        res = supabase.table("rating_votes").select("rating").eq("poll_id", poll_id).limit(100000).execute()
+        for row in res.data:
+            counts[int(row["rating"])] += 1
+        return counts
+
+
+def rating_vote(poll_id: str, user_id: int, rating: int):
+    """Toggle/replace a user's vote. Returns (meta, counts, my_vote_or_None, [(channel_id, message_id)])."""
+    meta = _rating_get_meta(poll_id)
+    if meta is None:
+        return None
+
+    existing = supabase.table("rating_votes").select("rating").eq("poll_id", poll_id).eq("user_id", user_id).limit(1).execute()
+    if existing.data and int(existing.data[0]["rating"]) == rating:
+        supabase.table("rating_votes").delete().eq("poll_id", poll_id).eq("user_id", user_id).execute()
+        my_vote = None
+    else:
+        supabase.table("rating_votes").upsert(
+            {"poll_id": poll_id, "user_id": user_id, "rating": rating},
+            on_conflict="poll_id,user_id",
+        ).execute()
+        my_vote = rating
+
+    counts = _rating_counts(poll_id)
+    msgs = supabase.table("rating_poll_messages").select("channel_id,message_id").eq("poll_id", poll_id).execute()
+    targets = [(int(r["channel_id"]), int(r["message_id"])) for r in msgs.data]
+    return meta, counts, my_vote, targets
+
+
+def _thread_kw(channel) -> dict:
+    return {"thread": channel} if isinstance(channel, discord.Thread) else {}
+
+
+async def sync_rating_copies(embed: discord.Embed, targets: list, exclude_message_id: int | None = None):
+    """Push the fresh embed to every copy of a poll in every linked server."""
+    async def one(channel_id: int, message_id: int):
+        if message_id == exclude_message_id:
+            return
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception:
+                return
+        webhook = await get_or_create_webhook(channel)
+        if webhook:
+            try:
+                await webhook.edit_message(message_id, embed=embed, **_thread_kw(channel))
+                return
+            except Exception:
+                pass
+        try:
+            await channel.get_partial_message(message_id).edit(embed=embed)
+        except Exception as e:
+            logger.warning(f"Could not sync rating poll copy {message_id} in {channel_id}: {e}")
+
+    await asyncio.gather(*(one(c, m) for c, m in targets))
+
+
+async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username: str, avatar_url: str):
+    webhook = await get_or_create_webhook(channel)
+    if webhook:
+        try:
+            return await webhook.send(
+                username=username,
+                avatar_url=avatar_url,
+                embed=embed,
+                view=build_rating_view(poll_id),
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+                **_thread_kw(channel),
+            )
+        except Exception as e:
+            logger.warning(f"Webhook poll post failed in {channel.id}, falling back to bot message: {e}")
+    try:
+        return await channel.send(embed=embed, view=build_rating_view(poll_id))
+    except Exception as e:
+        logger.error(f"Could not post rating poll in {channel.id}: {e}")
+        return None
+
+
+def relay_targets_for(channel) -> list:
+    if isinstance(channel, discord.Thread):
+        table, col = "thread_relays", _LINK_COLS["thread_relays"]
+    else:
+        table, col = "text_relays", _LINK_COLS["text_relays"]
+    ids = set()
+    res = supabase.table(table).select("network_code").eq(col, channel.id).execute()
+    for row in res.data:
+        r = supabase.table(table).select(col).eq("network_code", row["network_code"]).neq(col, channel.id).execute()
+        ids.update(int(x[col]) for x in r.data)
+    return list(ids)
+
+
+# ------------------------------------------------------------------------------
 # BOT EVENTS (TEXT, THREADS, FORUMS, VOICE, & REACTIONS)
 # ------------------------------------------------------------------------------
 _ready_done = False
@@ -276,6 +562,7 @@ async def on_ready():
     if VOICE_OK and not ensure_opus():
         logger.warning("libopus not found - voice bridge disabled until it is installed (see Dockerfile).")
     asyncio.create_task(keepalive_loop())
+    asyncio.create_task(ban_cache_loop())
 
     for guild in bot.guilds:
         try:
@@ -485,8 +772,23 @@ async def on_thread_create(thread: discord.Thread):
 # ------------------------------------------------------------------------------
 FRAME_BYTES = 3840                 
 SILENCE = b"\x00" * FRAME_BYTES
-MAX_BUFFERED_FRAMES = 6            
-IDLE_FRAMES_BEFORE_STOP = 50       
+# --- latency / quality tuning (all overridable with environment variables) ---------
+# Per-speaker playback queue, in 20 ms frames. Hard cap on how far behind live audio can get.
+MAX_BUFFERED_FRAMES = int(os.environ.get("VOICE_MAX_QUEUE_FRAMES", "4"))
+# A new talk-spurt waits until this many frames are queued (or PRIME_MAX_WAIT ticks pass).
+# This is the only place network jitter gets smoothed, and it costs at most ~20-40 ms.
+PRIME_FRAMES = int(os.environ.get("VOICE_PRIME_FRAMES", "2"))
+PRIME_MAX_WAIT = 2
+# Keep the player alive ~0.6 s after the last frame so short pauses don't restart it.
+IDLE_FRAMES_BEFORE_STOP = 30
+# voice_recv jitter buffer (per speaker). maxsize also bounds how long output stalls when a
+# packet is lost/late (library default is 10 frames = 200 ms). prefsize is reorder tolerance.
+JITTER_MAX_PACKETS = int(os.environ.get("VOICE_JITTER_MAX", "4"))
+JITTER_PREF_PACKETS = int(os.environ.get("VOICE_JITTER_PREF", "1"))
+# Outgoing Opus encoder.
+OPUS_APPLICATION = os.environ.get("VOICE_OPUS_APPLICATION", "audio")   # audio | voip | lowdelay
+OPUS_BITRATE_KBPS = int(os.environ.get("VOICE_BITRATE_KBPS", "96"))
+OPUS_EXPECTED_LOSS = float(os.environ.get("VOICE_EXPECTED_LOSS", "0.05"))
 MAX_VOICE_SESSIONS = int(os.environ.get("MAX_VOICE_SESSIONS", "4"))
 
 voice_sessions: dict = {}          
@@ -526,7 +828,7 @@ async def keepalive_loop():
 OPUS_SILENCE = b"\xf8\xff\xfe"
 DAVE_FOOTER = b"\xfa\xfa"
 
-voice_stats = {"dave_ok": 0, "dave_fail": 0, "plain": 0, "decode_err": 0}
+voice_stats = {"dave_ok": 0, "dave_fail": 0, "plain": 0, "decode_err": 0, "mix_drop": 0, "rebuffer": 0}
 
 
 def patch_opus_decode_safety():
@@ -554,6 +856,21 @@ def patch_opus_decode_safety():
             return packet, SILENCE
 
     vr_opus.PacketDecoder._decode_packet = safe_decode
+
+    # Smaller jitter buffer = lower latency and no 200 ms stall after a lost packet.
+    original_init = vr_opus.PacketDecoder.__init__
+
+    def tuned_init(self, router, ssrc):
+        original_init(self, router, ssrc)
+        try:
+            maxsize = max(2, JITTER_MAX_PACKETS)
+            self._buffer = vr_opus.JitterBuffer(
+                maxsize=maxsize, prefsize=min(max(0, JITTER_PREF_PACKETS), maxsize), prefill=1
+            )
+        except Exception as e:
+            logger.warning(f"Could not tune jitter buffer: {e!r}")
+
+    vr_opus.PacketDecoder.__init__ = tuned_init
 
 
 patch_opus_decode_safety()
@@ -590,37 +907,67 @@ def install_dave_receive(vc):
 
 if VOICE_OK:
 
+    class _Speaker:
+        __slots__ = ("dq", "primed", "waited")
+
+        def __init__(self):
+            self.dq = deque(maxlen=MAX_BUFFERED_FRAMES)
+            self.primed = False
+            self.waited = 0
+
     class MixerSource(discord.AudioSource):
         def __init__(self):
-            self.buffers: dict = {}   
+            self.buffers: dict = {}
             self.idle = 0
-            self.playing = False      
+            self.playing = False
 
         def feed(self, speaker_id: int, pcm: bytes):
-            dq = self.buffers.get(speaker_id)
-            if dq is None:
-                dq = self.buffers[speaker_id] = deque(maxlen=MAX_BUFFERED_FRAMES)
+            sp = self.buffers.get(speaker_id)
+            if sp is None:
+                sp = self.buffers[speaker_id] = _Speaker()
+            dq = sp.dq
+            if len(dq) == dq.maxlen:
+                voice_stats["mix_drop"] += 1   # oldest frame is discarded to stay near live
             dq.append(pcm)
+
+        def has_audio(self) -> bool:
+            return any(sp.dq for sp in list(self.buffers.values()))
 
         def read(self) -> bytes:
             frames = []
-            for dq in list(self.buffers.values()):
+            for sp in list(self.buffers.values()):
+                dq = sp.dq
+                if not sp.primed:
+                    if len(dq) >= PRIME_FRAMES or (dq and sp.waited >= PRIME_MAX_WAIT):
+                        sp.primed = True
+                    else:
+                        if dq:
+                            sp.waited += 1
+                        continue
                 try:
                     frames.append(dq.popleft())
                 except IndexError:
-                    pass
+                    sp.primed = False
+                    sp.waited = 0
+                    voice_stats["rebuffer"] += 1
 
             if not frames:
                 self.idle += 1
-                if self.idle >= IDLE_FRAMES_BEFORE_STOP:
+                if self.idle >= IDLE_FRAMES_BEFORE_STOP and not self.has_audio():
                     self.buffers.clear()
+                    self.playing = False   # lets the next frame restart playback immediately
                     return b""
                 return SILENCE
 
             self.idle = 0
-            out = frames[0]
+            if len(frames) == 1:
+                return frames[0]           # one speaker: pass through untouched
+
+            # Several speakers: scale each so the sum has headroom instead of hard clipping.
+            gain = 1.0 / math.sqrt(len(frames))
+            out = audioop.mul(frames[0], 2, gain)
             for f in frames[1:]:
-                out = audioop.add(out, f, 2)
+                out = audioop.add(out, audioop.mul(f, 2, gain), 2)
             return out
 
         def is_opus(self) -> bool:
@@ -631,7 +978,7 @@ if VOICE_OK:
 
     class VoiceSession:
         __slots__ = ("guild_id", "vc", "channel_id", "codes", "mixer",
-                     "frames_in", "frames_out", "loop")
+                     "frames_in", "frames_out", "loop", "_lock", "_gen")
 
         def __init__(self, guild_id, vc, channel_id, codes, loop):
             self.guild_id = guild_id
@@ -642,34 +989,41 @@ if VOICE_OK:
             self.frames_in = 0
             self.frames_out = 0
             self.loop = loop
+            self._lock = Lock()
+            self._gen = 0
 
         def ensure_playing(self):
+            """Safe to call from any thread; starts the player without waiting on the event loop."""
             if self.mixer.playing or not self.vc.is_connected():
                 return
-            self.mixer.playing = True
-            self.mixer.idle = 0
-            try:
-                self.vc.play(
-                    self.mixer,
-                    after=self._after_play,
-                    application="voip",
-                    bitrate=64,
-                    fec=True,
-                    expected_packet_loss=0.05,
-                    signal_type="voice",
-                )
-            except Exception as e:
-                self.mixer.playing = False
-                logger.error(f"Could not start voice playback in guild {self.guild_id}: {e}")
+            with self._lock:
+                if self.mixer.playing or not self.vc.is_connected():
+                    return
+                self.mixer.playing = True
+                self.mixer.idle = 0
+                self._gen += 1
+                gen = self._gen
+                try:
+                    self.vc.play(
+                        self.mixer,
+                        after=lambda err, g=gen: self._after_play(err, g),
+                        application=OPUS_APPLICATION,
+                        bitrate=OPUS_BITRATE_KBPS,
+                        fec=True,
+                        expected_packet_loss=OPUS_EXPECTED_LOSS,
+                        bandwidth="full",
+                        signal_type="voice",
+                    )
+                except Exception as e:
+                    self.mixer.playing = False
+                    logger.debug(f"Could not start voice playback in guild {self.guild_id}: {e}")
 
-        def _after_play(self, error):
+        def _after_play(self, error, gen):
             if error:
                 logger.error(f"Voice playback error in guild {self.guild_id}: {error}")
-            self.loop.call_soon_threadsafe(self._on_play_end)
-
-        def _on_play_end(self):
-            self.mixer.playing = False
-            if any(self.mixer.buffers.values()):
+            if gen == self._gen:
+                self.mixer.playing = False
+            if self.mixer.has_audio():
                 self.ensure_playing()
 
     def route_audio(src: "VoiceSession", speaker_id: int, pcm: bytes):
@@ -680,7 +1034,7 @@ if VOICE_OK:
             dst.mixer.feed(speaker_id, pcm)
             dst.frames_out += 1
             if not dst.mixer.playing:
-                dst.loop.call_soon_threadsafe(dst.ensure_playing)
+                dst.ensure_playing()
 
     class RelaySink(voice_recv.AudioSink):
         def __init__(self, session: VoiceSession):
@@ -688,10 +1042,11 @@ if VOICE_OK:
             self.session = session
 
         def wants_opus(self) -> bool:
-            return False  
+            return False
 
         def write(self, user, data):
-            if user is None or user.bot or is_user_banned(user.id):
+            # Runs on the packet-router thread ~50x/second per speaker: no network, no awaits.
+            if user is None or user.bot or user.id in _banned_ids:
                 return
             pcm = data.pcm
             if pcm and len(pcm) == FRAME_BYTES:
@@ -1013,68 +1368,54 @@ async def list_bot_bans(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error fetching banned users: {e}", ephemeral=True)
 
-@bot.tree.command(name="poll", description="Create a native poll and broadcast it across connected relay channels.")
+@bot.tree.command(name="poll", description="Post a 1-5 star rating poll and sync it across connected relay channels.")
 @app_commands.describe(
-    question="The question for your poll",
-    option1="First option",
-    option2="Second option",
-    option3="Third option (optional)",
-    option4="Fourth option (optional)",
-    duration_hours="How many hours the poll should stay open (default 24)"
+    title="What people are rating (e.g. a TV show)",
+    message="Line shown under the ratings (optional)"
 )
-async def poll(
-    interaction: discord.Interaction, 
-    question: str, 
-    option1: str, 
-    option2: str, 
-    option3: str = None, 
-    option4: str = None, 
-    duration_hours: int = 24
-):
-    await interaction.response.defer()
+async def poll(interaction: discord.Interaction, title: str, message: str = None):
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("\u274c This command can only be used in a server.", ephemeral=True)
+        return
 
-    p = discord.Poll(
-        question=question, 
-        duration=timedelta(hours=duration_hours)
-    )
-    p.add_answer(text=option1)
-    p.add_answer(text=option2)
-    if option3:
-        p.add_answer(text=option3)
-    if option4:
-        p.add_answer(text=option4)
+    await interaction.response.defer(ephemeral=True)
 
-    temp_msg = await interaction.followup.send(poll=p, wait=True)
+    poll_id = uuid.uuid4().hex[:12]
+    prompt = (message or RATING_DEFAULT_PROMPT).strip()[:1000]
+    clean_title = title.strip()[:200]
+    created_at = datetime.now(timezone.utc)
 
-    channel_id = interaction.channel.id
+    created = await asyncio.to_thread(rating_db_create, poll_id, clean_title, prompt, created_at, interaction.user.id)
+    if not created:
+        await interaction.followup.send(
+            "\u274c Couldn't create the poll. Make sure `rating_poll_setup.sql` has been run in Supabase.", ephemeral=True
+        )
+        return
+
     try:
-        res = supabase.table("text_relays").select("network_code").eq("channel_id", channel_id).execute()
-        codes = [row["network_code"] for row in res.data]
-
-        if codes:
-            target_channel_ids = []
-            for code in codes:
-                c_res = supabase.table("text_relays").select("channel_id").eq("network_code", code).neq("channel_id", channel_id).execute()
-                target_channel_ids.extend([row["channel_id"] for row in c_res.data])
-
-            target_channel_ids = list(set(target_channel_ids))
-            webhook_username = f"{interaction.user.display_name} [{interaction.guild.name}] (Poll)"
-
-            for target_id in target_channel_ids:
-                target_channel = bot.get_channel(target_id)
-                if target_channel and isinstance(target_channel, discord.TextChannel):
-                    webhook = await get_or_create_webhook(target_channel)
-                    if webhook:
-                        try:
-                            await webhook.send(
-                                username=webhook_username[:80],
-                                avatar_url=interaction.user.display_avatar.url,
-                                poll=p
-                            )
-                        except Exception as e:
-                            logger.error(f"Error broadcasting poll to channel {target_id}: {e}")
+        target_ids = await asyncio.to_thread(relay_targets_for, interaction.channel)
     except Exception as e:
-        logger.error(f"Error handling cross-server poll relay: {e}")
+        logger.error(f"Error looking up poll relay targets: {e}")
+        target_ids = []
+
+    embed = build_rating_embed(clean_title, prompt, {}, created_at)
+    username = f"{interaction.user.display_name} [{interaction.guild.name}] (Poll)"[:80]
+    avatar_url = interaction.user.display_avatar.url
+
+    posted = 0
+    for cid in [interaction.channel.id] + target_ids:
+        channel = bot.get_channel(cid)
+        if channel is None:
+            continue
+        sent = await post_rating_copy(channel, embed, poll_id, username, avatar_url)
+        if sent:
+            await asyncio.to_thread(rating_db_add_message, poll_id, channel.id, sent.id)
+            posted += 1
+
+    if posted:
+        await interaction.followup.send(f"\u2705 Rating poll posted in {posted} channel(s).", ephemeral=True)
+    else:
+        await interaction.followup.send("\u274c I couldn't post the poll here (check my Send Messages / Manage Webhooks permissions).", ephemeral=True)
 
 @bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
 @app_commands.describe(network_code="The network code to inspect")
@@ -1301,6 +1642,10 @@ async def link_vc(interaction: discord.Interaction, network_code: str, voice_cha
     await asyncio.to_thread(add_link, "vc_code_relays", code, target.id)
     linked = await asyncio.to_thread(get_links, "vc_code_relays", code)
 
+    live = voice_sessions.get(interaction.guild.id)
+    if live and live.channel_id == target.id:
+        live.codes = live.codes | {code}
+
     await interaction.followup.send(
         f"🎙️ Linked voice channel **{target.name}** to voice network `{code}`! "
         f"({len(linked)} channels connected)\n"
@@ -1364,6 +1709,8 @@ async def voice_status(interaction: discord.Interaction):
             f"Audio frames heard here: `{session.frames_in}` · frames played here: `{session.frames_out}`",
             f"Decrypt/decode (all servers): DAVE ok `{voice_stats['dave_ok']}`, DAVE failed `{voice_stats['dave_fail']}`, "
             f"unencrypted `{voice_stats['plain']}`, bad packets skipped `{voice_stats['decode_err']}`",
+            f"Smoothing (all servers): frames dropped to stay live `{voice_stats['mix_drop']}`, re-buffers `{voice_stats['rebuffer']}`",
+            f"Tuning: jitter `{JITTER_MAX_PACKETS}` pkts, queue `{MAX_BUFFERED_FRAMES}` frames, Opus `{OPUS_APPLICATION}` @ `{OPUS_BITRATE_KBPS}` kbps",
         ]
         if session.frames_in == 0:
             lines.append("_No audio received yet. If people are talking and this stays 0, receive is failing (check the logs / DAVE note)._")
@@ -1491,6 +1838,7 @@ def main():
         logger.critical("DISCORD_TOKEN environment variable is missing!")
         sys.exit(1)
 
+    refresh_ban_cache()
     bot.run(token)
 
 if __name__ == "__main__":
