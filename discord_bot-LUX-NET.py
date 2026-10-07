@@ -1163,4 +1163,335 @@ async def link_forum(interaction: discord.Interaction, network_code: str, forum_
     target_forum = forum_channel
     if not target_forum:
         current_channel = interaction.channel
-        if isinstance(current_
+        if isinstance(current_channel, discord.Thread) and isinstance(current_channel.parent, discord.ForumChannel):
+            target_forum = current_channel.parent
+        elif isinstance(current_channel, discord.ForumChannel):
+            target_forum = current_channel
+
+    if not target_forum:
+        await interaction.response.send_message(
+            "❌ Please select a `forum_channel` in the option, run this inside a forum post, or use it directly in a Forum Channel.", 
+            ephemeral=True
+        )
+        return
+
+    code = network_code.strip().lower()
+    add_link("forum_relays", code, target_forum.id)
+    forums = get_links("forum_relays", code)
+    
+    await interaction.response.send_message(
+        f"📌 Linked forum **{target_forum.name}** to network `{code}`! ({len(forums)} connected channels)",
+        ephemeral=False
+    )
+
+@bot.tree.command(name="unlink-forum", description="Disconnect this forum channel from its active network.")
+async def unlink_forum(interaction: discord.Interaction):
+    current_channel = interaction.channel
+    forum_ch = None
+    if isinstance(current_channel, discord.Thread) and isinstance(current_channel.parent, discord.ForumChannel):
+        forum_ch = current_channel.parent
+    elif isinstance(current_channel, discord.ForumChannel):
+        forum_ch = current_channel
+
+    if not forum_ch:
+        await interaction.response.send_message("❌ Please run this command inside a forum post or channel.", ephemeral=True)
+        return
+
+    forum_id = forum_ch.id
+    try:
+        res = supabase.table("forum_relays").select("network_code").eq("forum_channel_id", forum_id).execute()
+        codes = [row["network_code"] for row in res.data]
+
+        if codes:
+            for code in codes:
+                remove_link("forum_relays", code, forum_id)
+            await interaction.response.send_message(f"🔌 Disconnected forum **{forum_ch.name}** from the network.", ephemeral=False)
+        else:
+            await interaction.response.send_message("⚠️ This forum is not currently linked to any network.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error unlinking forum: {e}", ephemeral=True)
+
+@bot.tree.command(name="link-thread", description="Link or create a matching thread across servers using a shared thread code.")
+@app_commands.describe(network_code="The unique code for this thread bridge", thread_name="Name of the thread to create if needed")
+async def link_thread(interaction: discord.Interaction, network_code: str, thread_name: str = None):
+    code = network_code.strip().lower()
+    current_channel = interaction.channel
+
+    if isinstance(current_channel, discord.Thread):
+        add_link("thread_relays", code, current_channel.id)
+        threads = get_links("thread_relays", code)
+        await interaction.response.send_message(
+            f"🧵 Linked this thread (**{current_channel.name}**) to thread network `{code}`! ({len(threads)} connected)",
+            ephemeral=False
+        )
+    elif isinstance(current_channel, discord.TextChannel):
+        if not thread_name:
+            await interaction.response.send_message("❌ Please provide a `thread_name` if running this command in a text channel.", ephemeral=True)
+            return
+
+        try:
+            new_thread = await current_channel.create_thread(name=thread_name, auto_archive_duration=60)
+            add_link("thread_relays", code, new_thread.id)
+            threads = get_links("thread_relays", code)
+            await interaction.response.send_message(
+                f"🧵 Created and linked new thread **#{thread_name}** to thread network `{code}`!",
+                ephemeral=False
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to create thread: {e}", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ This command can only be used in text channels or threads.", ephemeral=True)
+
+@bot.tree.command(name="unlink-thread", description="Disconnect this thread from its active network.")
+async def unlink_thread(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message("❌ You must run this command inside the thread you want to unlink.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel.id
+    try:
+        res = supabase.table("thread_relays").select("network_code").eq("thread_id", thread_id).execute()
+        codes = [row["network_code"] for row in res.data]
+
+        if codes:
+            for code in codes:
+                remove_link("thread_relays", code, thread_id)
+            await interaction.response.send_message(
+                f"🔌 Disconnected thread **{interaction.channel.name}** from the cross-server network.",
+                ephemeral=False
+            )
+        else:
+            await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
+
+# ------------------------------------------------------------------------------
+# VOICE BRIDGE COMMANDS
+# ------------------------------------------------------------------------------
+def _resolve_voice_channel(interaction: discord.Interaction, chosen):
+    if chosen:
+        return chosen
+    user_voice = getattr(interaction.user, "voice", None)
+    if user_voice and isinstance(user_voice.channel, discord.VoiceChannel):
+        return user_voice.channel
+    return None
+
+@bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice call network.")
+@app_commands.describe(
+    network_code="The shared network code for this voice bridge",
+    voice_channel="Voice channel to link (optional, defaults to the one you're in)"
+)
+async def link_vc(interaction: discord.Interaction, network_code: str, voice_channel: discord.VoiceChannel = None):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        return
+    if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need the **Manage Channels** permission to link a voice channel.", ephemeral=True)
+        return
+
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message(
+            "❌ Pick a `voice_channel` in the option, or join the voice channel you want to link first.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    code = network_code.strip().lower()
+    await asyncio.to_thread(add_link, "vc_code_relays", code, target.id)
+    linked = await asyncio.to_thread(get_links, "vc_code_relays", code)
+
+    await interaction.followup.send(
+        f"🎙️ Linked voice channel **{target.name}** to voice network `{code}`! "
+        f"({len(linked)} channels connected)\n"
+        f"The bot joins automatically when someone enters a linked channel and leaves when it's empty."
+    )
+
+    if humans_in(target) > 0:
+        await maybe_join_voice(target)
+
+@bot.tree.command(name="unlink-vc", description="Disconnect a voice channel from its voice call network.")
+@app_commands.describe(voice_channel="Voice channel to unlink (optional, defaults to the one you're in)")
+async def unlink_vc(interaction: discord.Interaction, voice_channel: discord.VoiceChannel = None):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        return
+    if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ You need the **Manage Channels** permission to unlink a voice channel.", ephemeral=True)
+        return
+
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message(
+            "❌ Pick a `voice_channel` in the option, or join the voice channel you want to unlink first.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    codes = await get_vc_codes(target.id)
+    if not codes:
+        await interaction.followup.send(f"⚠️ **{target.name}** is not linked to any voice network.", ephemeral=True)
+        return
+
+    for code in codes:
+        await asyncio.to_thread(remove_link, "vc_code_relays", code, target.id)
+
+    session = voice_sessions.get(interaction.guild.id)
+    if session and session.channel_id == target.id:
+        await end_voice_session(interaction.guild.id)
+
+    await interaction.followup.send(f"🔌 Disconnected voice channel **{target.name}** from the voice network.")
+
+@bot.tree.command(name="voice-status", description="Show the live status of the voice bridge in this server.")
+async def voice_status(interaction: discord.Interaction):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        return
+
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  
+    lines = [
+        f"Active voice sessions (all servers): `{len(voice_sessions)}/{MAX_VOICE_SESSIONS}`",
+        f"libopus loaded: `{discord.opus.is_loaded()}`",
+        f"Peak memory: `{rss_mb:.0f} MB`",
+    ]
+
+    session = voice_sessions.get(interaction.guild.id) if interaction.guild else None
+    if session:
+        peers = [s for s in voice_sessions.values() if s is not session and (s.codes & session.codes)]
+        lines += [
+            f"This server: connected to <#{session.channel_id}>, networks `{', '.join(sorted(session.codes))}`",
+            f"Other servers on a call with you: `{len(peers)}`",
+            f"Audio frames heard here: `{session.frames_in}` · frames played here: `{session.frames_out}`",
+            f"Decrypt/decode (all servers): DAVE ok `{voice_stats['dave_ok']}`, DAVE failed `{voice_stats['dave_fail']}`, "
+            f"unencrypted `{voice_stats['plain']}`, bad packets skipped `{voice_stats['decode_err']}`",
+        ]
+        if session.frames_in == 0:
+            lines.append("_No audio received yet. If people are talking and this stays 0, receive is failing (check the logs / DAVE note)._")
+    else:
+        lines.append("This server: not in a call right now (the bot joins when someone enters a linked voice channel).")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+# ------------------------------------------------------------------------------
+# YOUTUBE & WEB SEARCH COMMANDS
+# ------------------------------------------------------------------------------
+class YouTubeDropdown(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Select the correct video from the search...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_url = self.values[0]
+        await interaction.response.send_message(
+            f"✅ You selected: {selected_url}\n(Click the link to open and watch the video directly!)",
+            ephemeral=False
+        )
+
+class YouTubeSelectView(discord.ui.View):
+    def __init__(self, entries):
+        super().__init__(timeout=60)
+        options = []
+        for entry in entries[:5]:
+            title = entry.get('title', 'Unknown Title')[:100]
+            uploader = entry.get('uploader', 'Unknown Channel')[:100]
+            url = entry.get('webpage_url', '')
+            options.append(
+                discord.SelectOption(
+                    label=title[:100],
+                    description=f"By: {uploader}"[:100],
+                    value=url
+                )
+            )
+        self.add_item(YouTubeDropdown(options))
+
+@bot.tree.command(name="play", description="Search YouTube or paste a direct YouTube URL.")
+@app_commands.describe(search="Search keywords or paste a YouTube URL")
+async def play(interaction: discord.Interaction, search: str):
+    await interaction.response.defer(ephemeral=True)
+
+    entries = []
+    if "youtube.com/watch" in search or "youtu.be/" in search:
+        entries.append({
+            'title': 'Direct YouTube Link',
+            'uploader': 'Provided URL',
+            'webpage_url': search.strip()
+        })
+    else:
+        try:
+            search_opts = {
+                'extract_flat': True,
+                'quiet': True,
+            }
+            query = f"ytsearch5:{search}"
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(query, download=False))
+            entries = data.get('entries', [])
+        except Exception as e:
+            logger.error(f"yt_dlp search error: {e}")
+
+        if not entries:
+            try:
+                for item in google_search(f"{search} site:youtube.com/watch", num_results=5):
+                    url = item.get("href", "")
+                    if "youtube.com/watch" in url:
+                        entries.append({
+                            'title': item.get("title", 'YouTube Video Result'),
+                            'uploader': 'Google Search',
+                            'webpage_url': url
+                        })
+            except Exception as e:
+                logger.error(f"Fallback video search error: {e}")
+
+    if not entries:
+        await interaction.followup.send(
+            f"⚠️ Could not find any videos for `{search}`. Try pasting the direct YouTube URL!", 
+            ephemeral=True
+        )
+        return
+
+    view = YouTubeSelectView(entries)
+    await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
+
+@bot.tree.command(name="search", description="Perform a fast web search via DuckDuckGo.")
+@app_commands.describe(query="What would you like to search for?")
+async def search(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, lambda: google_search(query, num_results=5))
+
+        if not results:
+            await interaction.followup.send(f"⚠ No results found for `{query}`.")
+            return
+
+        embed = discord.Embed(
+            title=f"🔍 Search Results for: `{query}`",
+            color=discord.Color.green()
+        )
+
+        for i, item in enumerate(results[:5], 1):
+            title = item.get("title", "Result")
+            url = item.get("href", "#")
+            body = item.get("body", "")[:250]  
+            
+            field_value = f"[{title}]({url})\n{body}"
+            embed.add_field(name=f"Result {i}", value=field_value, inline=False)
+
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await interaction.followup.send(f"❌ An error occurred while performing the search: {e}")
+
+# ------------------------------------------------------------------------------
+# MAIN RUNNER
+# ------------------------------------------------------------------------------
+def main():
+    token = os.environ.get("DISCORD_TOKEN")
+    if not token:
+        logger.critical("DISCORD_TOKEN environment variable is missing!")
+        sys.exit(1)
+
+    bot.run(token)
+
+if __name__ == "__main__":
+    main()
