@@ -545,6 +545,17 @@ def relay_targets_for(channel) -> list:
     return list(ids)
 
 
+def forum_targets_for(forum_id: int) -> list:
+    """Forum channels linked (via /link-forum) to the given forum."""
+    col = _LINK_COLS["forum_relays"]
+    ids = set()
+    res = supabase.table("forum_relays").select("network_code").eq(col, forum_id).execute()
+    for row in res.data:
+        r = supabase.table("forum_relays").select(col).eq("network_code", row["network_code"]).neq(col, forum_id).execute()
+        ids.update(int(x[col]) for x in r.data)
+    return list(ids)
+
+
 # ------------------------------------------------------------------------------
 # BOT EVENTS (TEXT, THREADS, FORUMS, VOICE, & REACTIONS)
 # ------------------------------------------------------------------------------
@@ -1392,21 +1403,33 @@ async def poll(interaction: discord.Interaction, title: str, message: str = None
         )
         return
 
+    origin = interaction.channel
+    target_channels = []
     try:
-        target_ids = await asyncio.to_thread(relay_targets_for, interaction.channel)
+        if isinstance(origin, discord.Thread) and isinstance(origin.parent, discord.ForumChannel):
+            # Forum post: copy the poll into the matching post (same title) in every linked forum,
+            # exactly like messages are matched by the relay.
+            forum_ids = await asyncio.to_thread(forum_targets_for, origin.parent.id)
+            for fid in forum_ids:
+                forum = bot.get_channel(fid)
+                if isinstance(forum, discord.ForumChannel):
+                    target_channels.extend(t for t in forum.threads if t.name.lower() == origin.name.lower())
+        else:
+            target_ids = await asyncio.to_thread(relay_targets_for, origin)
+            target_channels = [c for c in (bot.get_channel(i) for i in target_ids) if c is not None]
     except Exception as e:
         logger.error(f"Error looking up poll relay targets: {e}")
-        target_ids = []
 
     embed = build_rating_embed(clean_title, prompt, {}, created_at)
     username = f"{interaction.user.display_name} [{interaction.guild.name}] (Poll)"[:80]
     avatar_url = interaction.user.display_avatar.url
 
     posted = 0
-    for cid in [interaction.channel.id] + target_ids:
-        channel = bot.get_channel(cid)
-        if channel is None:
+    seen = set()
+    for channel in [origin] + target_channels:
+        if channel.id in seen:
             continue
+        seen.add(channel.id)
         sent = await post_rating_copy(channel, embed, poll_id, username, avatar_url)
         if sent:
             await asyncio.to_thread(rating_db_add_message, poll_id, channel.id, sent.id)
