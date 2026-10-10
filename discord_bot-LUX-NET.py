@@ -283,8 +283,8 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
 # STAR RATING POLLS (1-5 stars, persistent buttons, synced across relayed channels)
 # Needs the tables in rating_poll_setup.sql.
 # ------------------------------------------------------------------------------
-RATING_INTRO = "In case you aren\u2019t aware, these are the ratings:"
-RATING_DEFAULT_PROMPT = "So go on and react to television programs by reacting one of the five ratings mentioned!"
+# Old polls stored this default text in the database; it is hidden when their embeds refresh.
+_LEGACY_DEFAULT_PROMPT = "So go on and react to television programs by reacting one of the five ratings mentioned!"
 RATING_TEXT = {
     1: ("1 star", "the worst rating"),
     2: ("2 stars", "a bad rating"),
@@ -319,7 +319,7 @@ def build_rating_embed(title: str, prompt: str, counts: dict, created_at: dateti
     total = sum(counts.get(n, 0) for n in range(1, 6))
     average = (sum(n * counts.get(n, 0) for n in range(1, 6)) / total) if total else 0.0
 
-    lines = [RATING_INTRO]
+    lines = []
     for n in range(1, 6):
         name, blurb = RATING_TEXT[n]
         lines.append(f"- **{name}**, {blurb} ({counts.get(n, 0)} votes)")
@@ -327,8 +327,10 @@ def build_rating_embed(title: str, prompt: str, counts: dict, created_at: dateti
     description = (
         "\n".join(lines)
         + f"\n\n\u2b50 **Total Votes:** {total} | \U0001F4CA **Average Rating:** {average:.1f} / 5.0"
-        + f"\n\n{prompt}"
     )
+    prompt = (prompt or "").strip()
+    if prompt and prompt != _LEGACY_DEFAULT_PROMPT:
+        description += f"\n\n{prompt}"
     # No footer text: Discord renders the timestamp on its own as "\u2014 dd/mm/yyyy, hh:mm".
     return discord.Embed(
         title=f"\u2b50 {title}"[:256],
@@ -557,6 +559,67 @@ def forum_targets_for(forum_id: int) -> list:
 
 
 # ------------------------------------------------------------------------------
+# AUTO POLL (automatically adds the 1-5 rating poll to every new post in a forum)
+# Needs the auto_poll_forums table in auto_poll_setup.sql.
+# ------------------------------------------------------------------------------
+_auto_poll_forums: set = set()
+
+
+def refresh_auto_poll_cache() -> bool:
+    global _auto_poll_forums
+    try:
+        res = supabase.table("auto_poll_forums").select("forum_channel_id").execute()
+        _auto_poll_forums = {int(row["forum_channel_id"]) for row in res.data}
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load auto poll forums (did you run auto_poll_setup.sql?): {e}")
+        return False
+
+
+def set_auto_poll(forum_id: int, enabled: bool) -> bool:
+    try:
+        if enabled:
+            supabase.table("auto_poll_forums").upsert(
+                {"forum_channel_id": forum_id}, on_conflict="forum_channel_id"
+            ).execute()
+            _auto_poll_forums.add(forum_id)
+        else:
+            supabase.table("auto_poll_forums").delete().eq("forum_channel_id", forum_id).execute()
+            _auto_poll_forums.discard(forum_id)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update auto poll for forum {forum_id}: {e}")
+        return False
+
+
+async def post_auto_poll(thread: discord.Thread, starter_message: discord.Message, copies: list):
+    """Post a rating poll in a new forum post and in every relayed copy of that post."""
+    try:
+        poll_id = uuid.uuid4().hex[:12]
+        title = thread.name.strip()[:200] or "Rating"
+        created_at = datetime.now(timezone.utc)
+
+        created = await asyncio.to_thread(rating_db_create, poll_id, title, "", created_at, starter_message.author.id)
+        if not created:
+            return
+
+        embed = build_rating_embed(title, "", {}, created_at)
+        username = f"{starter_message.author.display_name} [{thread.guild.name}] (Poll)"[:80]
+        avatar_url = starter_message.author.display_avatar.url
+
+        seen = set()
+        for channel in [thread] + list(copies):
+            if channel.id in seen:
+                continue
+            seen.add(channel.id)
+            sent = await post_rating_copy(channel, embed, poll_id, username, avatar_url)
+            if sent:
+                await asyncio.to_thread(rating_db_add_message, poll_id, channel.id, sent.id)
+    except Exception as e:
+        logger.error(f"Auto poll failed for thread {thread.id}: {e}")
+
+
+# ------------------------------------------------------------------------------
 # BOT EVENTS (TEXT, THREADS, FORUMS, VOICE, & REACTIONS)
 # ------------------------------------------------------------------------------
 _ready_done = False
@@ -651,18 +714,20 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
         except Exception as e:
             logger.error(f"Failed to remove cross-server reaction from message {target_msg_id}: {e}")
 
-@bot.event
-async def on_thread_create(thread: discord.Thread):
+async def _relay_new_forum_post(thread: discord.Thread):
+    """Relays a new forum post to linked forums. Returns (starter_message or None, [copied threads]).
+    starter_message is None when the post should not get an auto poll (bot/webhook/banned/empty)."""
+    copies = []
     if not isinstance(thread.parent, discord.ForumChannel):
-        return
+        return None, copies
 
     if thread.id in RELAYED_THREAD_IDS:
-        return
+        return None, copies
 
     current_forum_id = thread.parent.id
 
     if not supabase:
-        return
+        return None, copies
 
     try:
         await asyncio.sleep(1.0)
@@ -679,18 +744,18 @@ async def on_thread_create(thread: discord.Thread):
 
         if starter_message:
             if is_user_banned(starter_message.author.id):
-                return
+                return None, copies
             if (starter_message.webhook_id and starter_message.webhook_id in webhook_ids) or starter_message.author.bot:
                 RELAYED_THREAD_IDS.add(thread.id)
-                return
+                return None, copies
 
         if not starter_message:
-            return
+            return None, copies
 
         res = supabase.table("forum_relays").select("network_code").eq("forum_channel_id", current_forum_id).execute()
         codes = [row["network_code"] for row in res.data]
         if not codes:
-            return
+            return starter_message, copies
 
         target_forum_ids = []
         for code in codes:
@@ -698,11 +763,11 @@ async def on_thread_create(thread: discord.Thread):
             target_forum_ids.extend([row["forum_channel_id"] for row in f_res.data])
     except Exception as e:
         logger.error(f"Database error in on_thread_create: {e}")
-        return
+        return starter_message, copies
 
     target_forum_ids = list(set(target_forum_ids))
     if not target_forum_ids:
-        return
+        return starter_message, copies
 
     try:
         author = starter_message.author
@@ -769,14 +834,31 @@ async def on_thread_create(thread: discord.Thread):
                         if sent_msg:
                             if isinstance(sent_msg.channel, discord.Thread):
                                 RELAYED_THREAD_IDS.add(sent_msg.channel.id)
+                                copies.append(sent_msg.channel)
                             elif sent_msg.thread:
                                 RELAYED_THREAD_IDS.add(sent_msg.thread.id)
+                                copies.append(sent_msg.thread)
                                 
                             register_message_mapping(starter_message.id, target_forum.id, sent_msg.id)
                     except Exception as e:
                         logger.error(f"Error relaying forum post to {fid}: {e}")
     except Exception as e:
         logger.error(f"Failed to relay new forum post: {e}")
+    return starter_message, copies
+
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    if not isinstance(thread.parent, discord.ForumChannel):
+        return
+    if thread.id in RELAYED_THREAD_IDS:
+        return
+
+    starter_message, copies = await _relay_new_forum_post(thread)
+
+    # Auto poll: add the 1-5 rating poll to new posts in forums where /auto-poll is enabled.
+    if starter_message is not None and thread.parent.id in _auto_poll_forums:
+        await post_auto_poll(thread, starter_message, copies)
 
 # ------------------------------------------------------------------------------
 # VOICE BRIDGE (LIVE AUDIO RELAY BETWEEN LINKED VOICE CHANNELS)
@@ -1392,7 +1474,7 @@ async def poll(interaction: discord.Interaction, title: str, message: str = None
     await interaction.response.defer(ephemeral=True)
 
     poll_id = uuid.uuid4().hex[:12]
-    prompt = (message or RATING_DEFAULT_PROMPT).strip()[:1000]
+    prompt = (message or "").strip()[:1000]
     clean_title = title.strip()[:200]
     created_at = datetime.now(timezone.utc)
 
@@ -1439,6 +1521,52 @@ async def poll(interaction: discord.Interaction, title: str, message: str = None
         await interaction.followup.send(f"\u2705 Rating poll posted in {posted} channel(s).", ephemeral=True)
     else:
         await interaction.followup.send("\u274c I couldn't post the poll here (check my Send Messages / Manage Webhooks permissions).", ephemeral=True)
+
+@bot.tree.command(name="auto-poll", description="Auto-add the 1-5 star rating poll to every new post in a forum.")
+@app_commands.describe(
+    enabled="Turn auto poll on or off for the forum",
+    forum_channel="Forum to change (optional, defaults to the forum you're in)"
+)
+@app_commands.choices(enabled=[
+    app_commands.Choice(name="on", value=1),
+    app_commands.Choice(name="off", value=0),
+])
+async def auto_poll(interaction: discord.Interaction, enabled: app_commands.Choice[int], forum_channel: discord.ForumChannel = None):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("\u274c You need the **Manage Channels** permission to change auto poll.", ephemeral=True)
+        return
+
+    target = forum_channel
+    if not target:
+        ch = interaction.channel
+        if isinstance(ch, discord.Thread) and isinstance(ch.parent, discord.ForumChannel):
+            target = ch.parent
+        elif isinstance(ch, discord.ForumChannel):
+            target = ch
+
+    if not target:
+        await interaction.response.send_message(
+            "\u274c Pick a `forum_channel` in the option, or run this inside a forum or forum post.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    on = bool(enabled.value)
+    ok = await asyncio.to_thread(set_auto_poll, target.id, on)
+    if not ok:
+        await interaction.followup.send(
+            "\u274c Couldn't save that. Make sure `auto_poll_setup.sql` has been run in Supabase.", ephemeral=True
+        )
+        return
+
+    if on:
+        await interaction.followup.send(
+            f"\u2b50 Auto poll is **on** for **{target.name}**. Every new post there gets a 1-5 star rating poll "
+            f"(also copied into the matching post in linked forums)."
+        )
+    else:
+        await interaction.followup.send(f"\U0001F6D1 Auto poll is **off** for **{target.name}**.")
+
 
 @bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
 @app_commands.describe(network_code="The network code to inspect")
@@ -1862,6 +1990,7 @@ def main():
         sys.exit(1)
 
     refresh_ban_cache()
+    refresh_auto_poll_cache()
     bot.run(token)
 
 if __name__ == "__main__":
