@@ -15,6 +15,7 @@ import struct
 import zipfile
 import shutil
 import atexit
+import secrets
 from collections import deque
 from threading import Thread, Lock
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
-from flask import Flask
+from aiohttp import web, WSMsgType   # ships with discord.py
 
 # Voice relay dependencies are optional: if they are missing the bot still runs
 # all text/forum/thread features and simply disables the voice commands.
@@ -251,21 +252,9 @@ def gemini_overview(query: str):
         return None
 
 # ------------------------------------------------------------------------------
-# FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
+# WEB SERVER (Render health check on '/' plus the live emulator player).
+# It is started from main() before the bot logs in, see start_web() in the emulator section.
 # ------------------------------------------------------------------------------
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return "LUX-NET Bridge Bot is Online!", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    log = logging.getLogger("werkzeug")
-    log.setLevel(logging.ERROR)
-    flask_app.run(host="0.0.0.0", port=port)
-
-Thread(target=run_flask, daemon=True).start()
 
 # ------------------------------------------------------------------------------
 # DISCORD BOT INITIALIZATION
@@ -1311,6 +1300,10 @@ async def on_message(message: discord.Message):
     if is_user_banned(message.author.id):
         return
 
+    # Typed emulator controls (w/a/s/d ...) in a channel with a running game.
+    if message.channel.id in emu_sessions and await emu_chat_input(message):
+        return
+
     await bot.process_commands(message)
 
     current_channel = message.channel
@@ -2128,6 +2121,18 @@ EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))        # frame
 EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
 EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"                # let Manage Server holders add ROMs
 
+# Live streaming / controls (all optional, tune for the free tier)
+EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "30"))              # frames per second sent to browsers
+EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))          # lower = less bandwidth/CPU
+EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))                # no input for this long: emulation sleeps (0 CPU)
+EMU_MAX_VIEWERS = int(os.environ.get("EMU_MAX_VIEWERS", "8"))             # browsers per game
+EMU_EDIT_INTERVAL = float(os.environ.get("EMU_EDIT_INTERVAL", "1.0"))     # min seconds between Discord picture updates
+EMU_GAP_FRAMES = 4                                                        # frames between two typed/button taps
+EMU_CHAT_KEYS = os.environ.get("EMU_CHAT_KEYS", "1") == "1"               # type w/a/s/d in the game channel
+EMU_CHAT_PREFIX = os.environ.get("EMU_CHAT_PREFIX", "").lower()           # e.g. "." to require ".wasd" (avoids eating words like "sad")
+EMU_DELETE_KEYS = os.environ.get("EMU_DELETE_KEYS", "1") == "1"           # delete typed inputs (needs Manage Messages)
+EMU_WEB_BASE = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
 EMU_SYSTEMS = {
     "nes": {"label": "NES", "exts": {".nes"}, "core": os.environ.get("CORE_NES", "fceumm_libretro")},
     # snes9x2010 is the light/fast SNES core; set CORE_SNES=snes9x_libretro for max accuracy.
@@ -2302,6 +2307,42 @@ def _proc_rss_mb(pid: int) -> float:
         return 0.0
 
 
+class EmuClient:
+    """One connected browser tab. Slow tabs only ever get the newest frame, so memory stays flat."""
+
+    def __init__(self, ws, uid: int, name: str):
+        self.ws, self.uid, self.name = ws, uid, name
+        self.mask = 0
+        self.latest = None
+        self.texts = deque(maxlen=20)
+        self.evt = asyncio.Event()
+        self.closing = False
+
+    def offer_frame(self, jpeg: bytes):
+        self.latest = jpeg
+        self.evt.set()
+
+    def offer_text(self, obj: dict):
+        self.texts.append(json.dumps(obj, separators=(",", ":")))
+        self.evt.set()
+
+    async def sender(self):
+        try:
+            while not self.ws.closed:
+                await self.evt.wait()
+                self.evt.clear()
+                while self.texts:
+                    await self.ws.send_str(self.texts.popleft())
+                jpeg, self.latest = self.latest, None
+                if jpeg:
+                    await self.ws.send_bytes(jpeg)
+                if self.closing:
+                    await self.ws.close()
+                    return
+        except Exception:
+            pass
+
+
 class EmuSession:
     def __init__(self, channel_id: int, rel: str, starter_id: int):
         self.channel_id = channel_id
@@ -2312,16 +2353,36 @@ class EmuSession:
         self.starter_id = starter_id
         self.proc = None
         self.message_id = None
+        self.view = None
         self.lock = asyncio.Lock()
         self.closed = False
+        self.closing = False
         self.last_used = time.monotonic()
         self.hold_idx = 1
         self.last_mask = 0
         self.seq = 0
         self.inputs = 0
         self.err_tail = deque(maxlen=20)
+        self.pending = None             # future for the reply to the request in flight
         self._err_task = None
+        self._reader_task = None
+        # live streaming
+        self.clients: set = set()
+        self.tokens: dict = {}          # user_id -> web token
+        self.live = False
+        self.paused = False
+        self.last_jpeg = None
+        self.stats: dict = {}
+        self._sent_mask = 0
+        # Discord preview (edits are rate limited, so they are coalesced)
+        self.last_edit = 0.0
+        self._refresh_due = 0.0
+        self._refresh_task = None
+        self.footer = ""
+        self.chat_backlog = 0
+        self.can_delete = True
 
+    # -- paths / small helpers -----------------------------------------------------------------
     @property
     def hold(self) -> int:
         return EMU_HOLD_STEPS[self.hold_idx]
@@ -2330,9 +2391,14 @@ class EmuSession:
     def state_path(self) -> str:
         return os.path.join(STATE_DIR, f"{self.channel_id}__{self.system}__{self.filename}.state")
 
+    @property
+    def auto_path(self) -> str:
+        return os.path.join(STATE_DIR, f"{self.channel_id}__{self.system}__{self.filename}.auto")
+
     def touch(self):
         self.last_used = time.monotonic()
 
+    # -- worker process ------------------------------------------------------------------------
     async def spawn(self):
         env = dict(os.environ, MALLOC_ARENA_MAX="2", PYTHONUNBUFFERED="1")   # MALLOC_ARENA_MAX keeps RSS small
         self.proc = await asyncio.create_subprocess_exec(
@@ -2341,6 +2407,7 @@ class EmuSession:
             stderr=asyncio.subprocess.PIPE, env=env,
         )
         self._err_task = asyncio.ensure_future(self._drain_stderr(self.proc))
+        self._reader_task = asyncio.ensure_future(self._reader(self.proc))
 
     async def _drain_stderr(self, proc):
         """Forward worker/core stderr to the bot log and keep the last lines for error messages."""
@@ -2367,27 +2434,63 @@ class EmuSession:
         hint = " (crashed: segmentation fault)" if code == -11 else ""
         return f"the emulator process stopped (exit code {code}){hint}" + (f": {tail}" if tail else "")
 
-    async def _rpc(self, msg: dict) -> dict:
-        data = pickle.dumps(msg, protocol=4)
-        self.proc.stdin.write(struct.pack("<I", len(data)) + data)
-        await self.proc.stdin.drain()
-        (n,) = struct.unpack("<I", await self.proc.stdout.readexactly(4))
-        return pickle.loads(await self.proc.stdout.readexactly(n))
-
-    async def call(self, **msg) -> dict:
-        """Never raises. One request at a time per game; the lock keeps the pipe in sync."""
-        async with self.lock:
-            if self.closed or self.proc is None:
-                return {"ok": False, "err": "session ended", "dead": True}
-            try:
-                return await self._rpc(msg)
-            except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
+    async def _reader(self, proc):
+        """Single reader for everything the worker says: replies, video frames and events."""
+        try:
+            while True:
+                (n,) = struct.unpack("<I", await proc.stdout.readexactly(4))
+                body = await proc.stdout.readexactly(n)
+                kind, payload = body[:1], body[1:]
+                if kind == b"J":
+                    self._on_frame(payload)
+                elif kind == b"R":
+                    fut = self.pending
+                    if fut is not None and not fut.done():
+                        fut.set_result(pickle.loads(payload))
+                elif kind == b"E":
+                    self._on_event(pickle.loads(payload))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        except Exception as e:
+            logger.error(f"Emulator reader failed: {e}")
+        finally:
+            if not self.closed:
                 reason = await self._death_reason()
                 logger.error(f"Emulator worker died: {reason}")
-                return {"ok": False, "err": reason, "dead": True}
+                fut = self.pending
+                if fut is not None and not fut.done():
+                    fut.set_result({"ok": False, "err": reason, "dead": True})
+                asyncio.ensure_future(emu_close(self, "emulator crashed", autosave=False))
+
+    def _write(self, msg: dict):
+        data = pickle.dumps(msg, protocol=4)
+        self.proc.stdin.write(struct.pack("<I", len(data)) + data)
+
+    def send(self, msg: dict):
+        """Fire and forget (ops the worker never answers: input, seq, live)."""
+        if self.closed or self.proc is None or self.proc.returncode is not None:
+            return
+        try:
+            self._write(msg)
+        except Exception:
+            pass
+
+    async def call(self, **msg) -> dict:
+        """Request/reply. Never raises. One request at a time per game."""
+        async with self.lock:
+            if self.closed or self.proc is None or self._reader_task is None or self._reader_task.done():
+                return {"ok": False, "err": "session ended", "dead": True}
+            self.pending = asyncio.get_running_loop().create_future()
+            try:
+                self._write(msg)
+                return await self.pending
+            except (BrokenPipeError, ConnectionResetError):
+                return {"ok": False, "err": await self._death_reason(), "dead": True}
             except Exception as e:
                 logger.error(f"Emulator RPC failed: {e}")
                 return {"ok": False, "err": str(e), "dead": True}
+            finally:
+                self.pending = None
 
     def kill(self):
         proc, self.proc = self.proc, None
@@ -2397,13 +2500,154 @@ class EmuSession:
             except ProcessLookupError:
                 pass
 
+    # -- live stream ---------------------------------------------------------------------------
+    def _broadcast(self, obj: dict):
+        for c in self.clients:
+            c.offer_text(obj)
 
-async def emu_close(sess: EmuSession, reason: str):
+    def _on_frame(self, jpeg: bytes):
+        self.last_jpeg = jpeg
+        for c in self.clients:
+            c.offer_frame(jpeg)
+
+    def _on_event(self, ev: dict):
+        kind = ev.get("ev")
+        if kind == "stats":
+            self.stats = ev
+        elif kind == "paused":
+            self.paused = bool(ev.get("on"))
+            self._broadcast({"t": "paused", "on": self.paused})
+        elif kind == "error":
+            logger.warning(f"[emu worker] {ev.get('err')}")
+
+    def _set_live(self, on: bool):
+        if on == self.live:
+            return
+        self.live = on
+        self.send({"op": "live", "on": on, "fps": EMU_STREAM_FPS,
+                   "quality": EMU_JPEG_QUALITY, "afk": EMU_AFK_PAUSE})
+
+    def _players_msg(self) -> dict:
+        names = sorted({c.name for c in self.clients})
+        return {"t": "players", "n": len(self.clients), "names": names[:20]}
+
+    def add_client(self, c: EmuClient):
+        self.clients.add(c)
+        self.touch()
+        c.offer_text({"t": "hello", "title": f"{self.label}: {self.title}", "paused": self.paused})
+        if self.last_jpeg:
+            c.offer_frame(self.last_jpeg)
+        self._broadcast(self._players_msg())
+        self._set_live(True)
+
+    def remove_client(self, c: EmuClient):
+        self.clients.discard(c)
+        self._broadcast(self._players_msg())
+        self.recalc_input()
+        if not self.clients:
+            self._set_live(False)
+
+    def recalc_input(self):
+        """All connected players are OR-ed together into one controller."""
+        m = 0
+        for c in self.clients:
+            m |= c.mask
+        if m != self._sent_mask:
+            self._sent_mask = m
+            self.send({"op": "input", "mask": m})
+            self.touch()
+            self.schedule_refresh(0.6)
+
+    def token_for(self, user) -> str:
+        token = self.tokens.get(user.id)
+        if not token:
+            token = secrets.token_urlsafe(9)
+            self.tokens[user.id] = token
+            emu_web_tokens[token] = (self, user.id, user.display_name)
+        return token
+
+    # -- Discord message (the "slow" screen) ---------------------------------------------------
+    async def press(self, steps: list) -> dict:
+        """Button taps from Discord. Live: queued into the real-time loop. Otherwise a fast burst."""
+        self.touch()
+        if self.live:
+            self.send({"op": "seq", "steps": steps})
+            self.schedule_refresh(sum(f for _, f in steps) / 60.0 + 0.1)
+            return {"ok": True}
+        res = await self.call(op="steps", steps=steps, settle=EMU_SETTLE_FRAMES)
+        if res.get("ok"):
+            self.schedule_refresh()
+        return res
+
+    def schedule_refresh(self, delay: float = 0.0):
+        self._refresh_due = max(self._refresh_due, time.monotonic() + delay)
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.ensure_future(self._refresh())
+
+    async def _refresh(self):
+        """Update the Discord picture at most once per EMU_EDIT_INTERVAL (3x slower while someone is on the live player), always with the newest frame."""
+        while not self.closed:
+            interval = EMU_EDIT_INTERVAL * (3 if self.clients else 1)   # live viewers have the real picture
+            due = max(self._refresh_due, self.last_edit + interval)
+            wait = due - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            stamp = time.monotonic()
+            res = await self.call(op="snap", scale=EMU_SCALE)
+            if not res.get("ok"):
+                return
+            await self.edit_message(res["png"])
+            self.last_edit = time.monotonic()
+            if self._refresh_due <= stamp:
+                return
+
+    def make_embed(self, fname: str) -> discord.Embed:
+        embed = discord.Embed(color=discord.Color.dark_grey())
+        embed.set_author(name=f"{self.label}: {self.title}")
+        embed.set_image(url=f"attachment://{fname}")
+        embed.set_footer(text=self.footer[:400])
+        return embed
+
+    async def edit_message(self, png: bytes):
+        ch = bot.get_channel(self.channel_id)
+        if not ch or not self.message_id:
+            return
+        self.seq += 1
+        fname = f"f{self.seq}.png"
+        try:
+            await ch.get_partial_message(self.message_id).edit(
+                embed=self.make_embed(fname), attachments=[discord.File(io.BytesIO(png), filename=fname)], view=self.view)
+        except discord.NotFound:
+            asyncio.ensure_future(emu_close(self, "the game message was deleted"))
+        except discord.HTTPException as e:
+            logger.warning(f"Could not update emulator message: {e}")
+
+
+emu_web_tokens: dict = {}      # web token -> (EmuSession, user_id, display_name)
+
+
+async def emu_close(sess: EmuSession, reason: str, autosave: bool = True):
     if emu_sessions.get(sess.channel_id) is sess:
         emu_sessions.pop(sess.channel_id, None)
-    if sess.closed:
+    if sess.closing:
         return
+    sess.closing = True
+    # Autosave so the next /emu-play can pick up where the players left off.
+    if autosave and sess.inputs and sess.proc and sess.proc.returncode is None:
+        try:
+            await asyncio.wait_for(sess.call(op="save", path=sess.auto_path), timeout=3)
+        except Exception:
+            pass
     sess.closed = True
+    if sess._refresh_task:
+        sess._refresh_task.cancel()
+    for token in sess.tokens.values():
+        emu_web_tokens.pop(token, None)
+    for c in list(sess.clients):
+        c.offer_text({"t": "end", "why": reason})
+        c.closing = True
+        c.evt.set()
     if sess.proc and sess.proc.returncode is None:
         try:
             sess.proc.stdin.close()      # worker exits on EOF
@@ -2453,10 +2697,323 @@ async def emu_startup():
         await asyncio.to_thread(refresh_remote_roms)
 
 
+# ---- typed controls: just type w a s d in the game channel -----------------------------------
+# w a s d = D-pad, j = B, k = A, u = Y, i = X, q = L, e = R, start, select.
+# "d3" = tap right 3 times, "d+j" = right and B together, "wwdk" = a sequence.
+_KEY_ALIASES = {"w": "up", "a": "left", "s": "down", "d": "right", "j": "b", "k": "a", "u": "y",
+                "i": "x", "q": "l", "e": "r", "up": "up", "down": "down", "left": "left",
+                "right": "right", "start": "start", "select": "select"}
+_KEY_ONE = r"(?:start|select|up|down|left|right|[wasdjkuiqe])"
+_KEY_GROUP = rf"{_KEY_ONE}(?:\+{_KEY_ONE})*(?:\d{{1,2}})?"
+_KEY_FULL = re.compile(rf"{_KEY_GROUP}(?:[ ,]*{_KEY_GROUP})*")
+_KEY_ITER = re.compile(rf"({_KEY_ONE}(?:\+{_KEY_ONE})*)(\d{{1,2}})?")
+
+
+def parse_chat_keys(text: str, hold: int):
+    """'wwd k3' -> [(mask, frames), ...] or None when the message is normal chat."""
+    t = (text or "").strip().lower()
+    if EMU_CHAT_PREFIX:
+        if not t.startswith(EMU_CHAT_PREFIX):
+            return None
+        t = t[len(EMU_CHAT_PREFIX):].strip()
+    if not t or len(t) > 60 or not _KEY_FULL.fullmatch(t):
+        return None
+    steps, taps = [], 0
+    for m in _KEY_ITER.finditer(t):
+        mask = 0
+        for key in m.group(1).split("+"):
+            mask |= EMU_MASKS[_KEY_ALIASES[key]]
+        for _ in range(max(1, min(int(m.group(2) or 1), 20))):
+            if taps >= 24:
+                break
+            steps += [(mask, hold), (0, EMU_GAP_FRAMES)]
+            taps += 1
+    return steps or None
+
+
+async def _try_delete(sess: EmuSession, message: discord.Message):
+    try:
+        await message.delete()
+    except discord.Forbidden:
+        sess.can_delete = False      # no Manage Messages here: stop trying
+    except Exception:
+        pass
+
+
+async def emu_chat_input(message: discord.Message) -> bool:
+    """Called from on_message. True = the message was a controller input and is handled."""
+    if not EMU_CHAT_KEYS:
+        return False
+    sess = emu_sessions.get(message.channel.id)
+    if sess is None or sess.closed:
+        return False
+    steps = parse_chat_keys(message.content, sess.hold)
+    if not steps:
+        return False
+    if EMU_DELETE_KEYS and sess.can_delete:
+        asyncio.ensure_future(_try_delete(sess, message))
+    if sess.chat_backlog >= 4:      # swallow floods instead of queueing forever
+        return True
+    sess.chat_backlog += 1
+    try:
+        sess.inputs += 1
+        sess.footer = f"{message.author.display_name}: {message.content.strip()[:24]}  •  {sess.inputs} inputs"
+        await sess.press(steps)
+    finally:
+        sess.chat_backlog -= 1
+    return True
+
+
+# ---- live web player -------------------------------------------------------------------------
+EMU_PAGE_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>LUX-NET Arcade</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#0b0d12;color:#e6e8ee;font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+#wrap{display:flex;flex-direction:column;height:100%}
+#bar{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#12151c;border-bottom:1px solid #23283a;font-size:13px}
+#title{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{padding:2px 8px;border-radius:99px;background:#1c2130;color:#9aa4bd;white-space:nowrap}
+button.t{background:#1c2130;color:#cfd6ea;border:0;border-radius:8px;padding:4px 9px;font-size:14px;cursor:pointer}
+#stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;position:relative}
+canvas{image-rendering:pixelated;background:#000;border-radius:4px}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;background:rgba(8,10,14,.72);font-size:17px;pointer-events:none}
+#msg:empty{display:none}
+#help{padding:5px 10px;font-size:12px;color:#7d87a3;text-align:center;border-top:1px solid #1b2030}
+#pad{display:none;height:min(38vh,250px);padding:6px 10px calc(10px + env(safe-area-inset-bottom));position:relative}
+body.touch #pad{display:block}
+body.touch #help{display:none}
+.g{position:absolute;display:grid;gap:6px}
+.b{width:54px;height:54px;border-radius:50%;background:#232a3d;border:1px solid #33405e;color:#cfd6ea;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;touch-action:none}
+.b.on{background:#4d6bff;border-color:#8ea2ff}
+.b.sm{width:64px;height:30px;border-radius:15px;font-size:12px}
+.b.sh{width:74px;height:36px;border-radius:12px;font-size:13px}
+#dp{left:8px;bottom:8px;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px)}
+#ab{right:8px;bottom:8px;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px)}
+#mid{position:absolute;left:50%;transform:translateX(-50%);bottom:14px;display:flex;gap:10px}
+#sh1{left:8px;top:2px}#sh2{right:8px;top:2px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <div id="title">Connecting…</div>
+    <span class="pill" id="pl">👥 –</span>
+    <span class="pill" id="fps">– fps</span>
+    <button class="t" id="tp" title="Touch controls">🎮</button>
+    <button class="t" id="fs" title="Fullscreen">⛶</button>
+  </div>
+  <div id="stage"><canvas id="cv" width="256" height="224"></canvas><div id="msg">Connecting…</div></div>
+  <div id="help">WASD / arrows move · J K = B A · U I = Y X · Q E = L R · Enter = Start · Shift = Select · gamepads work too</div>
+  <div id="pad"></div>
+</div>
+<script>
+(function(){
+"use strict";
+var $=function(i){return document.getElementById(i)};
+var cv=$("cv"),ctx=cv.getContext("2d",{alpha:false}),stage=$("stage"),msg=$("msg");
+// libretro joypad bits: B0 Y1 SELECT2 START3 UP4 DOWN5 LEFT6 RIGHT7 A8 X9 L10 R11
+var KEYS={KeyW:4,ArrowUp:4,KeyS:5,ArrowDown:5,KeyA:6,ArrowLeft:6,KeyD:7,ArrowRight:7,
+  KeyJ:0,KeyZ:0,KeyK:8,KeyX:8,KeyU:1,KeyC:1,KeyI:9,KeyV:9,KeyQ:10,KeyE:11,
+  Enter:3,ShiftLeft:2,ShiftRight:2,Backspace:2};
+var down=new Set(),held=new Map(),padMask=0,last=-1,ws=null,over=false,tries=0;
+
+function mask(){
+  var m=padMask;
+  down.forEach(function(c){m|=1<<KEYS[c]});
+  held.forEach(function(b){m|=1<<b});
+  return m;
+}
+function push(force){
+  var m=mask();
+  if(!ws||ws.readyState!==1||(m===last&&!force))return;
+  var b=new DataView(new ArrayBuffer(2));b.setUint16(0,m,true);ws.send(b.buffer);last=m;
+}
+addEventListener("keydown",function(e){
+  if(!(e.code in KEYS))return;
+  e.preventDefault();
+  if(!down.has(e.code)){down.add(e.code);push()}
+});
+addEventListener("keyup",function(e){
+  if(!(e.code in KEYS))return;
+  e.preventDefault();down.delete(e.code);push();
+});
+addEventListener("blur",function(){down.clear();held.clear();paint();push()});
+
+// ---- gamepad (standard mapping) ----
+function pollPad(){
+  var m=0,gp=(navigator.getGamepads?navigator.getGamepads():[])||[];
+  for(var i=0;i<gp.length;i++){
+    var g=gp[i];if(!g||!g.connected)continue;
+    var p=function(n){return g.buttons[n]&&g.buttons[n].pressed};
+    if(p(0))m|=1<<0;if(p(1))m|=1<<8;if(p(2))m|=1<<1;if(p(3))m|=1<<9;
+    if(p(4))m|=1<<10;if(p(5))m|=1<<11;if(p(8))m|=1<<2;if(p(9))m|=1<<3;
+    if(p(12))m|=1<<4;if(p(13))m|=1<<5;if(p(14))m|=1<<6;if(p(15))m|=1<<7;
+    var x=g.axes[0]||0,y=g.axes[1]||0;
+    if(x<-.5)m|=1<<6;if(x>.5)m|=1<<7;if(y<-.5)m|=1<<4;if(y>.5)m|=1<<5;
+  }
+  if(m!==padMask){padMask=m;push()}
+  requestAnimationFrame(pollPad);
+}
+requestAnimationFrame(pollPad);
+
+// ---- touch pad ----
+var pad=$("pad");
+function btn(parent,label,bit,cls,style){
+  var d=document.createElement("div");d.className="b "+(cls||"");d.textContent=label;
+  if(style)d.style.cssText=style;
+  d.addEventListener("pointerdown",function(e){e.preventDefault();d.setPointerCapture(e.pointerId);held.set(e.pointerId,bit);d.classList.add("on");push();if(navigator.vibrate)navigator.vibrate(8)});
+  var up=function(e){held.delete(e.pointerId);d.classList.remove("on");push()};
+  d.addEventListener("pointerup",up);d.addEventListener("pointercancel",up);
+  parent.appendChild(d);return d;
+}
+function grid(id,cells){
+  var g=document.createElement("div");g.className="g";g.id=id;
+  cells.forEach(function(c){if(c)btn(g,c[0],c[1]);else g.appendChild(document.createElement("div"))});
+  pad.appendChild(g);
+}
+grid("dp",[null,["▲",4],null,["◀",6],null,["▶",7],null,["▼",5],null]);
+grid("ab",[null,["X",9],null,["Y",1],null,["A",8],null,["B",0],null]);
+var mid=document.createElement("div");mid.id="mid";pad.appendChild(mid);
+btn(mid,"SELECT",2,"sm");btn(mid,"START",3,"sm");
+btn(pad,"L",10,"sh","left:8px;top:2px;position:absolute");btn(pad,"R",11,"sh","right:8px;top:2px;position:absolute");
+function paint(){document.querySelectorAll(".b.on").forEach(function(d){d.classList.remove("on")})}
+var coarse=matchMedia("(pointer: coarse)").matches;
+if(coarse)document.body.classList.add("touch");
+$("tp").onclick=function(){document.body.classList.toggle("touch");fit()};
+$("fs").onclick=function(){
+  if(document.fullscreenElement)document.exitFullscreen();
+  else if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen();
+};
+
+// ---- layout: keep a 4:3 picture as large as the stage allows ----
+function fit(){
+  var w=stage.clientWidth-8,h=stage.clientHeight-8;
+  var cw=Math.max(64,Math.min(w,h*4/3));
+  cv.style.width=Math.floor(cw)+"px";cv.style.height=Math.floor(cw*3/4)+"px";
+}
+addEventListener("resize",fit);fit();
+
+// ---- video: always draw only the newest frame ----
+var pending=null,busy=false,shown=0;
+function pump(){
+  if(busy||!pending)return;
+  var d=pending;pending=null;busy=true;
+  createImageBitmap(new Blob([d],{type:"image/jpeg"})).then(function(b){
+    if(cv.width!==b.width||cv.height!==b.height){cv.width=b.width;cv.height=b.height}
+    ctx.drawImage(b,0,0);if(b.close)b.close();shown++;
+  }).catch(function(){}).then(function(){busy=false;pump()});
+}
+setInterval(function(){$("fps").textContent=shown+" fps";shown=0},1000);
+
+function setMsg(t){msg.textContent=t||""}
+function onText(m){
+  if(m.t==="hello"){$("title").textContent=m.title;document.title=m.title;setMsg(m.paused?"⏸ Paused (idle). Press any key to resume.":"")}
+  else if(m.t==="players"){$("pl").textContent="👥 "+m.n;$("pl").title=m.names.join(", ")}
+  else if(m.t==="paused"){setMsg(m.on?"⏸ Paused (idle). Press any key to resume.":"")}
+  else if(m.t==="end"){over=true;setMsg("Game ended: "+m.why)}
+}
+function connect(){
+  var proto=location.protocol==="https:"?"wss://":"ws://";
+  ws=new WebSocket(proto+location.host+location.pathname.replace(/\/+$/,"")+"/ws");
+  ws.binaryType="arraybuffer";
+  ws.onopen=function(){tries=0;push(true)};
+  ws.onmessage=function(e){
+    if(typeof e.data==="string"){onText(JSON.parse(e.data))}
+    else{pending=e.data;pump()}
+  };
+  ws.onclose=function(){
+    if(over)return;
+    setMsg("Connection lost, reconnecting…");
+    setTimeout(connect,Math.min(4000,400*(++tries)));
+  };
+}
+connect();
+})();
+</script>
+</body>
+</html>
+'''
+
+
+async def web_home(request):
+    return web.Response(text="LUX-NET Bridge Bot is Online!")
+
+
+async def web_emu_page(request):
+    if request.match_info["token"] not in emu_web_tokens:
+        return web.Response(status=404, content_type="text/plain",
+                            text="This game link has expired. Press 'Play live' on the game message in Discord for a new one.")
+    return web.Response(text=EMU_PAGE_HTML, content_type="text/html",
+                        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                                 "X-Content-Type-Options": "nosniff"})
+
+
+async def web_emu_ws(request):
+    info = emu_web_tokens.get(request.match_info["token"])
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=256, compress=False)
+    await ws.prepare(request)
+    if not info or info[0].closed:
+        await ws.send_str(json.dumps({"t": "end", "why": "this game has ended"}))
+        await ws.close()
+        return ws
+    sess, uid, name = info
+    if is_user_banned(uid):
+        await ws.send_str(json.dumps({"t": "end", "why": "you are banned from this bot"}))
+        await ws.close()
+        return ws
+    if len(sess.clients) >= EMU_MAX_VIEWERS:
+        await ws.send_str(json.dumps({"t": "end", "why": f"this game already has {EMU_MAX_VIEWERS} players watching"}))
+        await ws.close()
+        return ws
+    client = EmuClient(ws, uid, name)
+    sender = asyncio.ensure_future(client.sender())
+    sess.add_client(client)
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.BINARY and len(msg.data) >= 2:
+                mask = struct.unpack("<H", msg.data[:2])[0] & 0x0FFF
+                if mask != client.mask:
+                    client.mask = mask
+                    sess.recalc_input()
+            elif msg.type == WSMsgType.ERROR:
+                break
+    finally:
+        sender.cancel()
+        sess.remove_client(client)
+    return ws
+
+
+_web_runner = None
+
+
+async def start_web():
+    """One HTTP server for everything: Render's health check ('/') and the live game player."""
+    global _web_runner
+    app = web.Application()
+    app.add_routes([
+        web.get("/", web_home),
+        web.get("/emu/{token}", web_emu_page),
+        web.get("/emu/{token}/ws", web_emu_ws),
+    ])
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    _web_runner = runner
+    logger.info(f"Web server listening on :{port}" + (f" (live player base {EMU_WEB_BASE})" if EMU_WEB_BASE else " (no PUBLIC_URL/RENDER_EXTERNAL_URL: live player links disabled)"))
+
+
 # ---- controller UI -------------------------------------------------------------------------
 class EmuButton(discord.ui.Button):
-    def __init__(self, action: str, label: str, style, row: int, disabled: bool = False):
-        super().__init__(label=label, style=style, row=row, disabled=disabled)
+    def __init__(self, action: str, label: str, style, row: int, disabled: bool = False, emoji=None):
+        super().__init__(label=label or None, style=style, row=row, disabled=disabled, emoji=emoji)
         self.action = action
 
     async def callback(self, interaction: discord.Interaction):
@@ -2474,12 +3031,13 @@ class EmuView(discord.ui.View):
             [("l", "L", S, not snes), ("up", "⬆", S, False), ("r", "R", S, not snes), ("select", "Select", S, False), ("start", "Start", G, False)],
             [("left", "⬅", S, False), ("down", "⬇", S, False), ("right", "➡", S, False), ("x", "X", P, not snes), ("y", "Y", P, not snes)],
             [("b", "B", D, False), ("a", "A", G, False), ("ab", "A+B", P, False), ("hold", "", S, False), ("clip", "\U0001F39E Clip", S, False)],
-            [("save", "\U0001F4BE Save", S, False), ("load", "\U0001F4C2 Load", S, False), ("quit", "⏹ Quit", D, False)],
+            [("live", "Play live (30 FPS)", P, False), ("save", "\U0001F4BE Save", S, False), ("load", "\U0001F4C2 Load", S, False), ("quit", "⏹ Quit", D, False)],
         ]
         self.hold_btn = None
         for row, items in enumerate(layout):
             for action, label, style, disabled in items:
-                btn = EmuButton(action, label, style, row, disabled)
+                emoji = "\U0001F5A5️" if action == "live" else None
+                btn = EmuButton(action, label, style, row, disabled, emoji)
                 if action == "hold":
                     self.hold_btn = btn
                     self._relabel_hold()
@@ -2494,43 +3052,12 @@ class EmuView(discord.ui.View):
             return False
         return True
 
-    async def _call(self, interaction: discord.Interaction, **msg):
-        """Run an emulator request. If it is slow, defer so the 3 s interaction window never expires.
-        The request task is never cancelled (that would desync the worker pipe)."""
-        task = asyncio.ensure_future(self.sess.call(**msg))
-        done, _ = await asyncio.wait({task}, timeout=2.3)
-        deferred = False
-        if not done:
-            try:
-                await interaction.response.defer()
-                deferred = True
-            except discord.HTTPException:
-                pass
-        return await task, deferred
-
-    async def _show_frame(self, interaction, png: bytes, deferred: bool, note: str):
-        sess = self.sess
-        sess.seq += 1
-        fname = f"f{sess.seq}.png"
-        embed = discord.Embed(color=discord.Color.dark_grey())
-        embed.set_author(name=f"{sess.label}: {sess.title}")
-        embed.set_image(url=f"attachment://{fname}")
-        embed.set_footer(text=note)
-        file = discord.File(io.BytesIO(png), filename=fname)
-        if deferred:
-            await interaction.edit_original_response(embed=embed, attachments=[file], view=self)
-        else:
-            await interaction.response.edit_message(embed=embed, attachments=[file], view=self)
-
-    async def _fail(self, interaction, res, deferred):
+    async def _fail(self, interaction, res):
         text = f"❌ {res.get('err', 'Emulator error')}"
         if res.get("dead"):
-            await emu_close(self.sess, "emulator stopped")
+            await emu_close(self.sess, "emulator stopped", autosave=False)
         try:
-            if deferred or interaction.response.is_done():
-                await interaction.followup.send(text, ephemeral=True)
-            else:
-                await interaction.response.send_message(text, ephemeral=True)
+            await interaction.followup.send(text, ephemeral=True)
         except Exception:
             pass
 
@@ -2546,44 +3073,62 @@ class EmuView(discord.ui.View):
         sess.touch()
 
         if action in EMU_MASKS:
+            await interaction.response.defer()                      # acknowledge instantly, never expires
             sess.last_mask = EMU_MASKS[action]
             sess.inputs += 1
-            res, deferred = await self._call(interaction, op="step", mask=sess.last_mask, hold=sess.hold,
-                                             settle=EMU_SETTLE_FRAMES, scale=EMU_SCALE)
+            sess.footer = f"{interaction.user.display_name}: {action.upper()}  •  {sess.inputs} inputs"
+            res = await sess.press([(sess.last_mask, sess.hold), (0, EMU_GAP_FRAMES)])
             if not res.get("ok"):
-                return await self._fail(interaction, res, deferred)
-            await self._show_frame(interaction, res["png"], deferred, f"{interaction.user.display_name}: {action.upper()}  •  {sess.inputs} inputs")
+                await self._fail(interaction, res)
 
         elif action == "hold":
             sess.hold_idx = (sess.hold_idx + 1) % len(EMU_HOLD_STEPS)
             self._relabel_hold()
             await interaction.response.edit_message(view=self)
 
+        elif action == "live":
+            if not EMU_WEB_BASE:
+                await interaction.response.send_message(
+                    "⚠️ The live player needs a public address. Set the `PUBLIC_URL` environment variable "
+                    "(Render sets `RENDER_EXTERNAL_URL` automatically for web services).", ephemeral=True)
+                return
+            if len(sess.clients) >= EMU_MAX_VIEWERS:
+                await interaction.response.send_message(f"⚠️ This game already has {EMU_MAX_VIEWERS} live players.", ephemeral=True)
+                return
+            url = f"{EMU_WEB_BASE}/emu/{sess.token_for(interaction.user)}"
+            link = discord.ui.View()
+            link.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open live player", url=url))
+            await interaction.response.send_message(
+                "\U0001F5A5️ **Live player (smooth 30 FPS)**\n"
+                "**W A S D** move • **J / K** = B / A • **U / I** = Y / X • **Q / E** = L / R • **Enter** = Start • **Shift** = Select\n"
+                "Gamepads and phone touch controls work too. This link is tied to you, so don't share it.",
+                view=link, ephemeral=True)
+
         elif action == "clip":
-            res, deferred = await self._call(interaction, op="clip", mask=sess.last_mask, hold=sess.hold, frames=90, every=3, scale=1)
+            await interaction.response.defer(thinking=True)
+            res = await sess.call(op="clip", mask=sess.last_mask, hold=sess.hold, frames=90, every=3, scale=1)
             if not res.get("ok"):
-                return await self._fail(interaction, res, deferred)
-            file = discord.File(io.BytesIO(res["gif"]), filename="clip.gif")
-            if deferred:
-                await interaction.followup.send(file=file)
-            else:
-                await interaction.response.send_message(file=file)
+                return await self._fail(interaction, res)
+            await interaction.followup.send(file=discord.File(io.BytesIO(res["gif"]), filename="clip.gif"))
 
         elif action == "save":
-            res, deferred = await self._call(interaction, op="save", path=sess.state_path)
+            await interaction.response.defer(ephemeral=True)
+            res = await sess.call(op="save", path=sess.state_path)
             if not res.get("ok"):
-                return await self._fail(interaction, res, deferred)
-            msg = "\U0001F4BE Saved your progress."
-            await (interaction.followup.send(msg, ephemeral=True) if deferred else interaction.response.send_message(msg, ephemeral=True))
+                return await self._fail(interaction, res)
+            await interaction.followup.send("\U0001F4BE Saved your progress.", ephemeral=True)
 
         elif action == "load":
             if not os.path.exists(sess.state_path):
                 await interaction.response.send_message("⚠️ No save for this game in this channel yet. Press **Save** first.", ephemeral=True)
                 return
-            res, deferred = await self._call(interaction, op="loadstate", path=sess.state_path, scale=EMU_SCALE)
+            await interaction.response.defer(ephemeral=True)
+            res = await sess.call(op="loadstate", path=sess.state_path)
             if not res.get("ok"):
-                return await self._fail(interaction, res, deferred)
-            await self._show_frame(interaction, res["png"], deferred, f"{interaction.user.display_name}: loaded save")
+                return await self._fail(interaction, res)
+            sess.footer = f"{interaction.user.display_name}: loaded save"
+            sess.schedule_refresh()
+            await interaction.followup.send("\U0001F4C2 Loaded.", ephemeral=True)
 
         elif action == "quit":
             if not self._can_stop(interaction):
@@ -2594,10 +3139,10 @@ class EmuView(discord.ui.View):
 
 
 # ---- slash commands ------------------------------------------------------------------------
-@bot.tree.command(name="emu-play", description="Play a NES/SNES game in this channel with a button controller.")
-@app_commands.describe(game="Pick a game from the library")
+@bot.tree.command(name="emu-play", description="Play a NES/SNES game in this channel (buttons, typed WASD, or the live 30 FPS player).")
+@app_commands.describe(game="Pick a game from the library", resume="Continue from where this channel last stopped (default: yes)")
 @app_commands.autocomplete(game=emu_rom_autocomplete)
-async def emu_play(interaction: discord.Interaction, game: str):
+async def emu_play(interaction: discord.Interaction, game: str, resume: bool = True):
     if not interaction.guild or not interaction.channel:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
@@ -2623,27 +3168,48 @@ async def emu_play(interaction: discord.Interaction, game: str):
                               sysdir=os.path.join(EMU_BASE, "system"), savedir=os.path.join(STATE_DIR, "sram"))
         if not res.get("ok"):
             raise RuntimeError(res.get("err", "load failed"))
-        res = await sess.call(op="step", mask=0, hold=0, settle=60, scale=EMU_SCALE)   # skip the first second of boot
+        resumed = False
+        if resume and os.path.exists(sess.auto_path):
+            r = await sess.call(op="loadstate", path=sess.auto_path)
+            resumed = bool(r.get("ok"))
+        if not resumed:
+            r = await sess.call(op="steps", steps=[(0, 90)], settle=1)       # skip the first second and a half of boot
+            if not r.get("ok"):
+                raise RuntimeError(r.get("err", "no frame"))
+        res = await sess.call(op="snap", scale=EMU_SCALE)
         if not res.get("ok"):
             raise RuntimeError(res.get("err", "no frame"))
 
-        view = EmuView(sess)
+        sess.view = EmuView(sess)
         sess.seq += 1
         fname = f"f{sess.seq}.png"
-        embed = discord.Embed(color=discord.Color.dark_grey())
-        embed.set_author(name=f"{sess.label}: {sess.title}")
-        embed.set_image(url=f"attachment://{fname}")
-        embed.set_footer(text=f"Started by {interaction.user.display_name} • anyone in the channel can press buttons")
-        msg = await interaction.channel.send(embed=embed, file=discord.File(io.BytesIO(res["png"]), filename=fname), view=view)
+        sess.footer = (f"Started by {interaction.user.display_name}"
+                       + (" (resumed)" if resumed else "")
+                       + " • type w a s d j k in chat • or press 🖥️ Play live")
+        msg = await interaction.channel.send(embed=sess.make_embed(fname),
+                                             file=discord.File(io.BytesIO(res["png"]), filename=fname), view=sess.view)
         sess.message_id = msg.id
+        sess.last_edit = time.monotonic()
         sess.touch()
-        await interaction.followup.send("\U0001F3AE Game started!", ephemeral=True)
+        await interaction.followup.send("\U0001F3AE Game started! Type `w` `a` `s` `d` in this channel, or press **Play live** for 30 FPS.", ephemeral=True)
     except Exception as e:
         logger.error(f"emu-play failed: {e}")
         emu_sessions.pop(sess.channel_id, None)
-        sess.closed = True
+        sess.closing = sess.closed = True
         sess.kill()
         await interaction.followup.send(f"❌ Couldn't start the game: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="emu-keys", description="Show the keyboard controls for the emulator.")
+async def emu_keys(interaction: discord.Interaction):
+    pre = f"`{EMU_CHAT_PREFIX}` + " if EMU_CHAT_PREFIX else ""
+    await interaction.response.send_message(
+        "**Typed controls** (send these as messages in the game channel)\n"
+        f"{pre}`w a s d` = up / left / down / right • `j` = B • `k` = A • `u` = Y • `i` = X • `q` = L • `e` = R • `start` • `select`\n"
+        "`d3` = tap right 3 times • `d+j` = right and B together • `wwdk` = a quick sequence\n\n"
+        "**Live player** (press **Play live** on the game message): real keyboard, smooth 30 FPS. "
+        "`W A S D` / arrows, `J K` = B A, `U I` = Y X, `Q E` = L R, `Enter` = Start, `Shift` = Select. "
+        "Gamepads and phones (touch pad) work too.", ephemeral=True)
 
 
 @bot.tree.command(name="emu-games", description="List the NES/SNES games in the library.")
@@ -2730,7 +3296,15 @@ async def emu_status(interaction: discord.Interaction):
     for s in emu_sessions.values():
         pid = s.proc.pid if s.proc else 0
         idle = int(time.monotonic() - s.last_used)
-        lines.append(f"• <#{s.channel_id}>: **{s.label} {s.title}**, worker `{_proc_rss_mb(pid):.0f} MB`, idle `{idle}s`")
+        extra = ""
+        if s.clients:
+            st = s.stats or {}
+            extra = f", `{len(s.clients)}` live player(s)"
+            if st:
+                extra += f" • `{st.get('emu', 0)}` emu fps / `{st.get('sent', 0)}` sent fps / `{st.get('load', 0)}%` busy"
+            if s.paused:
+                extra += " • ⏸ paused (AFK)"
+        lines.append(f"• <#{s.channel_id}>: **{s.label} {s.title}**, worker `{_proc_rss_mb(pid):.0f} MB`, idle `{idle}s`{extra}")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # ------------------------------------------------------------------------------
@@ -2744,7 +3318,16 @@ def main():
 
     refresh_ban_cache()
     refresh_auto_poll_cache()
-    bot.run(token)
+
+    async def runner():
+        await start_web()          # bind the port first so Render's health check passes even if Discord is slow
+        async with bot:
+            await bot.start(token)
+
+    try:
+        asyncio.run(runner())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
