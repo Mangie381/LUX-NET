@@ -216,6 +216,8 @@ def _clamp(v, lo, hi):
 
 
 def main():
+    import faulthandler
+    faulthandler.enable()   # a crash inside a core prints a Python traceback to stderr (shown in the bot log)
     # Cores sometimes printf. Keep the real stdout private for the protocol and send
     # everything else (including C-level prints) to stderr.
     out = os.fdopen(os.dup(1), "wb", buffering=0)
