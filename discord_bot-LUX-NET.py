@@ -2319,6 +2319,8 @@ class EmuSession:
         self.last_mask = 0
         self.seq = 0
         self.inputs = 0
+        self.err_tail = deque(maxlen=20)
+        self._err_task = None
 
     @property
     def hold(self) -> int:
@@ -2335,8 +2337,35 @@ class EmuSession:
         env = dict(os.environ, MALLOC_ARENA_MAX="2", PYTHONUNBUFFERED="1")   # MALLOC_ARENA_MAX keeps RSS small
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", WORKER_PATH,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, env=env,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env=env,
         )
+        self._err_task = asyncio.ensure_future(self._drain_stderr(self.proc))
+
+    async def _drain_stderr(self, proc):
+        """Forward worker/core stderr to the bot log and keep the last lines for error messages."""
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    self.err_tail.append(text)
+                    logger.warning(f"[emu worker] {text}")
+        except Exception:
+            pass
+
+    async def _death_reason(self) -> str:
+        code = None
+        try:
+            code = await asyncio.wait_for(self.proc.wait(), timeout=1.5)
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)   # let the stderr reader catch up
+        tail = " | ".join(list(self.err_tail)[-4:])[-350:]
+        hint = " (crashed: segmentation fault)" if code == -11 else ""
+        return f"the emulator process stopped (exit code {code}){hint}" + (f": {tail}" if tail else "")
 
     async def _rpc(self, msg: dict) -> dict:
         data = pickle.dumps(msg, protocol=4)
@@ -2353,7 +2382,9 @@ class EmuSession:
             try:
                 return await self._rpc(msg)
             except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
-                return {"ok": False, "err": "the emulator process stopped", "dead": True}
+                reason = await self._death_reason()
+                logger.error(f"Emulator worker died: {reason}")
+                return {"ok": False, "err": reason, "dead": True}
             except Exception as e:
                 logger.error(f"Emulator RPC failed: {e}")
                 return {"ok": False, "err": str(e), "dead": True}
