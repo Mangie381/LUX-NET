@@ -9,6 +9,12 @@ import math
 import re
 import uuid
 import urllib.request
+import time
+import pickle
+import struct
+import zipfile
+import shutil
+import atexit
 from collections import deque
 from threading import Thread, Lock
 from datetime import datetime, timedelta, timezone
@@ -691,6 +697,8 @@ async def on_ready():
         logger.warning("libopus not found - voice bridge disabled until it is installed (see Dockerfile).")
     asyncio.create_task(keepalive_loop())
     asyncio.create_task(ban_cache_loop())
+    asyncio.create_task(emu_reaper_loop())
+    asyncio.create_task(emu_startup())
 
     for guild in bot.guilds:
         try:
@@ -2095,6 +2103,604 @@ async def search(interaction: discord.Interaction, query: str):
     except Exception as e:
         logger.error(f"Search error: {e}")
         await interaction.followup.send(f"❌ An error occurred while performing the search: {e}")
+
+# ------------------------------------------------------------------------------
+# NES / SNES EMULATOR (libretro cores in a throw-away worker process per game)
+# ------------------------------------------------------------------------------
+# Needs emu_worker.py next to this file and Pillow in requirements.txt.
+# Cores (fceumm / snes9x2010) are downloaded automatically on first start. ROMs are NOT
+# included: drop your own dumps in roms/nes and roms/snes, or use /emu-add.
+# Optional persistence: create a private Supabase Storage bucket named "roms"
+# (ROM_BUCKET env var changes the name) so uploaded ROMs survive redeploys.
+EMU_BASE = os.path.dirname(os.path.abspath(__file__))
+ROM_DIR = os.environ.get("ROM_DIR", os.path.join(EMU_BASE, "roms"))
+CORE_DIR = os.environ.get("CORE_DIR", os.path.join(EMU_BASE, "cores"))
+STATE_DIR = os.environ.get("STATE_DIR", os.path.join(EMU_BASE, "states"))
+ROM_BUCKET = os.environ.get("ROM_BUCKET", "roms")
+WORKER_PATH = os.path.join(EMU_BASE, "emu_worker.py")
+CORE_BASE_URL = os.environ.get("CORE_BASE_URL", "https://buildbot.libretro.com/nightly/linux/x86_64/latest")
+
+MAX_EMU_SESSIONS = int(os.environ.get("MAX_EMU_SESSIONS", "2"))          # one worker process each
+EMU_IDLE_SECONDS = int(os.environ.get("EMU_IDLE_SECONDS", "300"))        # idle sessions are killed, freeing RAM
+EMU_SCALE = int(os.environ.get("EMU_SCALE", "2"))                        # PNG upscale (nearest neighbour)
+EMU_HOLD_STEPS = [4, 8, 16, 30]                                          # frames a tap holds a button
+EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))        # frames run after release
+EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
+EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"                # let Manage Server holders add ROMs
+
+EMU_SYSTEMS = {
+    "nes": {"label": "NES", "exts": {".nes"}, "core": os.environ.get("CORE_NES", "fceumm_libretro")},
+    # snes9x2010 is the light/fast SNES core; set CORE_SNES=snes9x_libretro for max accuracy.
+    "snes": {"label": "SNES", "exts": {".sfc", ".smc", ".swc", ".fig"}, "core": os.environ.get("CORE_SNES", "snes9x2010_libretro")},
+}
+
+# libretro joypad bit positions
+EMU_MASKS = {
+    "b": 1 << 0, "y": 1 << 1, "select": 1 << 2, "start": 1 << 3,
+    "up": 1 << 4, "down": 1 << 5, "left": 1 << 6, "right": 1 << 7,
+    "a": 1 << 8, "x": 1 << 9, "l": 1 << 10, "r": 1 << 11,
+    "ab": (1 << 0) | (1 << 8),
+}
+
+emu_sessions: dict = {}        # channel_id -> EmuSession
+_remote_roms: set = set()      # "nes/Name.nes" entries that live in the Supabase bucket
+_ROM_BAD_CHARS = re.compile(r"[^\w .,'()&!+\-]")
+
+
+# ---- cores ---------------------------------------------------------------------------------
+def ensure_core(system: str) -> str:
+    """Return the path of the libretro core for a system, downloading it once if missing."""
+    name = EMU_SYSTEMS[system]["core"]
+    path = os.path.join(CORE_DIR, name + ".so")
+    if os.path.exists(path):
+        return path
+    os.makedirs(CORE_DIR, exist_ok=True)
+    url = f"{CORE_BASE_URL}/{name}.so.zip"
+    logger.info(f"Downloading libretro core {name} ...")
+    with urllib.request.urlopen(url, timeout=60) as r:
+        blob = r.read()
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        member = next(m for m in z.namelist() if m.endswith(".so"))
+        tmp = path + ".part"
+        with z.open(member) as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    os.replace(tmp, path)
+    return path
+
+
+# ---- ROM library ---------------------------------------------------------------------------
+def system_for(filename: str):
+    ext = os.path.splitext(filename)[1].lower()
+    for key, spec in EMU_SYSTEMS.items():
+        if ext in spec["exts"]:
+            return key
+    return None
+
+
+def clean_rom_filename(name: str):
+    base = os.path.basename((name or "").replace("\\", "/"))
+    stem, ext = os.path.splitext(base)
+    stem = _ROM_BAD_CHARS.sub("", stem).strip(" .")[:60]
+    return (stem + ext.lower()) if stem else None
+
+
+def valid_rom_ref(rel: str):
+    """'nes/Game.nes' -> (system, filename), or None if it is not a safe library reference."""
+    parts = (rel or "").split("/")
+    if len(parts) != 2 or parts[0] not in EMU_SYSTEMS:
+        return None
+    if clean_rom_filename(parts[1]) != parts[1] or system_for(parts[1]) != parts[0]:
+        return None
+    return parts[0], parts[1]
+
+
+def list_local_roms() -> set:
+    found = set()
+    for system in EMU_SYSTEMS:
+        d = os.path.join(ROM_DIR, system)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if system_for(f) == system:
+                    found.add(f"{system}/{f}")
+    return found
+
+
+def all_roms() -> list:
+    return sorted(list_local_roms() | _remote_roms, key=str.lower)
+
+
+def refresh_remote_roms() -> None:
+    global _remote_roms
+    found = set()
+    try:
+        for system in EMU_SYSTEMS:
+            for item in supabase.storage.from_(ROM_BUCKET).list(system):
+                name = item.get("name", "")
+                if system_for(name) == system:
+                    found.add(f"{system}/{name}")
+        _remote_roms = found
+    except Exception as e:
+        logger.warning(f"ROM bucket '{ROM_BUCKET}' not available, using local ROM files only: {e}")
+
+
+def ensure_rom_local(rel: str) -> str:
+    ref = valid_rom_ref(rel)
+    if not ref:
+        raise ValueError("invalid ROM name")
+    path = os.path.join(ROM_DIR, ref[0], ref[1])
+    if os.path.exists(path):
+        return path
+    data = supabase.storage.from_(ROM_BUCKET).download(rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
+
+
+def add_rom_blocking(system: str, filename: str, data: bytes) -> bool:
+    """Save a ROM locally and (best effort) in the Supabase bucket. Returns True if it is persistent."""
+    path = os.path.join(ROM_DIR, system, filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    try:
+        supabase.storage.from_(ROM_BUCKET).upload(
+            path=f"{system}/{filename}", file=data,
+            file_options={"content-type": "application/octet-stream", "upsert": "true"},
+        )
+        _remote_roms.add(f"{system}/{filename}")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not persist ROM to bucket '{ROM_BUCKET}': {e}")
+        return False
+
+
+def remove_rom_blocking(rel: str) -> None:
+    ref = valid_rom_ref(rel)
+    if not ref:
+        return
+    try:
+        os.remove(os.path.join(ROM_DIR, ref[0], ref[1]))
+    except FileNotFoundError:
+        pass
+    try:
+        supabase.storage.from_(ROM_BUCKET).remove([rel])
+    except Exception as e:
+        logger.warning(f"Could not remove {rel} from bucket: {e}")
+    _remote_roms.discard(rel)
+
+
+def sync_roms_to_disk() -> None:
+    """Pull bucket ROMs onto local disk at startup so the first /emu-play has no download delay."""
+    for rel in sorted(_remote_roms):
+        try:
+            ensure_rom_local(rel)
+        except Exception as e:
+            logger.warning(f"Could not pre-load {rel}: {e}")
+
+
+async def emu_rom_autocomplete(interaction: discord.Interaction, current: str):
+    cur = current.lower()
+    out = []
+    for rel in all_roms():
+        if cur in rel.lower():
+            system, fname = rel.split("/", 1)
+            out.append(app_commands.Choice(name=f"[{EMU_SYSTEMS[system]['label']}] {os.path.splitext(fname)[0]}"[:100], value=rel[:100]))
+            if len(out) >= 25:
+                break
+    return out
+
+
+# ---- sessions ------------------------------------------------------------------------------
+def _proc_rss_mb(pid: int) -> float:
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+    except Exception:
+        return 0.0
+
+
+class EmuSession:
+    def __init__(self, channel_id: int, rel: str, starter_id: int):
+        self.channel_id = channel_id
+        self.rel = rel
+        self.system, self.filename = rel.split("/", 1)
+        self.title = os.path.splitext(self.filename)[0]
+        self.label = EMU_SYSTEMS[self.system]["label"]
+        self.starter_id = starter_id
+        self.proc = None
+        self.message_id = None
+        self.lock = asyncio.Lock()
+        self.closed = False
+        self.last_used = time.monotonic()
+        self.hold_idx = 1
+        self.last_mask = 0
+        self.seq = 0
+        self.inputs = 0
+
+    @property
+    def hold(self) -> int:
+        return EMU_HOLD_STEPS[self.hold_idx]
+
+    @property
+    def state_path(self) -> str:
+        return os.path.join(STATE_DIR, f"{self.channel_id}__{self.system}__{self.filename}.state")
+
+    def touch(self):
+        self.last_used = time.monotonic()
+
+    async def spawn(self):
+        env = dict(os.environ, MALLOC_ARENA_MAX="2", PYTHONUNBUFFERED="1")   # MALLOC_ARENA_MAX keeps RSS small
+        self.proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", WORKER_PATH,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, env=env,
+        )
+
+    async def _rpc(self, msg: dict) -> dict:
+        data = pickle.dumps(msg, protocol=4)
+        self.proc.stdin.write(struct.pack("<I", len(data)) + data)
+        await self.proc.stdin.drain()
+        (n,) = struct.unpack("<I", await self.proc.stdout.readexactly(4))
+        return pickle.loads(await self.proc.stdout.readexactly(n))
+
+    async def call(self, **msg) -> dict:
+        """Never raises. One request at a time per game; the lock keeps the pipe in sync."""
+        async with self.lock:
+            if self.closed or self.proc is None:
+                return {"ok": False, "err": "session ended", "dead": True}
+            try:
+                return await self._rpc(msg)
+            except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
+                return {"ok": False, "err": "the emulator process stopped", "dead": True}
+            except Exception as e:
+                logger.error(f"Emulator RPC failed: {e}")
+                return {"ok": False, "err": str(e), "dead": True}
+
+    def kill(self):
+        proc, self.proc = self.proc, None
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+
+async def emu_close(sess: EmuSession, reason: str):
+    if emu_sessions.get(sess.channel_id) is sess:
+        emu_sessions.pop(sess.channel_id, None)
+    if sess.closed:
+        return
+    sess.closed = True
+    if sess.proc and sess.proc.returncode is None:
+        try:
+            sess.proc.stdin.close()      # worker exits on EOF
+            await asyncio.wait_for(sess.proc.wait(), timeout=2)
+        except Exception:
+            pass
+    sess.kill()
+    if sess.message_id:
+        ch = bot.get_channel(sess.channel_id)
+        if ch:
+            try:
+                await ch.get_partial_message(sess.message_id).edit(content=f"⏹️ **{sess.label}: {sess.title}** ended ({reason}).", view=None)
+            except Exception:
+                pass
+    logger.info(f"Emulator session closed in channel {sess.channel_id}: {reason}")
+
+
+async def emu_reaper_loop():
+    while True:
+        await asyncio.sleep(30)
+        now = time.monotonic()
+        for sess in list(emu_sessions.values()):
+            if now - sess.last_used > EMU_IDLE_SECONDS:
+                await emu_close(sess, "idle, memory freed")
+
+
+def _kill_all_emulators():
+    for sess in list(emu_sessions.values()):
+        sess.kill()
+
+atexit.register(_kill_all_emulators)
+
+
+async def emu_startup():
+    for d in (ROM_DIR, CORE_DIR, STATE_DIR):
+        os.makedirs(d, exist_ok=True)
+    for system in EMU_SYSTEMS:
+        try:
+            await asyncio.to_thread(ensure_core, system)
+        except Exception as e:
+            logger.error(f"Could not get the {system} core (set CORE_BASE_URL or place the .so in {CORE_DIR}): {e}")
+    await asyncio.to_thread(refresh_remote_roms)
+    await asyncio.to_thread(sync_roms_to_disk)
+    logger.info(f"Emulator ready: {len(all_roms())} game(s) in the library.")
+    while True:    # keep the bucket listing fresh for autocomplete without hitting the network per keystroke
+        await asyncio.sleep(300)
+        await asyncio.to_thread(refresh_remote_roms)
+
+
+# ---- controller UI -------------------------------------------------------------------------
+class EmuButton(discord.ui.Button):
+    def __init__(self, action: str, label: str, style, row: int, disabled: bool = False):
+        super().__init__(label=label, style=style, row=row, disabled=disabled)
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.handle(interaction, self.action)
+
+
+class EmuView(discord.ui.View):
+    def __init__(self, sess: EmuSession):
+        super().__init__(timeout=None)
+        self.sess = sess
+        snes = sess.system == "snes"
+        S, P, G, D = (discord.ButtonStyle.secondary, discord.ButtonStyle.primary,
+                      discord.ButtonStyle.success, discord.ButtonStyle.danger)
+        layout = [
+            [("l", "L", S, not snes), ("up", "⬆", S, False), ("r", "R", S, not snes), ("select", "Select", S, False), ("start", "Start", G, False)],
+            [("left", "⬅", S, False), ("down", "⬇", S, False), ("right", "➡", S, False), ("x", "X", P, not snes), ("y", "Y", P, not snes)],
+            [("b", "B", D, False), ("a", "A", G, False), ("ab", "A+B", P, False), ("hold", "", S, False), ("clip", "\U0001F39E Clip", S, False)],
+            [("save", "\U0001F4BE Save", S, False), ("load", "\U0001F4C2 Load", S, False), ("quit", "⏹ Quit", D, False)],
+        ]
+        self.hold_btn = None
+        for row, items in enumerate(layout):
+            for action, label, style, disabled in items:
+                btn = EmuButton(action, label, style, row, disabled)
+                if action == "hold":
+                    self.hold_btn = btn
+                    self._relabel_hold()
+                self.add_item(btn)
+
+    def _relabel_hold(self):
+        self.hold_btn.label = f"⏩ Hold {self.sess.hold}f"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_user_banned(interaction.user.id):
+            await interaction.response.send_message("❌ You are globally banned from using this bot.", ephemeral=True)
+            return False
+        return True
+
+    async def _call(self, interaction: discord.Interaction, **msg):
+        """Run an emulator request. If it is slow, defer so the 3 s interaction window never expires.
+        The request task is never cancelled (that would desync the worker pipe)."""
+        task = asyncio.ensure_future(self.sess.call(**msg))
+        done, _ = await asyncio.wait({task}, timeout=2.3)
+        deferred = False
+        if not done:
+            try:
+                await interaction.response.defer()
+                deferred = True
+            except discord.HTTPException:
+                pass
+        return await task, deferred
+
+    async def _show_frame(self, interaction, png: bytes, deferred: bool, note: str):
+        sess = self.sess
+        sess.seq += 1
+        fname = f"f{sess.seq}.png"
+        embed = discord.Embed(color=discord.Color.dark_grey())
+        embed.set_author(name=f"{sess.label}: {sess.title}")
+        embed.set_image(url=f"attachment://{fname}")
+        embed.set_footer(text=note)
+        file = discord.File(io.BytesIO(png), filename=fname)
+        if deferred:
+            await interaction.edit_original_response(embed=embed, attachments=[file], view=self)
+        else:
+            await interaction.response.edit_message(embed=embed, attachments=[file], view=self)
+
+    async def _fail(self, interaction, res, deferred):
+        text = f"❌ {res.get('err', 'Emulator error')}"
+        if res.get("dead"):
+            await emu_close(self.sess, "emulator stopped")
+        try:
+            if deferred or interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            pass
+
+    def _can_stop(self, interaction: discord.Interaction) -> bool:
+        perms = getattr(interaction.user, "guild_permissions", None)
+        return interaction.user.id == self.sess.starter_id or bool(perms and perms.manage_messages)
+
+    async def handle(self, interaction: discord.Interaction, action: str):
+        sess = self.sess
+        if sess.closed:
+            await interaction.response.send_message("⏹️ This game session has ended. Start a new one with `/emu-play`.", ephemeral=True)
+            return
+        sess.touch()
+
+        if action in EMU_MASKS:
+            sess.last_mask = EMU_MASKS[action]
+            sess.inputs += 1
+            res, deferred = await self._call(interaction, op="step", mask=sess.last_mask, hold=sess.hold,
+                                             settle=EMU_SETTLE_FRAMES, scale=EMU_SCALE)
+            if not res.get("ok"):
+                return await self._fail(interaction, res, deferred)
+            await self._show_frame(interaction, res["png"], deferred, f"{interaction.user.display_name}: {action.upper()}  •  {sess.inputs} inputs")
+
+        elif action == "hold":
+            sess.hold_idx = (sess.hold_idx + 1) % len(EMU_HOLD_STEPS)
+            self._relabel_hold()
+            await interaction.response.edit_message(view=self)
+
+        elif action == "clip":
+            res, deferred = await self._call(interaction, op="clip", mask=sess.last_mask, hold=sess.hold, frames=90, every=3, scale=1)
+            if not res.get("ok"):
+                return await self._fail(interaction, res, deferred)
+            file = discord.File(io.BytesIO(res["gif"]), filename="clip.gif")
+            if deferred:
+                await interaction.followup.send(file=file)
+            else:
+                await interaction.response.send_message(file=file)
+
+        elif action == "save":
+            res, deferred = await self._call(interaction, op="save", path=sess.state_path)
+            if not res.get("ok"):
+                return await self._fail(interaction, res, deferred)
+            msg = "\U0001F4BE Saved your progress."
+            await (interaction.followup.send(msg, ephemeral=True) if deferred else interaction.response.send_message(msg, ephemeral=True))
+
+        elif action == "load":
+            if not os.path.exists(sess.state_path):
+                await interaction.response.send_message("⚠️ No save for this game in this channel yet. Press **Save** first.", ephemeral=True)
+                return
+            res, deferred = await self._call(interaction, op="loadstate", path=sess.state_path, scale=EMU_SCALE)
+            if not res.get("ok"):
+                return await self._fail(interaction, res, deferred)
+            await self._show_frame(interaction, res["png"], deferred, f"{interaction.user.display_name}: loaded save")
+
+        elif action == "quit":
+            if not self._can_stop(interaction):
+                await interaction.response.send_message("❌ Only the person who started the game (or someone with Manage Messages) can quit it.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            await emu_close(sess, f"stopped by {interaction.user.display_name}")
+
+
+# ---- slash commands ------------------------------------------------------------------------
+@bot.tree.command(name="emu-play", description="Play a NES/SNES game in this channel with a button controller.")
+@app_commands.describe(game="Pick a game from the library")
+@app_commands.autocomplete(game=emu_rom_autocomplete)
+async def emu_play(interaction: discord.Interaction, game: str):
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    ref = valid_rom_ref(game)
+    if not ref or game not in all_roms():
+        await interaction.response.send_message("❌ Pick a game from the list (use `/emu-games` to see the library).", ephemeral=True)
+        return
+    if interaction.channel.id in emu_sessions:
+        await interaction.response.send_message("⚠️ A game is already running in this channel. Use its **Quit** button or `/emu-stop` first.", ephemeral=True)
+        return
+    if len(emu_sessions) >= MAX_EMU_SESSIONS:
+        await interaction.response.send_message(f"⚠️ The bot is already running {MAX_EMU_SESSIONS} games. Try again when one ends.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    sess = EmuSession(interaction.channel.id, game, interaction.user.id)
+    emu_sessions[sess.channel_id] = sess      # reserve the slot before any await
+    try:
+        rom_path = await asyncio.to_thread(ensure_rom_local, game)
+        core_path = await asyncio.to_thread(ensure_core, sess.system)
+        await sess.spawn()
+        res = await sess.call(op="load", core=core_path, rom=rom_path,
+                              sysdir=os.path.join(EMU_BASE, "system"), savedir=os.path.join(STATE_DIR, "sram"))
+        if not res.get("ok"):
+            raise RuntimeError(res.get("err", "load failed"))
+        res = await sess.call(op="step", mask=0, hold=0, settle=60, scale=EMU_SCALE)   # skip the first second of boot
+        if not res.get("ok"):
+            raise RuntimeError(res.get("err", "no frame"))
+
+        view = EmuView(sess)
+        sess.seq += 1
+        fname = f"f{sess.seq}.png"
+        embed = discord.Embed(color=discord.Color.dark_grey())
+        embed.set_author(name=f"{sess.label}: {sess.title}")
+        embed.set_image(url=f"attachment://{fname}")
+        embed.set_footer(text=f"Started by {interaction.user.display_name} • anyone in the channel can press buttons")
+        msg = await interaction.channel.send(embed=embed, file=discord.File(io.BytesIO(res["png"]), filename=fname), view=view)
+        sess.message_id = msg.id
+        sess.touch()
+        await interaction.followup.send("\U0001F3AE Game started!", ephemeral=True)
+    except Exception as e:
+        logger.error(f"emu-play failed: {e}")
+        emu_sessions.pop(sess.channel_id, None)
+        sess.closed = True
+        sess.kill()
+        await interaction.followup.send(f"❌ Couldn't start the game: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="emu-games", description="List the NES/SNES games in the library.")
+async def emu_games(interaction: discord.Interaction):
+    roms = all_roms()
+    if not roms:
+        await interaction.response.send_message(
+            "\U0001F4ED The library is empty. The bot owner can add games with `/emu-add`, or put files in `roms/nes` and `roms/snes`.",
+            ephemeral=True)
+        return
+    embed = discord.Embed(title=f"\U0001F3AE Game library ({len(roms)})", color=discord.Color.blurple())
+    for system, spec in EMU_SYSTEMS.items():
+        names = [os.path.splitext(r.split("/", 1)[1])[0] for r in roms if r.startswith(system + "/")]
+        if names:
+            text = "\n".join(f"• {n}" for n in names)
+            embed.add_field(name=f"{spec['label']} ({len(names)})", value=text[:1000], inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def _can_manage_roms(interaction: discord.Interaction, is_owner: bool) -> bool:
+    if is_owner:
+        return True
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return EMU_ADD_OPEN and bool(perms and perms.manage_guild)
+
+
+@bot.tree.command(name="emu-add", description="Add a NES/SNES game file to the library.")
+@app_commands.describe(rom="The ROM file (.nes, .sfc, .smc)", name="Optional display name (defaults to the file name)")
+async def emu_add(interaction: discord.Interaction, rom: discord.Attachment, name: str = None):
+    if not _can_manage_roms(interaction, await check_is_owner(interaction)):
+        await interaction.response.send_message("❌ Only the bot owner can add games.", ephemeral=True)
+        return
+    ext = os.path.splitext(rom.filename)[1].lower()
+    filename = clean_rom_filename((name or os.path.splitext(rom.filename)[0]) + ext)
+    system = system_for(filename or "")
+    if not filename or not system:
+        await interaction.response.send_message("❌ Use a `.nes`, `.sfc`, `.smc`, `.swc` or `.fig` file.", ephemeral=True)
+        return
+    if rom.size > EMU_MAX_ROM_BYTES:
+        await interaction.response.send_message(f"❌ That file is too large (limit {EMU_MAX_ROM_BYTES // 1048576} MB).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    data = await rom.read()
+    if system == "nes" and data[:4] != b"NES\x1a":
+        await interaction.followup.send("❌ That doesn't look like an iNES `.nes` file.", ephemeral=True)
+        return
+    persisted = await asyncio.to_thread(add_rom_blocking, system, filename, data)
+    note = "" if persisted else f"\n⚠️ Not saved to the `{ROM_BUCKET}` Supabase bucket, so it may disappear on redeploy."
+    await interaction.followup.send(f"✅ Added **{os.path.splitext(filename)[0]}** to the {EMU_SYSTEMS[system]['label']} library.{note}", ephemeral=True)
+
+
+@bot.tree.command(name="emu-remove", description="Remove a game from the library.")
+@app_commands.describe(game="The game to remove")
+@app_commands.autocomplete(game=emu_rom_autocomplete)
+async def emu_remove(interaction: discord.Interaction, game: str):
+    if not _can_manage_roms(interaction, await check_is_owner(interaction)):
+        await interaction.response.send_message("❌ Only the bot owner can remove games.", ephemeral=True)
+        return
+    if not valid_rom_ref(game):
+        await interaction.response.send_message("❌ Pick a game from the list.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await asyncio.to_thread(remove_rom_blocking, game)
+    await interaction.followup.send(f"\U0001F5D1️ Removed `{game}`.", ephemeral=True)
+
+
+@bot.tree.command(name="emu-stop", description="Stop the game running in this channel.")
+async def emu_stop(interaction: discord.Interaction):
+    sess = emu_sessions.get(interaction.channel.id) if interaction.channel else None
+    if not sess:
+        await interaction.response.send_message("⚠️ No game is running in this channel.", ephemeral=True)
+        return
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not (interaction.user.id == sess.starter_id or (perms and perms.manage_messages) or await check_is_owner(interaction)):
+        await interaction.response.send_message("❌ Only the person who started the game (or someone with Manage Messages) can stop it.", ephemeral=True)
+        return
+    await interaction.response.send_message("⏹️ Stopping the game...", ephemeral=True)
+    await emu_close(sess, f"stopped by {interaction.user.display_name}")
+
+
+@bot.tree.command(name="emu-status", description="Show running emulator sessions and memory use.")
+async def emu_status(interaction: discord.Interaction):
+    lines = [f"Running games: `{len(emu_sessions)}/{MAX_EMU_SESSIONS}` • idle timeout `{EMU_IDLE_SECONDS}s` • library `{len(all_roms())}` game(s)"]
+    for s in emu_sessions.values():
+        pid = s.proc.pid if s.proc else 0
+        idle = int(time.monotonic() - s.last_used)
+        lines.append(f"• <#{s.channel_id}>: **{s.label} {s.title}**, worker `{_proc_rss_mb(pid):.0f} MB`, idle `{idle}s`")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # ------------------------------------------------------------------------------
 # MAIN RUNNER
