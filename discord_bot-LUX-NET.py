@@ -512,7 +512,20 @@ async def sync_rating_copies(embed: discord.Embed, targets: list, exclude_messag
     await asyncio.gather(*(one(c, m) for c, m in targets))
 
 
-async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username: str, avatar_url: str):
+async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username: str, avatar_url: str, reply_to_id: int = None):
+    # Attach the poll to a specific message (the first post) as a reply. Only the bot can reply;
+    # webhooks can't, so this goes first and the webhook path below stays as the fallback.
+    if reply_to_id:
+        try:
+            return await channel.send(
+                embed=embed,
+                view=build_rating_view(poll_id),
+                reference=channel.get_partial_message(reply_to_id),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as e:
+            logger.warning(f"Could not reply to first message {reply_to_id} in {channel.id}, using normal poll post: {e}")
     webhook = await get_or_create_webhook(channel)
     if webhook:
         try:
@@ -607,12 +620,14 @@ async def post_auto_poll(thread: discord.Thread, starter_message: discord.Messag
         username = f"{starter_message.author.display_name} [{thread.guild.name}] (Poll)"[:80]
         avatar_url = starter_message.author.display_avatar.url
 
+        # In a forum post the first message shares its ID with the thread, in the original
+        # and in every relayed copy, so the poll replies straight to that first message.
         seen = set()
         for channel in [thread] + list(copies):
             if channel.id in seen:
                 continue
             seen.add(channel.id)
-            sent = await post_rating_copy(channel, embed, poll_id, username, avatar_url)
+            sent = await post_rating_copy(channel, embed, poll_id, username, avatar_url, reply_to_id=channel.id)
             if sent:
                 await asyncio.to_thread(rating_db_add_message, poll_id, channel.id, sent.id)
     except Exception as e:
@@ -1873,35 +1888,88 @@ async def voice_status(interaction: discord.Interaction):
 # ------------------------------------------------------------------------------
 # YOUTUBE & WEB SEARCH COMMANDS
 # ------------------------------------------------------------------------------
+def _entry_url(entry: dict) -> str:
+    """Flat yt-dlp search results don't always carry webpage_url, so fall back to url / id."""
+    url = entry.get("webpage_url") or entry.get("url") or ""
+    if not url.startswith("http") and entry.get("id"):
+        url = f"https://www.youtube.com/watch?v={entry['id']}"
+    return url
+
+
+async def relay_watch_post(source_channel, requester: discord.abc.User, title: str, url: str):
+    """Post the picked video link into every channel linked to source_channel.
+    Only the URL is sent, so Discord unfurls the playable YouTube player in each server."""
+    try:
+        target_ids = await asyncio.to_thread(relay_targets_for, source_channel)
+    except Exception as e:
+        logger.error(f"Could not look up relay targets for /play: {e}")
+        return
+
+    guild_name = source_channel.guild.name if source_channel.guild else "Unknown"
+    username = f"{requester.display_name} [{guild_name}]"[:80]
+    content = f"\u25B6\uFE0F **{requester.display_name}** is watching: **{title}**\n{url}"[:2000]
+
+    async def one(cid: int):
+        ch = bot.get_channel(cid)
+        if not ch:
+            return
+        try:
+            webhook = await get_or_create_webhook(ch)
+            if webhook:
+                await webhook.send(
+                    username=username,
+                    avatar_url=requester.display_avatar.url,
+                    content=content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    **_thread_kw(ch),
+                )
+            else:
+                await ch.send(content, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            logger.warning(f"Could not relay video link to {cid}: {e}")
+
+    await asyncio.gather(*(one(cid) for cid in target_ids))
+
+
 class YouTubeDropdown(discord.ui.Select):
     def __init__(self, options):
         super().__init__(placeholder="Select the correct video from the search...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        selected_url = self.values[0]
+        url = self.values[0]
+        title = next((o.label for o in self.options if o.value == url), "YouTube video")
+
+        # Public message in this channel: the bare URL makes Discord show the playable embed.
         await interaction.response.send_message(
-            f"✅ You selected: {selected_url}\n(Click the link to open and watch the video directly!)",
-            ephemeral=False
+            f"\u25B6\uFE0F **{interaction.user.display_name}** is watching: **{title}**\n{url}"
         )
+        # Same post in every linked channel / server.
+        if interaction.channel and supabase:
+            await relay_watch_post(interaction.channel, interaction.user, title, url)
+
 
 class YouTubeSelectView(discord.ui.View):
     def __init__(self, entries):
         super().__init__(timeout=60)
         options = []
         for entry in entries[:5]:
-            title = entry.get('title', 'Unknown Title')[:100]
-            uploader = entry.get('uploader', 'Unknown Channel')[:100]
-            url = entry.get('webpage_url', '')
+            url = _entry_url(entry)
+            if not url:
+                continue
+            title = (entry.get("title") or "Unknown Title")[:100]
+            uploader = entry.get("uploader") or entry.get("channel") or "Unknown Channel"
             options.append(
                 discord.SelectOption(
-                    label=title[:100],
+                    label=title,
                     description=f"By: {uploader}"[:100],
-                    value=url
+                    value=url[:100],
                 )
             )
-        self.add_item(YouTubeDropdown(options))
+        self.has_options = bool(options)
+        if options:
+            self.add_item(YouTubeDropdown(options))
 
-@bot.tree.command(name="play", description="Search YouTube or paste a direct YouTube URL.")
+@bot.tree.command(name="play", description="Search YouTube, pick a video, and it plays inline here and in linked servers.")
 @app_commands.describe(search="Search keywords or paste a YouTube URL")
 async def play(interaction: discord.Interaction, search: str):
     await interaction.response.defer(ephemeral=True)
@@ -1947,6 +2015,9 @@ async def play(interaction: discord.Interaction, search: str):
         return
 
     view = YouTubeSelectView(entries)
+    if not view.has_options:
+        await interaction.followup.send(f"\u26A0\uFE0F Could not find any playable results for `{search}`.", ephemeral=True)
+        return
     await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
 @bot.tree.command(name="search", description="Perform a fast web search via DuckDuckGo.")
