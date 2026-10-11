@@ -3,6 +3,7 @@ import sys
 import asyncio
 import logging
 import io
+import json
 import resource
 import math
 import re
@@ -204,6 +205,44 @@ def google_search(query: str, num_results: int = 5):
         }]
         
     return results
+
+# ------------------------------------------------------------------------------
+# GEMINI AI OVERVIEW (shown above the search links in /search)
+# Needs GEMINI_API_KEY (free key from Google AI Studio). GEMINI_MODEL is optional.
+# Uses Gemini's built-in Google Search grounding so the overview reflects current results.
+# ------------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def gemini_overview(query: str):
+    """Returns a short AI overview for the query, or None if unavailable."""
+    if not GEMINI_API_KEY:
+        return None
+    payload = {
+        "contents": [{"parts": [{"text": (
+            "Give a short, factual overview answering this web search, like a search engine's AI overview: "
+            "2 to 4 sentences, or up to 4 short bullet points if it is a list. "
+            "Use Discord markdown only (**bold**, - bullets). No headings, no preamble, "
+            "no links, and keep it under 120 words.\n\nSearch: " + query
+        )}]}],
+        "tools": [{"google_search": {}}],
+    }
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(part.get("text", "") for part in parts).strip()
+        return text or None
+    except Exception as e:
+        logger.error(f"Gemini overview error: {e}")
+        return None
 
 # ------------------------------------------------------------------------------
 # FLASK KEEP-ALIVE SERVER (FOR RENDER UPTIME)
@@ -2020,14 +2059,17 @@ async def play(interaction: discord.Interaction, search: str):
         return
     await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
-@bot.tree.command(name="search", description="Perform a fast web search via DuckDuckGo.")
+@bot.tree.command(name="search", description="Web search with a Gemini AI overview and result links.")
 @app_commands.describe(query="What would you like to search for?")
 async def search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
     try:
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, lambda: google_search(query, num_results=5))
+        # Links and the AI overview are fetched at the same time.
+        results, overview = await asyncio.gather(
+            asyncio.to_thread(google_search, query, 5),
+            asyncio.to_thread(gemini_overview, query),
+        )
 
         if not results:
             await interaction.followup.send(f"⚠ No results found for `{query}`.")
@@ -2037,6 +2079,9 @@ async def search(interaction: discord.Interaction, query: str):
             title=f"🔍 Search Results for: `{query}`",
             color=discord.Color.green()
         )
+        if overview:
+            embed.description = f"✨ **AI Overview**\n{overview[:1800]}"
+            embed.set_footer(text="AI overview by Gemini. It can make mistakes, so check the links below.")
 
         for i, item in enumerate(results[:5], 1):
             title = item.get("title", "Result")
