@@ -7,3 +7,4 @@ supabase
 yt-dlp>=2026.03.00
 duckduckgo-search
 pillow
+aiohttp
