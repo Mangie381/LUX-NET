@@ -350,7 +350,10 @@ def forget_webhook(channel):
 # ------------------------------------------------------------------------------
 # RELAY ENGINE (cached lookups, concurrent sends, safe attachment handling)
 # ------------------------------------------------------------------------------
-RELAY_MAX_FILE_MB = int(os.environ.get("RELAY_MAX_FILE_MB", "25"))
+# Largest file the bot will download to re-upload (Discord's biggest server limit is 100 MB). Lower it if the
+# host runs out of memory. Files above this, or above a target server's own limit, are sent as a link instead.
+RELAY_MAX_FILE_MB = int(os.environ.get("RELAY_MAX_FILE_MB", "100"))
+_big_download_sem = asyncio.Semaphore(2)     # at most 2 large downloads in memory at once
 RELAY_SYNC_EDITS = os.environ.get("RELAY_SYNC_EDITS", "1") == "1"
 RELAY_SYNC_DELETES = os.environ.get("RELAY_SYNC_DELETES", "1") == "1"
 RELAY_CACHE_TTL = int(os.environ.get("RELAY_CACHE_TTL", "120"))
@@ -512,13 +515,27 @@ async def _download_attachment(att: discord.Attachment, limit_bytes: int) -> Rel
     ra = RelayAttachment(filename=att.filename, url=att.url, size=att.size, description=att.description)
     if att.size <= limit_bytes:
         try:
-            ra.data = await att.read()
+            if att.size > 20 * 1024 * 1024:
+                async with _big_download_sem:
+                    ra.data = await att.read()
+            else:
+                ra.data = await att.read()
         except Exception as e:
             logger.warning(f"Could not download attachment {att.filename}: {e}")
+    else:
+        logger.info(f"{att.filename} ({att.size // 1048576} MB) is above every target server's upload limit; relaying as a link")
     return ra
 
 
-async def build_relay_payload(message: discord.Message, *, with_reply: bool = True, extra_text: str = "") -> RelayPayload:
+def _fmt_size(n: int) -> str:
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(1, n // 1024)} KB"
+
+
+def _link_line(a) -> str:
+    return f"\U0001F4CE **{a.filename}** ({_fmt_size(a.size)}):\n{a.url}"
+
+
+async def build_relay_payload(message: discord.Message, *, with_reply: bool = True, extra_text: str = "", targets: list = None) -> RelayPayload:
     content = message.content or ""
     embeds = list(message.embeds)
     atts = list(message.attachments)
@@ -558,7 +575,10 @@ async def build_relay_payload(message: discord.Message, *, with_reply: bool = Tr
     if prefix:
         _remember(_reply_prefixes, message.id, prefix)
 
-    limit_bytes = RELAY_MAX_FILE_MB * 1024 * 1024
+    # Download anything that at least one target server can accept (that server's own limit decides, not the
+    # uploader's: a Nitro user's 200 MB video still can't be uploaded into a server limited to 10 MB).
+    target_limits = [t.guild.filesize_limit for t in (targets or []) if getattr(t, "guild", None)]
+    limit_bytes = min(RELAY_MAX_FILE_MB * 1024 * 1024, max(target_limits)) if target_limits else RELAY_MAX_FILE_MB * 1024 * 1024
     attachments = await asyncio.gather(*(_download_attachment(a, limit_bytes) for a in atts[:10]))
 
     guild_name = message.guild.name if message.guild else "Unknown"
@@ -607,12 +627,17 @@ async def webhook_send(channel, *, files_factory=None, thread=None, **kwargs):
 async def relay_to_target(ch, p: RelayPayload, *, thread_name: str | None = None):
     """Relay one payload to one channel/thread. Returns the first sent message or None."""
     limit = ch.guild.filesize_limit if getattr(ch, "guild", None) else 10 * 1024 * 1024
-    inline = [a for a in p.attachments if a.data is not None and a.size <= limit]
-    links = [a.url for a in p.attachments if a not in inline]
+    inline, total = [], 0
+    for a in p.attachments:          # pack files into what this server accepts; the rest go as links
+        if a.data is not None and a.size <= limit and total + a.size <= limit and len(inline) < 10:
+            inline.append(a)
+            total += a.size
+    inline_ids = {id(a) for a in inline}
+    links = [_link_line(a) for a in p.attachments if id(a) not in inline_ids]
     no_mentions = discord.AllowedMentions.none()
 
     def build(use_files: bool):
-        extra = list(links) + ([] if use_files else [a.url for a in inline])
+        extra = list(links) + ([] if use_files else [_link_line(a) for a in inline])
         text = (p.content + ("\n" if p.content and extra else "") + "\n".join(extra)).strip()
         return split_text(text)
 
@@ -1198,7 +1223,7 @@ async def _relay_new_forum_post(thread: discord.Thread):
         return starter_message, copies
 
     try:
-        payload = await build_relay_payload(starter_message, with_reply=False)
+        payload = await build_relay_payload(starter_message, with_reply=False, targets=targets)
         if not payload.content and not payload.embeds and not payload.attachments:
             payload.content = f"*[Forum Post: {thread.name}]*"
         results = await asyncio.gather(*(relay_to_target(f, payload, thread_name=thread.name) for f in targets),
@@ -1629,7 +1654,7 @@ async def on_message(message: discord.Message):
     if not targets:
         return
 
-    payload = await build_relay_payload(message)
+    payload = await build_relay_payload(message, targets=targets)
     sent = await relay_payload(payload, targets)
     if sent:
         schedule_mapping(message.id, message.channel.id, sent)
