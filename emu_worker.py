@@ -7,23 +7,40 @@ session ends or goes idle, so the OS gives all of its memory back.
 
 Two ways of running a game:
 
-  LIVE   {"op": "live", "on": True}   The worker runs the core on its own clock (real time,
-         ~60 Hz) and pushes a JPEG frame to the bot ~30 times a second. The bot relays those to
-         browsers over a WebSocket. While nobody is watching, or nobody has pressed a key for a
-         while, the loop sleeps and uses no CPU at all.
+  LIVE   {"op": "live", "on": True}   The worker runs the core on its own clock (the core's
+         native rate, ~60 Hz) and pushes EVERY frame as a JPEG plus the matching audio to the
+         bot. The bot relays both over a WebSocket to browsers. While nobody is watching, or
+         nobody has pressed a key for a while, the loop sleeps and uses no CPU at all.
 
-  BURST  "step" / "steps" / "snap" / "clip"   The core runs as fast as the CPU allows for a few
+  BURST  "steps" / "snap" / "clip"    The core runs as fast as the CPU allows for a few
          frames, then one picture comes back. Used for the Discord button / chat controls.
 
 Wire protocol (stdin/stdout, both ends are our own code):
   bot -> worker : 4-byte little-endian length + pickle
   worker -> bot : 4-byte little-endian length + 1 kind byte + payload
-                  kind b"R" = pickled reply to the last request op
-                  kind b"J" = JPEG video frame
-                  kind b"E" = pickled event (stats / paused / resumed)
-Ops that never get a reply: input, seq, live.
+                    kind b"R" = pickled reply to the last request op
+                    kind b"J" = video frame:  1 pad byte + JPEG
+                    kind b"A" = audio chunk:  1 pad byte + int16 PCM (interleaved if stereo)
+                    kind b"E" = pickled event (stats / paused / error)
+Ops that never get a reply: input, seq, live, audio.
+
+The pad byte makes the PCM start on an even offset once the bot forwards "kind + pad + data"
+unchanged to the browser, so the page can view it as an Int16Array without copying.
+
+Performance notes
+  * Pictures are never converted in Python: Pillow unpacks XRGB8888 / RGB565 / 0RGB1555
+    straight from the core's buffer (handles the pitch too).
+  * JPEG encoding and pipe writes run in a separate thread. Pillow and ctypes both release
+    the GIL, so the core is already running the next frame while the last one is encoded.
+  * The encoder only ever sees the NEWEST frame (latest wins). A slow pipe or a slow CPU
+    drops pictures, never grows memory. Audio has a hard cap too.
+  * No numpy, no per-frame allocation in the emulation thread beyond the audio bytes.
 """
+import collections
+import ctypes
+import gc
 import io
+import json
 import os
 import pickle
 import queue
@@ -31,511 +48,629 @@ import struct
 import sys
 import threading
 import time
-from collections import deque
-from ctypes import (CDLL, CFUNCTYPE, POINTER, Structure, byref, c_bool, c_char_p, c_double,
-                    c_float, c_int, c_int16, c_size_t, c_uint, c_void_p, cast,
-                    create_string_buffer, string_at)
 
 from PIL import Image
 
-# --- libretro structures -------------------------------------------------------------------
-class GameInfo(Structure):
-    _fields_ = [("path", c_char_p), ("data", c_void_p), ("size", c_size_t), ("meta", c_char_p)]
+try:                                  # stdlib <=3.12, `audioop-lts` on 3.13+. Optional.
+    import audioop
+except ImportError:
+    audioop = None
+
+# ---------------------------------------------------------------------------------------------
+# libretro ctypes bindings
+# ---------------------------------------------------------------------------------------------
+c = ctypes
 
 
-class SystemInfo(Structure):
-    _fields_ = [("library_name", c_char_p), ("library_version", c_char_p),
-                ("valid_extensions", c_char_p), ("need_fullpath", c_bool), ("block_extract", c_bool)]
+class GameInfo(c.Structure):
+    _fields_ = [("path", c.c_char_p), ("data", c.c_void_p), ("size", c.c_size_t), ("meta", c.c_char_p)]
 
 
-class GameGeometry(Structure):
-    _fields_ = [("base_width", c_uint), ("base_height", c_uint),
-                ("max_width", c_uint), ("max_height", c_uint), ("aspect_ratio", c_float)]
+class SystemInfo(c.Structure):
+    _fields_ = [("library_name", c.c_char_p), ("library_version", c.c_char_p),
+                ("valid_extensions", c.c_char_p), ("need_fullpath", c.c_bool), ("block_extract", c.c_bool)]
 
 
-class SystemTiming(Structure):
-    _fields_ = [("fps", c_double), ("sample_rate", c_double)]
+class GameGeometry(c.Structure):
+    _fields_ = [("base_width", c.c_uint), ("base_height", c.c_uint),
+                ("max_width", c.c_uint), ("max_height", c.c_uint), ("aspect_ratio", c.c_float)]
 
 
-class AVInfo(Structure):
+class SystemTiming(c.Structure):
+    _fields_ = [("fps", c.c_double), ("sample_rate", c.c_double)]
+
+
+class AVInfo(c.Structure):
     _fields_ = [("geometry", GameGeometry), ("timing", SystemTiming)]
 
 
-ENV_CB = CFUNCTYPE(c_bool, c_uint, c_void_p)
-VIDEO_CB = CFUNCTYPE(None, c_void_p, c_uint, c_uint, c_size_t)
-AUDIO_CB = CFUNCTYPE(None, c_int16, c_int16)
-AUDIO_BATCH_CB = CFUNCTYPE(c_size_t, c_void_p, c_size_t)
-POLL_CB = CFUNCTYPE(None)
-INPUT_CB = CFUNCTYPE(c_int16, c_uint, c_uint, c_uint, c_uint)
-
-RETRO_DEVICE_JOYPAD = 1
-RETRO_DEVICE_ID_JOYPAD_MASK = 256
-
-# libretro pixel format -> Pillow raw decoder
-RAW_MODES = {0: "BGR;15", 1: "BGRX", 2: "BGR;16"}
-
-try:
-    _QUANT = Image.Quantize.FASTOCTREE
-except AttributeError:  # very old Pillow
-    _QUANT = 2
+class Variable(c.Structure):
+    _fields_ = [("key", c.c_char_p), ("value", c.c_char_p)]
 
 
-class Core:
-    def __init__(self, core_path: str, rom_path: str, system_dir: str, save_dir: str):
-        os.makedirs(system_dir, exist_ok=True)
-        os.makedirs(save_dir, exist_ok=True)
-        self._sys = system_dir.encode()
-        self._save = save_dir.encode()
-        self.fmt = 0            # libretro default is 0RGB1555 until the core says otherwise
-        self.frame = None       # (raw bytes, w, h, pitch) of the latest *copied* video frame
-        self.fresh = False      # True when the last retro_run delivered (and we copied) new pixels
-        self.want_video = True  # False => we do not need this frame: skip the copy, tell the core
-        self.mask = 0           # currently held buttons (libretro joypad bitmask)
+ENV_CB = c.CFUNCTYPE(c.c_bool, c.c_uint, c.c_void_p)
+VIDEO_CB = c.CFUNCTYPE(None, c.c_void_p, c.c_uint, c.c_uint, c.c_size_t)
+AUDIO_CB = c.CFUNCTYPE(None, c.c_int16, c.c_int16)
+AUDIO_BATCH_CB = c.CFUNCTYPE(c.c_size_t, c.c_void_p, c.c_size_t)
+POLL_CB = c.CFUNCTYPE(None)
+INPUT_CB = c.CFUNCTYPE(c.c_int16, c.c_uint, c.c_uint, c.c_uint, c.c_uint)
 
-        self.lib = lib = CDLL(core_path)
-        lib.retro_set_environment.argtypes = [ENV_CB]
-        lib.retro_set_video_refresh.argtypes = [VIDEO_CB]
-        lib.retro_set_audio_sample.argtypes = [AUDIO_CB]
-        lib.retro_set_audio_sample_batch.argtypes = [AUDIO_BATCH_CB]
-        lib.retro_set_input_poll.argtypes = [POLL_CB]
-        lib.retro_set_input_state.argtypes = [INPUT_CB]
-        lib.retro_get_system_info.argtypes = [POINTER(SystemInfo)]
-        lib.retro_get_system_av_info.argtypes = [POINTER(AVInfo)]
-        lib.retro_load_game.argtypes = [POINTER(GameInfo)]
-        lib.retro_load_game.restype = c_bool
-        lib.retro_serialize_size.restype = c_size_t
-        lib.retro_serialize.argtypes = [c_void_p, c_size_t]
-        lib.retro_serialize.restype = c_bool
-        lib.retro_unserialize.argtypes = [c_void_p, c_size_t]
-        lib.retro_unserialize.restype = c_bool
+ENV_SET_ROTATION = 1
+ENV_GET_CAN_DUPE = 3
+ENV_SET_PERFORMANCE_LEVEL = 8
+ENV_GET_SYSTEM_DIRECTORY = 9
+ENV_SET_PIXEL_FORMAT = 10
+ENV_SET_INPUT_DESCRIPTORS = 11
+ENV_GET_VARIABLE = 15
+ENV_SET_VARIABLES = 16
+ENV_GET_VARIABLE_UPDATE = 17
+ENV_GET_LOG_INTERFACE = 27
+ENV_GET_SAVE_DIRECTORY = 31
+ENV_SET_SYSTEM_AV_INFO = 32
+ENV_SET_CONTROLLER_INFO = 35
+ENV_SET_GEOMETRY = 37
+ENV_GET_CORE_OPTIONS_VERSION = 52
 
-        # Keep references: ctypes callbacks are freed if the Python object is collected.
-        self._cbs = (
-            ENV_CB(self._env), VIDEO_CB(self._video), AUDIO_CB(lambda l, r: None),
-            AUDIO_BATCH_CB(lambda d, n: n),   # audio is discarded: nobody can hear a Discord frame
-            POLL_CB(lambda: None), INPUT_CB(self._input),
-        )
-        lib.retro_set_environment(self._cbs[0])
-        lib.retro_init()
-        lib.retro_set_video_refresh(self._cbs[1])
-        lib.retro_set_audio_sample(self._cbs[2])
-        lib.retro_set_audio_sample_batch(self._cbs[3])
-        lib.retro_set_input_poll(self._cbs[4])
-        lib.retro_set_input_state(self._cbs[5])
+JOYPAD = 1
+JOYPAD_MASK_ID = 256
+MEM_SAVE_RAM = 0
 
-        info = SystemInfo()
-        lib.retro_get_system_info(byref(info))
-        self.name = (info.library_name or b"core").decode(errors="replace")
+# libretro pixel format id -> (Pillow raw mode, bytes per pixel)
+PIXFMT = {0: ("BGR;15", 2), 1: ("BGRX", 4), 2: ("BGR;16", 2)}
 
-        gi = GameInfo()
-        gi.path = rom_path.encode()
-        gi.meta = None
-        self._rom = None
-        if info.need_fullpath:
-            gi.data, gi.size = None, 0
-        else:
-            with open(rom_path, "rb") as f:
-                self._rom = f.read()                    # must outlive the game
-            gi.data = cast(c_char_p(self._rom), c_void_p)
-            gi.size = len(self._rom)
-        self._gi = gi
-        if not lib.retro_load_game(byref(gi)):
-            raise RuntimeError("core refused to load this ROM")
-
-        av = AVInfo()
-        lib.retro_get_system_av_info(byref(av))
-        self.fps = av.timing.fps or 60.0
-        for _ in range(5):                  # get a first picture (a core may start with a dupe)
-            self.run_frames(1, 0)
-            if self.frame is not None:
-                break
-
-    # -- callbacks ---------------------------------------------------------------------------
-    def _env(self, cmd, data):
-        cmd &= 0xFFFF   # strip EXPERIMENTAL / PRIVATE flags
-        if cmd == 3:                                    # GET_CAN_DUPE
-            cast(data, POINTER(c_bool))[0] = True
-            return True
-        if cmd in (9, 31):                              # GET_SYSTEM_DIRECTORY / GET_SAVE_DIRECTORY
-            cast(data, POINTER(c_char_p))[0] = self._sys if cmd == 9 else self._save
-            return True
-        if cmd == 10:                                   # SET_PIXEL_FORMAT
-            fmt = cast(data, POINTER(c_int))[0]
-            if fmt in RAW_MODES:
-                self.fmt = fmt
-                return True
-            return False
-        if cmd == 17:                                   # GET_VARIABLE_UPDATE
-            cast(data, POINTER(c_bool))[0] = False
-            return True
-        if cmd == 47:                                   # GET_AUDIO_VIDEO_ENABLE
-            # bit0 = render video, bit3 = hard-disable audio. Cores that honour this skip the
-            # expensive PPU/blitter work on frames we are going to throw away.
-            cast(data, POINTER(c_int))[0] = (1 if self.want_video else 0) | 8
-            return True
-        if cmd == 51:                                   # GET_INPUT_BITMASK: one call instead of 16
-            return True
-        if cmd in (11, 16, 32, 37):                     # input descriptors, variables, av info, geometry
-            return True
-        return False
-
-    def _video(self, data, w, h, pitch):
-        # NULL means "same picture as the previous frame". Copying costs a lot at 60 Hz, so we
-        # only do it for frames somebody will actually look at.
-        if data and self.want_video:
-            self.frame = (string_at(data, pitch * h), w, h, pitch)
-            self.fresh = True
-
-    def _input(self, port, device, index, id_):
-        if port != 0 or device != RETRO_DEVICE_JOYPAD:
-            return 0
-        if id_ == RETRO_DEVICE_ID_JOYPAD_MASK:
-            return self.mask & 0xFFFF
-        return 1 if (self.mask >> id_) & 1 else 0
-
-    # -- emulation ---------------------------------------------------------------------------
-    def run_frames(self, n: int, mask: int, show_last: bool = True):
-        """Run n frames at full speed. Only the last one is copied (unless show_last is False)."""
-        self.mask = mask
-        run = self.lib.retro_run
-        for i in range(n):
-            last = i == n - 1
-            self.want_video = last and show_last
-            self.fresh = False
-            run()
-        self.want_video = True
-        if n and show_last and not self.fresh:
-            # The core answered the last frame with a NULL "duplicate" and we skipped the copy of
-            # the real picture before it. Run a few more frames so self.frame is current.
-            for _ in range(3):
-                self.fresh = False
-                run()
-                if self.fresh:
-                    break
-
-    def image(self, scale: int = 1) -> Image.Image:
-        raw, w, h, pitch = self.frame
-        im = Image.frombuffer("RGB", (w, h), raw, "raw", RAW_MODES[self.fmt], pitch, 1)
-        if scale > 1:
-            im = im.resize((w * scale, h * scale), Image.NEAREST)
-        return im
-
-    def png(self, scale: int) -> bytes:
-        buf = io.BytesIO()
-        self.image(scale).save(buf, "PNG", compress_level=1)   # level 1: fastest, still small
-        return buf.getvalue()
-
-    def jpeg(self, quality: int) -> bytes:
-        buf = io.BytesIO()
-        # 4:4:4 keeps pixel-art colour edges clean; the frames are tiny anyway.
-        self.image(1).save(buf, "JPEG", quality=quality, subsampling=0)
-        return buf.getvalue()
-
-    def gif(self, mask, hold, total, every, scale) -> bytes:
-        frames = []
-        self.mask = mask
-        for i in range(total):
-            if i == hold:
-                self.mask = 0
-            sample = i % every == every - 1
-            self.want_video = sample
-            self.fresh = False
-            self.lib.retro_run()
-            if sample and self.fresh:
-                frames.append(self.image(scale).quantize(colors=64, method=_QUANT))
-        self.want_video = True
-        self.mask = 0
-        if not frames:
-            self.run_frames(1, 0)
-            frames.append(self.image(scale).quantize(colors=64, method=_QUANT))
-        buf = io.BytesIO()
-        frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], loop=0,
-                       duration=max(20, int(1000 * every / self.fps)), disposal=1, optimize=False)
-        return buf.getvalue()
-
-    def save_state(self, path: str):
-        size = self.lib.retro_serialize_size()
-        buf = create_string_buffer(size)
-        if not self.lib.retro_serialize(buf, size):
-            raise RuntimeError("this core cannot save states")
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(buf.raw)
-        os.replace(tmp, path)
-
-    def load_state(self, path: str):
-        with open(path, "rb") as f:
-            data = f.read()
-        buf = create_string_buffer(data, len(data))
-        if not self.lib.retro_unserialize(buf, len(data)):
-            raise RuntimeError("core rejected the save state")
+MAX_BURST_FRAMES = 900          # safety cap for one steps/clip request
+AUDIO_QUEUE_CHUNKS = 90         # ~1.5 s of audio at most waiting for the pipe
+IDLE_STATS_EVERY = 1.0
 
 
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, int(v)))
+def log(*a):
+    print("[worker]", *a, file=sys.stderr, flush=True)
 
 
-class Host:
-    """Everything the worker process does besides running the core: I/O, ops, the live loop."""
-
-    def __init__(self, out):
-        self.out = out
-        self.core = None
-        self.cmds = queue.Queue()
-        # live-mode state
-        self.live = False
-        self.paused = False
-        self.live_mask = 0
-        self.seq = deque()          # [mask, frames_left] steps queued by chat/button presses
-        self.every = 2              # send every Nth emulated frame (2 => ~30 fps from a 60 Hz core)
+# ---------------------------------------------------------------------------------------------
+# Output: one writer thread owns stdout, encodes video and keeps every queue bounded
+# ---------------------------------------------------------------------------------------------
+class Out:
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.reliable = collections.deque()                       # replies + events, never dropped
+        self.audio = collections.deque(maxlen=AUDIO_QUEUE_CHUNKS)  # oldest dropped if the pipe stalls
+        self.slot = None            # bytearray: newest frame waiting for the encoder
+        self.slot_len = 0
+        self.slot_meta = None       # (w, h, pitch, rawmode)
+        self.pending = False
+        self.encbuf = bytearray(0)
         self.quality = 72
-        self.afk = 60.0
-        self.last_input = 0.0
-        self.next_t = 0.0
-        self.frame_i = 0
-        self.last_raw = None
-        self.stat_t = 0.0
-        self.stat_emu = 0
-        self.stat_sent = 0
-        self.stat_busy = 0.0
+        self.sent = 0               # frames written (for the stats event)
+        self.bio = io.BytesIO()
+        # Some cores printf() to stdout, which would corrupt the binary protocol. Keep a private
+        # copy of the real stdout for ourselves and point fd 1 at stderr (the bot logs that).
+        proto_fd = os.dup(1)
+        os.dup2(2, 1)
+        self._stdout = os.fdopen(proto_fd, "wb")
+        threading.Thread(target=self._run, daemon=True, name="writer").start()
 
-    # -- output ------------------------------------------------------------------------------
-    def _write(self, kind: bytes, payload: bytes):
-        self.out.write(struct.pack("<I", len(payload) + 1) + kind + payload)
-        self.out.flush()
-
+    # ---- called from the emulation thread ----
     def reply(self, obj):
-        self._write(b"R", pickle.dumps(obj, protocol=4))
+        self._post(b"R", pickle.dumps(obj, protocol=4))
 
     def event(self, obj):
-        self._write(b"E", pickle.dumps(obj, protocol=4))
+        self._post(b"E", pickle.dumps(obj, protocol=4))
 
-    # -- input thread ------------------------------------------------------------------------
-    def reader(self, inp):
+    def _post(self, kind, payload):
+        with self.cv:
+            self.reliable.append(kind + payload)
+            self.cv.notify()
+
+    def audio_chunk(self, pcm):
+        with self.cv:
+            self.audio.append(pcm)
+            self.cv.notify()
+
+    def publish(self, src: bytearray, n: int, meta):
+        """Copy the newest frame into the slot (latest wins). ~10 microseconds."""
+        with self.cv:
+            if self.slot is None or len(self.slot) < n:
+                self.slot = bytearray(n)
+            self.slot[:n] = memoryview(src)[:n]
+            self.slot_len, self.slot_meta, self.pending = n, meta, True
+            self.cv.notify()
+
+    # ---- writer thread ----
+    def _write(self, body: bytes):
         try:
-            while True:
-                hdr = inp.read(4)
-                if len(hdr) < 4:
-                    break
-                (n,) = struct.unpack("<I", hdr)
-                self.cmds.put(pickle.loads(inp.read(n)))
-        finally:
-            self.cmds.put(None)         # bot went away
+            self._stdout.write(struct.pack("<I", len(body)) + body)
+            self._stdout.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            os._exit(0)
 
-    # -- ops ---------------------------------------------------------------------------------
-    def dispatch(self, msg):
-        op = msg.get("op")
-        silent = op in ("input", "seq", "live")
-        try:
-            res = self.run_op(op, msg)
-        except Exception as e:
-            res = {"ok": False, "err": f"{type(e).__name__}: {e}"}
-            if silent:
-                self.event({"ev": "error", "err": res["err"]})
-                return
-        if not silent:
-            self.reply(res)
-        if op == "quit":
-            os._exit(0)     # skip retro_deinit: some cores crash on teardown, the OS reclaims everything
-
-    def run_op(self, op, msg):
-        core = self.core
-        if op == "load":
-            self.core = core = Core(msg["core"], msg["rom"], msg["sysdir"], msg["savedir"])
-            _, w, h, _ = core.frame
-            return {"ok": True, "w": w, "h": h, "fps": core.fps, "name": core.name}
-        if op == "quit":
-            return {"ok": True}
-        if core is None:
-            return {"ok": False, "err": "no game is loaded"}
-
-        if op == "step":
-            core.run_frames(_clamp(msg["hold"], 0, 240), msg["mask"], show_last=False)
-            core.run_frames(max(1, _clamp(msg["settle"], 0, 240)), 0)
-            return {"ok": True, "png": core.png(_clamp(msg.get("scale", 2), 1, 4))}
-        if op == "steps":
-            budget = 900
-            for mask, frames in msg["steps"]:
-                frames = min(_clamp(frames, 0, 240), budget)
-                budget -= frames
-                core.run_frames(frames, int(mask) & 0xFFFF, show_last=False)
-                if budget <= 0:
-                    break
-            core.run_frames(max(1, _clamp(msg.get("settle", 4), 0, 240)), 0)
-            return {"ok": True}
-        if op == "snap":
-            if core.frame is None:
-                return {"ok": False, "err": "no frame yet"}
-            return {"ok": True, "png": core.png(_clamp(msg.get("scale", 2), 1, 4))}
-        if op == "clip":
-            gif = core.gif(msg["mask"], _clamp(msg["hold"], 0, 240), _clamp(msg["frames"], 6, 240),
-                           _clamp(msg.get("every", 3), 1, 10), _clamp(msg.get("scale", 1), 1, 3))
-            return {"ok": True, "gif": gif}
-        if op == "save":
-            core.save_state(msg["path"])
-            return {"ok": True}
-        if op == "loadstate":
-            core.load_state(msg["path"])
-            core.run_frames(1, 0)
-            self.last_raw = None
-            return {"ok": True}
-
-        # ---- live-mode ops (no reply) ----
-        if op == "live":
-            self.set_live(bool(msg["on"]), msg)
-            return None
-        if op == "input":
-            mask = int(msg["mask"]) & 0xFFFF
-            if mask != self.live_mask:
-                self.live_mask = mask
-                if mask:
-                    self.wake()
-            return None
-        if op == "seq":
-            for mask, frames in msg["steps"]:
-                self.seq.append([int(mask) & 0xFFFF, _clamp(frames, 1, 240)])
-            while len(self.seq) > 200:      # never let a flood build an endless backlog
-                self.seq.pop()
-            self.wake()
-            return None
-        return {"ok": False, "err": f"unknown op {op!r}"}
-
-    # -- live loop ---------------------------------------------------------------------------
-    def wake(self):
-        now = time.perf_counter()
-        self.last_input = now
-        if self.live and self.paused:
-            self.paused = False
-            self.next_t = now
-            self.event({"ev": "paused", "on": False})
-
-    def set_live(self, on: bool, msg):
-        core = self.core
-        if core is None:
-            return
-        if self.paused:                 # the bot's idea of "paused" must not go stale
-            self.paused = False
-            self.event({"ev": "paused", "on": False})
-        if not on:
-            self.live = False
-            self.live_mask = 0
-            self.seq.clear()
-            return
-        stream_fps = max(5.0, min(60.0, float(msg.get("fps", 30))))
-        self.every = max(1, round(core.fps / stream_fps))
-        self.quality = _clamp(msg.get("quality", 72), 30, 95)
-        self.afk = max(5.0, float(msg.get("afk", 60)))
-        now = time.perf_counter()
-        was_live = self.live
-        self.live, self.paused = True, False
-        self.next_t = now
-        self.last_input = now
-        self.stat_t, self.stat_emu, self.stat_sent, self.stat_busy = now, 0, 0, 0.0
-        if not was_live and core.frame is not None:
-            self.last_raw = None
-            self.send_current()
-
-    def send_current(self):
-        core = self.core
-        if core.frame is None:
-            return
-        raw = core.frame[0]
-        if raw == self.last_raw:
-            return
-        self.last_raw = raw
-        self._write(b"J", core.jpeg(self.quality))
-        self.stat_sent += 1
-
-    def live_frame(self, now):
-        core = self.core
-        period = 1.0 / core.fps
-        lag = now - self.next_t
-        if lag > period * 8:        # cannot keep up: run in slow motion instead of spiralling
-            self.next_t, lag = now, 0.0
-        self.next_t += period
-
-        mask = self.live_mask
-        if self.seq:
-            cur = self.seq[0]
-            mask |= cur[0]
-            cur[1] -= 1
-            if cur[1] <= 0:
-                self.seq.popleft()
-
-        # Only encode a picture when we are on time; when behind, skipping the encode is what
-        # lets the emulation catch up.
-        send = (self.frame_i % self.every == 0) and lag < period * 1.5
-        self.frame_i += 1
-        core.mask = mask
-        core.want_video = send
-        core.fresh = False
-        core.lib.retro_run()
-        core.want_video = True
-        self.stat_emu += 1
-        if send and core.fresh:
-            self.send_current()
-
-        if not mask and not self.seq and now - self.last_input > self.afk:
-            self.paused = True
-            self.event({"ev": "paused", "on": True})
-
-    def emit_stats(self, now):
-        dt = now - self.stat_t
-        if dt >= 2.0:
-            self.event({"ev": "stats", "emu": round(self.stat_emu / dt, 1),
-                        "sent": round(self.stat_sent / dt, 1),
-                        "load": round(100 * self.stat_busy / dt)})
-            self.stat_t, self.stat_emu, self.stat_sent, self.stat_busy = now, 0, 0, 0.0
-
-    def run(self):
-        cmds = self.cmds
+    def _run(self):
         while True:
-            if not self.live or self.paused:
-                msg = cmds.get()                  # block: zero CPU while idle
-                if msg is None:
-                    return
-                self.dispatch(msg)
-                continue
-            now = time.perf_counter()
-            if now < self.next_t:
-                try:
-                    msg = cmds.get(timeout=self.next_t - now)
-                except queue.Empty:
+            frame = None
+            with self.cv:
+                while not (self.reliable or self.audio or self.pending):
+                    self.cv.wait()
+                if self.reliable:
+                    body = self.reliable.popleft()
+                elif self.audio:
+                    body = b"A\x00" + b"".join(self.audio)
+                    self.audio.clear()
+                else:
+                    n = self.slot_len
+                    if len(self.encbuf) < n:
+                        self.encbuf = bytearray(n)
+                    self.encbuf[:n] = memoryview(self.slot)[:n]
+                    frame = (self.slot_meta, n)
+                    self.pending = False
+                    body = None
+            if frame is not None:
+                body = self._encode(*frame)
+                if body is None:
                     continue
-                if msg is None:
-                    return
-                self.dispatch(msg)
-                continue
-            t0 = time.perf_counter()
-            self.live_frame(now)
-            t1 = time.perf_counter()
-            self.stat_busy += t1 - t0
-            self.emit_stats(t1)
-            # a slow command (clip, state load) may have eaten time; do not "catch up" 100 frames
-            while True:
-                try:
-                    msg = cmds.get_nowait()
-                except queue.Empty:
-                    break
-                if msg is None:
-                    return
-                self.dispatch(msg)
+                self.sent += 1
+            self._write(body)
+
+    def _encode(self, meta, n):
+        w, h, pitch, raw = meta
+        try:
+            im = Image.frombuffer("RGB", (w, h), self.encbuf, "raw", raw, pitch, 1)
+            self.bio.seek(0)
+            self.bio.truncate()
+            im.save(self.bio, "JPEG", quality=self.quality, subsampling=2)
+            return b"J\x00" + self.bio.getvalue()
+        except Exception as e:
+            self.event({"ev": "error", "err": f"encode failed: {e}"})
+            return None
+
+
+# ---------------------------------------------------------------------------------------------
+# The emulator
+# ---------------------------------------------------------------------------------------------
+class Emu:
+    def __init__(self, out: Out):
+        self.out = out
+        self.lib = None
+        self.keep = []                       # keeps ctypes callbacks / strings alive
+        self.pixfmt = 0
+        self.options = {}
+        try:
+            self.options = json.loads(os.environ.get("EMU_CORE_OPTIONS", "{}"))
+        except Exception:
+            pass
+        self.opt_bufs = {}
+        self.sysdir = b"."
+        self.savedir = b"."
+        # video
+        self.cur = bytearray(0)              # newest frame the core produced
+        self.cur_addr = 0
+        self.cur_meta = None
+        self.cur_len = 0
+        self.frame_new = False
+        # audio
+        self.audio_buf = bytearray()
+        self.audio_on = False                # only produce chunks while a browser listens
+        self.capture_audio = False
+        self.mono = os.environ.get("EMU_AUDIO_MONO", "0") == "1" and audioop is not None
+        # input
+        self.mask = 0
+        self.rom_name = "game"
+        self.srm_path = None
+        self.state_buf = None
+        # timing
+        self.fps = 60.0
+        self.rate = 32000.0
+        self.w = self.h = 0
+
+    # ---- callbacks (kept tiny: they run inside retro_run) ----
+    def _env(self, cmd, data):
+        try:
+            if cmd == ENV_SET_PIXEL_FORMAT:
+                fmt = c.cast(data, c.POINTER(c.c_int)).contents.value
+                if fmt in PIXFMT:
+                    self.pixfmt = fmt
+                    return True
+                return False
+            if cmd == ENV_GET_CAN_DUPE:
+                c.cast(data, c.POINTER(c.c_bool)).contents.value = True
+                return True
+            if cmd == ENV_GET_SYSTEM_DIRECTORY:
+                c.cast(data, c.POINTER(c.c_char_p)).contents.value = self.sysdir
+                return True
+            if cmd == ENV_GET_SAVE_DIRECTORY:
+                c.cast(data, c.POINTER(c.c_char_p)).contents.value = self.savedir
+                return True
+            if cmd == ENV_GET_VARIABLE:
+                var = c.cast(data, c.POINTER(Variable)).contents
+                key = var.key.decode() if var.key else ""
+                if key in self.options:
+                    buf = self.opt_bufs.setdefault(key, str(self.options[key]).encode())
+                    var.value = buf
+                    return True
+                return False
+            if cmd == ENV_GET_VARIABLE_UPDATE:
+                c.cast(data, c.POINTER(c.c_bool)).contents.value = False
+                return True
+            if cmd == ENV_GET_CORE_OPTIONS_VERSION:
+                c.cast(data, c.POINTER(c.c_uint)).contents.value = 0
+                return True
+            if cmd in (ENV_SET_ROTATION, ENV_SET_PERFORMANCE_LEVEL, ENV_SET_INPUT_DESCRIPTORS,
+                       ENV_SET_VARIABLES, ENV_SET_CONTROLLER_INFO, ENV_SET_GEOMETRY,
+                       ENV_SET_SYSTEM_AV_INFO):
+                return True
+        except Exception as e:
+            log("env error", cmd, e)
+        return False                         # includes GET_LOG_INTERFACE: the core logs to stderr itself
+
+    def _video(self, data, w, h, pitch):
+        if not data or data == 0xFFFFFFFFFFFFFFFF:      # duplicate frame / hardware frame
+            return
+        n = pitch * h
+        if n > len(self.cur):
+            self.cur = bytearray(n)
+            self.cur_addr = c.addressof((c.c_char * n).from_buffer(self.cur))
+        c.memmove(self.cur_addr, data, n)
+        self.cur_len = n
+        self.cur_meta = (w, h, pitch, PIXFMT[self.pixfmt][0])
+        self.w, self.h = w, h
+        self.frame_new = True
+
+    def _audio_batch(self, data, frames):
+        if self.capture_audio and data:
+            self.audio_buf += c.string_at(data, frames * 4)
+        return frames
+
+    def _audio_one(self, left, right):
+        if self.capture_audio:
+            self.audio_buf += struct.pack("<hh", left, right)
+
+    def _poll(self):
+        pass
+
+    def _input(self, port, device, index, id_):
+        if port != 0 or device != JOYPAD:
+            return 0
+        if id_ == JOYPAD_MASK_ID:
+            return self.mask
+        return (self.mask >> id_) & 1 if id_ < 16 else 0
+
+    # ---- load / frames ----
+    def load(self, core, rom, sysdir, savedir):
+        os.makedirs(sysdir, exist_ok=True)
+        os.makedirs(savedir, exist_ok=True)
+        self.sysdir, self.savedir = sysdir.encode(), savedir.encode()
+        self.lib = lib = c.CDLL(core)
+        lib.retro_get_memory_data.restype = c.c_void_p
+        lib.retro_get_memory_size.restype = c.c_size_t
+        lib.retro_serialize_size.restype = c.c_size_t
+        lib.retro_serialize.restype = c.c_bool
+        lib.retro_unserialize.restype = c.c_bool
+        lib.retro_load_game.restype = c.c_bool
+
+        self.cb_env, self.cb_video = ENV_CB(self._env), VIDEO_CB(self._video)
+        self.cb_audio, self.cb_batch = AUDIO_CB(self._audio_one), AUDIO_BATCH_CB(self._audio_batch)
+        self.cb_poll, self.cb_input = POLL_CB(self._poll), INPUT_CB(self._input)
+        lib.retro_set_environment(self.cb_env)
+        lib.retro_init()
+        lib.retro_set_video_refresh(self.cb_video)
+        lib.retro_set_audio_sample(self.cb_audio)
+        lib.retro_set_audio_sample_batch(self.cb_batch)
+        lib.retro_set_input_poll(self.cb_poll)
+        lib.retro_set_input_state(self.cb_input)
+
+        sysinfo = SystemInfo()
+        lib.retro_get_system_info(c.byref(sysinfo))
+        with open(rom, "rb") as f:
+            data = f.read()
+        self.rom_data = c.create_string_buffer(data, len(data))        # must outlive the core
+        info = GameInfo(rom.encode(), c.cast(self.rom_data, c.c_void_p), len(data), None)
+        if not lib.retro_load_game(c.byref(info)):
+            raise RuntimeError("the core refused this game file")
+        if not sysinfo.need_fullpath:
+            pass                                                        # data pointer already given
+        av = AVInfo()
+        lib.retro_get_system_av_info(c.byref(av))
+        self.fps = av.timing.fps if av.timing.fps > 1 else 60.0
+        self.rate = av.timing.sample_rate if av.timing.sample_rate > 1000 else 32000.0
+        lib.retro_set_controller_port_device(0, JOYPAD)
+
+        self.rom_name = os.path.splitext(os.path.basename(rom))[0]
+        self.srm_path = os.path.join(savedir, self.rom_name + ".srm")
+        self._load_sram()
+
+        size = lib.retro_serialize_size()
+        if size:
+            self.state_buf = bytearray(size)
+            self.state_addr = c.addressof((c.c_char * size).from_buffer(self.state_buf))
+
+        # first frame so w/h are known; 0 mask, no audio
+        self.run_frames(1)
+        gc.collect()
+        gc.freeze()                                    # core + python objects never need scanning again
+        gc.set_threshold(20000, 50, 50)
+        return {"ok": True, "w": self.w, "h": self.h, "fps": self.fps, "rate": int(self.rate),
+                "ch": 1 if self.mono else 2}
+
+    def run_frames(self, n, mask=None, audio=False):
+        if mask is not None:
+            self.mask = mask
+        self.capture_audio = audio
+        run = self.lib.retro_run
+        for _ in range(n):
+            run()
+        if not audio:
+            self.audio_buf.clear()
+
+    # ---- cartridge RAM + save states ----
+    def _load_sram(self):
+        size = self.lib.retro_get_memory_size(MEM_SAVE_RAM)
+        ptr = self.lib.retro_get_memory_data(MEM_SAVE_RAM)
+        if size and ptr and os.path.exists(self.srm_path):
+            try:
+                with open(self.srm_path, "rb") as f:
+                    data = f.read(size)
+                c.memmove(ptr, data, len(data))
+            except OSError as e:
+                log("could not load sram:", e)
+
+    def save_sram(self):
+        try:
+            size = self.lib.retro_get_memory_size(MEM_SAVE_RAM)
+            ptr = self.lib.retro_get_memory_data(MEM_SAVE_RAM)
+            if size and ptr:
+                _atomic_write(self.srm_path, c.string_at(ptr, size))
+        except Exception as e:
+            log("could not save sram:", e)
+
+    def save_state(self, path):
+        if not self.state_buf:
+            raise RuntimeError("this core cannot save states")
+        if not self.lib.retro_serialize(c.c_void_p(self.state_addr), len(self.state_buf)):
+            raise RuntimeError("save state failed")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        _atomic_write(path, memoryview(self.state_buf))
+        self.save_sram()
+
+    def load_state(self, path):
+        if not self.state_buf:
+            raise RuntimeError("this core cannot load states")
+        with open(path, "rb") as f:
+            data = f.read()
+        if len(data) > len(self.state_buf):
+            raise RuntimeError("that save belongs to a different game version")
+        c.memmove(self.state_addr, data, len(data))
+        if not self.lib.retro_unserialize(c.c_void_p(self.state_addr), len(data)):
+            raise RuntimeError("load state failed")
+        self.run_frames(1, 0)                      # refresh the picture
+
+    # ---- pictures ----
+    def _image(self):
+        if self.cur_meta is None:
+            self.run_frames(1, 0)
+        w, h, pitch, raw = self.cur_meta
+        return Image.frombuffer("RGB", (w, h), self.cur, "raw", raw, pitch, 1)
+
+    def snap_png(self, scale):
+        im = self._image()
+        if scale > 1:
+            im = im.resize((im.width * scale, im.height * scale), Image.NEAREST)
+        bio = io.BytesIO()
+        im.save(bio, "PNG", compress_level=1)
+        return bio.getvalue()
+
+    def clip_gif(self, mask, hold, frames, every, scale):
+        frames = max(1, min(int(frames), MAX_BURST_FRAMES))
+        every = max(1, int(every))
+        imgs = []
+        for i in range(frames):
+            self.run_frames(1, mask if i < hold else 0)
+            if i % every == 0:
+                im = self._image().copy()
+                if scale > 1:
+                    im = im.resize((im.width * scale, im.height * scale), Image.NEAREST)
+                imgs.append(im)
+        bio = io.BytesIO()
+        imgs[0].save(bio, "GIF", save_all=True, append_images=imgs[1:], loop=0,
+                     duration=max(20, int(1000 * every / self.fps)), optimize=False)
+        return bio.getvalue()
+
+
+def _atomic_write(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------------------------
+def stdin_reader(q: "queue.SimpleQueue"):
+    stream = sys.stdin.buffer
+    try:
+        while True:
+            head = stream.read(4)
+            if len(head) < 4:
+                break
+            (n,) = struct.unpack("<I", head)
+            body = stream.read(n)
+            if len(body) < n:
+                break
+            q.put(pickle.loads(body))
+    except Exception as e:
+        log("stdin reader:", e)
+    q.put(None)
 
 
 def main():
-    import faulthandler
-    faulthandler.enable()   # a crash inside a core prints a Python traceback to stderr (shown in the bot log)
-    # Cores sometimes printf. Keep the real stdout private for the protocol and send
-    # everything else (including C-level prints) to stderr.
-    out = os.fdopen(os.dup(1), "wb")
-    os.dup2(2, 1)
-    host = Host(out)
-    threading.Thread(target=host.reader, args=(sys.stdin.buffer,), daemon=True).start()
+    out = Out()
+    emu = Emu(out)
+    q: "queue.SimpleQueue" = queue.SimpleQueue()
+    threading.Thread(target=stdin_reader, args=(q,), daemon=True, name="stdin").start()
+
+    live = False
+    paused = False
+    stream_fps = 60.0
+    afk = 60.0
+    last_input = time.monotonic()
+    seq = collections.deque()                    # per-frame masks queued by "seq"
+    input_mask = 0
+    send_acc = 0.0
+    # stats
+    st_t = time.monotonic()
+    st_frames = 0
+    st_busy = 0.0
+    st_sent0 = 0
+    next_t = 0.0
+
+    def set_paused(on):
+        nonlocal paused, next_t
+        if on != paused:
+            paused = on
+            out.event({"ev": "paused", "on": on})
+            next_t = 0.0
+
+    def handle(m):
+        """Returns False when the worker should exit."""
+        nonlocal live, stream_fps, afk, last_input, input_mask, next_t, send_acc
+        if m is None:
+            return False
+        op = m.get("op")
+        try:
+            if op == "input":
+                input_mask = int(m["mask"]) & 0x0FFF
+                last_input = time.monotonic()
+                set_paused(False)
+            elif op == "seq":
+                for mask, frames in m["steps"]:
+                    seq.extend([int(mask) & 0x0FFF] * int(frames))
+                last_input = time.monotonic()
+                set_paused(False)
+            elif op == "live":
+                live = bool(m["on"])
+                stream_fps = float(m.get("fps") or 60)
+                out.quality = int(m.get("quality") or 72)
+                afk = float(m.get("afk") or 0)
+                last_input = time.monotonic()
+                send_acc = 0.0
+                next_t = 0.0
+                if live:
+                    set_paused(False)
+                else:
+                    seq.clear()
+                    input_mask = 0
+                    emu.audio_on = False
+            elif op == "audio":
+                emu.audio_on = bool(m["on"])
+            elif op == "load":
+                res = emu.load(m["core"], m["rom"], m["sysdir"], m["savedir"])
+                out.reply(res)
+            elif op == "steps":
+                total = 0
+                for mask, frames in m["steps"]:
+                    n = min(int(frames), MAX_BURST_FRAMES - total)
+                    emu.run_frames(max(0, n), int(mask) & 0x0FFF)
+                    total += n
+                emu.run_frames(max(1, int(m.get("settle", 1))), 0)
+                out.reply({"ok": True})
+                next_t = 0.0
+            elif op == "snap":
+                out.reply({"ok": True, "png": emu.snap_png(max(1, int(m.get("scale", 1))))})
+            elif op == "clip":
+                out.reply({"ok": True, "gif": emu.clip_gif(int(m.get("mask", 0)) & 0x0FFF, int(m.get("hold", 8)),
+                                                             m.get("frames", 90), m.get("every", 3),
+                                                             max(1, int(m.get("scale", 1))))})
+                next_t = 0.0
+            elif op == "save":
+                emu.save_state(m["path"])
+                out.reply({"ok": True})
+            elif op == "loadstate":
+                emu.load_state(m["path"])
+                out.reply({"ok": True})
+            else:
+                out.reply({"ok": False, "err": f"unknown op {op!r}"})
+        except Exception as e:
+            log(f"op {op} failed: {e}")
+            if op in ("input", "seq", "live", "audio"):
+                out.event({"ev": "error", "err": f"{op}: {e}"})
+            else:
+                out.reply({"ok": False, "err": str(e)})
+        return True
+
+    while True:
+        # ---- sleeping: nothing to run, block until the bot says something ----
+        if not (live and not paused and emu.lib is not None):
+            if not handle(q.get()):
+                break
+            continue
+
+        # ---- running in real time ----
+        loop_start = time.perf_counter()
+        exit_now = False
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            if not handle(msg):
+                exit_now = True
+                break
+        if exit_now:
+            break
+        if not (live and not paused):
+            continue
+
+        now = time.perf_counter()
+        frame_dt = 1.0 / emu.fps
+        if next_t == 0.0 or now - next_t > 0.25:       # first frame, or fell far behind: re-sync, never "catch up"
+            if next_t == 0.0:                          # (re)starting: stats should not include the sleep
+                st_t, st_frames, st_busy, st_sent0 = time.monotonic(), 0, 0.0, out.sent
+            next_t = now
+
+        mask = seq.popleft() if seq else input_mask
+        emu.run_frames(1, mask, audio=emu.audio_on)
+        st_frames += 1
+
+        if emu.audio_on and emu.audio_buf:
+            pcm = bytes(emu.audio_buf)
+            emu.audio_buf.clear()
+            if emu.mono:
+                pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+            out.audio_chunk(pcm)
+
+        # honour EMU_STREAM_FPS when it is below the core rate (e.g. 30 on a weak CPU)
+        send_acc += min(stream_fps, emu.fps)
+        if send_acc >= emu.fps - 1e-6:
+            send_acc -= emu.fps
+            if emu.frame_new and emu.cur_meta:
+                out.publish(emu.cur, emu.cur_len, emu.cur_meta)
+        emu.frame_new = False
+
+        # AFK: nobody touched a key for a while and nothing is held -> sleep with 0 CPU
+        t = time.monotonic()
+        if afk and not seq and input_mask == 0 and t - last_input > afk:
+            set_paused(True)
+
+        st_busy += time.perf_counter() - loop_start
+        if t - st_t >= IDLE_STATS_EVERY:
+            span = t - st_t
+            out.event({"ev": "stats", "emu": round(st_frames / span), "sent": round((out.sent - st_sent0) / span),
+                       "load": min(100, round(100 * st_busy / span))})
+            st_t, st_frames, st_busy, st_sent0 = t, 0, 0.0, out.sent
+
+        next_t += frame_dt
+        delay = next_t - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
+
+    # stdin closed: persist cartridge RAM and leave immediately (daemon threads die with us)
     try:
-        host.run()
+        if emu.lib is not None:
+            emu.save_sram()
     finally:
-        os._exit(0)   # skip retro_deinit: some cores crash on teardown and the OS reclaims everything anyway
+        try:
+            out._stdout.flush()
+        finally:
+            os._exit(0)
 
 
 if __name__ == "__main__":
