@@ -688,6 +688,7 @@ async def on_ready():
     asyncio.create_task(ban_cache_loop())
     asyncio.create_task(emu_reaper_loop())
     asyncio.create_task(emu_startup())
+    asyncio.create_task(radio_warm())
 
     for guild in bot.guilds:
         try:
@@ -1237,7 +1238,7 @@ async def maybe_join_voice(channel: discord.VoiceChannel):
     if not VOICE_OK or not isinstance(channel, discord.VoiceChannel):
         return
     gid = channel.guild.id
-    if gid in voice_sessions or gid in _voice_connecting:
+    if gid in voice_sessions or gid in _voice_connecting or gid in radio_sessions:
         return
     if len(voice_sessions) >= MAX_VOICE_SESSIONS:
         return
@@ -1279,10 +1280,17 @@ async def maybe_leave_voice(channel: discord.abc.GuildChannel):
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if bot.user and member.id == bot.user.id:
+        rs = radio_sessions.get(member.guild.id)
+        if rs and after.channel is None:
+            rs["gen"] += 1
+            radio_sessions.pop(member.guild.id, None)
         session = voice_sessions.get(member.guild.id)
         if session and (after.channel is None or after.channel.id != session.channel_id):
             await end_voice_session(member.guild.id)
         return
+
+    if before.channel and before.channel != after.channel and not member.bot:
+        await radio_maybe_leave(before.channel)
 
     if member.bot or is_user_banned(member.id) or not VOICE_OK:
         return
@@ -2883,7 +2891,7 @@ var $=function(i){return document.getElementById(i)};
 var cv=$("cv"),ctx=cv.getContext("2d",{alpha:false}),stage=$("stage"),msg=$("msg");
 // libretro joypad bits: B0 Y1 SELECT2 START3 UP4 DOWN5 LEFT6 RIGHT7 A8 X9 L10 R11
 var KEYS={KeyW:4,ArrowUp:4,KeyS:5,ArrowDown:5,KeyA:6,ArrowLeft:6,KeyD:7,ArrowRight:7,
-  KeyJ:0,KeyZ:0,KeyK:8,KeyX:8,KeyU:1,KeyC:1,KeyI:9,KeyV:9,KeyQ:10,KeyE:11,
+  KeyJ:0,KeyK:8,KeyU:1,KeyI:9,KeyQ:10,KeyE:11,
   Enter:3,ShiftLeft:2,ShiftRight:2,Backspace:2};
 var down=new Set(),held=new Map(),padMask=0,last=-1,ws=null,over=false,tries=0;
 
@@ -3023,7 +3031,7 @@ function playPCM(d){
   else{for(i=0;i<n;i++)L[i]=s[i]/32768}
   var src=ac.createBufferSource();src.buffer=ab;src.connect(gain);
   var now=ac.currentTime;
-  if(nextT<now+0.01||nextT>now+0.35)nextT=now+0.07;   // (re)start with a ~70 ms cushion against network jitter
+  if(nextT<now+0.005||nextT>now+0.22)nextT=now+0.045;   // (re)start with a ~45 ms cushion against network jitter
   src.start(nextT);nextT+=ab.duration;
 }
 
@@ -3133,6 +3141,10 @@ async def start_web():
         web.get("/", web_home),
         web.get("/emu/{token}", web_emu_page),
         web.get("/emu/{token}/ws", web_emu_ws),
+        web.get("/radio", web_radio_page),
+        web.get("/radio/api/countries", web_radio_countries),
+        web.get("/radio/api/stations", web_radio_stations),
+        web.get("/radio/stream/{sid}", web_radio_stream),
     ])
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -3442,6 +3454,614 @@ async def emu_status(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # ------------------------------------------------------------------------------
+# RADIO (Radio Browser directory: browse by country, web player + voice playback)
+# ------------------------------------------------------------------------------
+# Uses the free, open Radio Browser API (no key). Two ways to listen:
+#   * the web player at  <PUBLIC_URL>/radio   (browse countries, plays in your browser; /radio shows the link)
+#   * /radio-play        (the bot streams a station into your voice channel; needs FFmpeg on the host)
+# Voice playback is not available in a server while the voice bridge is active there.
+import random
+import ipaddress
+import socket
+import aiohttp
+from urllib.parse import urlparse, urljoin
+
+RADIO_HOSTS = [h.strip() for h in os.environ.get(
+    "RADIO_HOSTS", "de1.api.radio-browser.info,de2.api.radio-browser.info,fi1.api.radio-browser.info"
+).split(",") if h.strip()]
+RADIO_UA = "LUX-NET-Bridge/1.0 (Discord bot)"
+RADIO_PROXY_MAX = int(os.environ.get("RADIO_PROXY_MAX", "6"))      # simultaneous browser listeners proxied through the bot
+RADIO_LIST_LIMIT = 300
+
+radio_sessions: dict = {}      # guild_id -> {"vc", "info", "gen", "restarts"}
+_radio_cache: dict = {}        # request key -> (expires, data)
+_radio_urls: dict = {}         # station uuid -> stream url (for stations we have listed)
+_radio_http = None
+_radio_proxy_active = 0
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+async def radio_http():
+    global _radio_http
+    if _radio_http is None or _radio_http.closed:
+        _radio_http = aiohttp.ClientSession(headers={"User-Agent": RADIO_UA})
+    return _radio_http
+
+
+async def radio_shutdown():
+    if _radio_http is not None and not _radio_http.closed:
+        await _radio_http.close()
+
+
+async def radio_api(path: str, params: dict = None, ttl: int = 900):
+    key = path + "?" + json.dumps(params or {}, sort_keys=True)
+    now = time.monotonic()
+    hit = _radio_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    session = await radio_http()
+    hosts = RADIO_HOSTS[:]
+    random.shuffle(hosts)
+    last = None
+    for host in hosts:
+        try:
+            async with session.get(f"https://{host}/json/{path}", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    last = f"{host}: HTTP {r.status}"
+                    continue
+                data = await r.json(content_type=None)
+            if len(_radio_cache) > 300:
+                for k in [k for k, v in _radio_cache.items() if v[0] < now] or list(_radio_cache)[:100]:
+                    _radio_cache.pop(k, None)
+            _radio_cache[key] = (now + ttl, data)
+            return data
+        except Exception as e:
+            last = f"{host}: {e}"
+    if hit:
+        return hit[1]          # stale data beats an error
+    raise RuntimeError(f"radio directory unavailable ({last})")
+
+
+def radio_norm(s: dict):
+    url = (s.get("url_resolved") or s.get("url") or "").strip()
+    uid = s.get("stationuuid")
+    if not uid or not url.startswith(("http://", "https://")) or s.get("hls") == 1:
+        return None
+    if len(_radio_urls) > 20000:
+        _radio_urls.clear()
+    _radio_urls[uid] = url
+    icon = (s.get("favicon") or "").strip()
+
+    def num(v):
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    lat, lng = num(s.get("geo_lat")), num(s.get("geo_long"))
+    if lat is not None and lng is not None and abs(lat) < 0.01 and abs(lng) < 0.01:
+        lat = lng = None
+    return {
+        "id": uid,
+        "name": (s.get("name") or "Unknown").strip()[:80] or "Unknown",
+        "cc": s.get("countrycode") or "",
+        "country": s.get("country") or "",
+        "tags": (s.get("tags") or "")[:60],
+        "votes": int(s.get("votes") or 0),
+        "codec": s.get("codec") or "",
+        "bitrate": int(s.get("bitrate") or 0),
+        "favicon": icon if icon.startswith("https://") else "",
+        "lat": lat, "lng": lng,
+        "url": url,
+    }
+
+
+async def radio_countries() -> list:
+    data = await radio_api("countries", {"hidebroken": "true", "order": "name"}, ttl=3600)
+    out = [{"cc": c["iso_3166_1"], "name": c["name"], "count": int(c.get("stationcount") or 0)}
+           for c in data if c.get("iso_3166_1") and c.get("stationcount")]
+    return sorted(out, key=lambda c: c["name"].lower())
+
+
+async def radio_stations(cc: str = None, q: str = None, limit: int = RADIO_LIST_LIMIT) -> list:
+    params = {"hidebroken": "true", "order": "votes", "reverse": "true", "limit": limit}
+    if cc:
+        params["countrycode"] = cc.upper()
+    if q:
+        params["name"] = q
+    data = await radio_api("stations/search", params, ttl=900 if cc else 300)
+    return [s for s in (radio_norm(x) for x in data) if s]
+
+
+async def radio_station_info(uid: str):
+    if not _UUID_RE.match(uid or ""):
+        return None
+    data = await radio_api(f"stations/byuuid/{uid}", None, ttl=3600)
+    return radio_norm(data[0]) if data else None
+
+
+async def radio_station_url(uid: str):
+    if not _UUID_RE.match(uid or ""):
+        return None
+    url = _radio_urls.get(uid)
+    if url:
+        return url
+    info = await radio_station_info(uid)
+    return info["url"] if info else None
+
+
+async def radio_click(uid: str):
+    """Courtesy vote count for the directory (fire and forget)."""
+    try:
+        await radio_api(f"url/{uid}", None, ttl=0)
+    except Exception:
+        pass
+
+
+async def radio_url_is_public(url: str) -> bool:
+    """Blocks stream URLs that point at private / internal addresses (SSRF guard)."""
+    try:
+        u = urlparse(url)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return False
+        port = u.port or (443 if u.scheme == "https" else 80)
+        infos = await asyncio.get_running_loop().getaddrinfo(u.hostname, port, type=socket.SOCK_STREAM)
+        return bool(infos) and all(ipaddress.ip_address(i[4][0]).is_global for i in infos)
+    except Exception:
+        return False
+
+
+async def radio_warm():
+    try:
+        await radio_countries()
+    except Exception as e:
+        logger.warning(f"Radio directory warm-up failed: {e}")
+
+
+# ---- web player ---------------------------------------------------------------------------
+async def web_radio_page(request):
+    return web.Response(text=RADIO_PAGE_HTML, content_type="text/html",
+                        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
+
+
+async def web_radio_countries(request):
+    try:
+        data = await radio_countries()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
+    return web.json_response(data, headers={"Cache-Control": "public, max-age=600"})
+
+
+async def web_radio_stations(request):
+    cc = (request.query.get("cc") or "").strip()[:2]
+    q = (request.query.get("q") or "").strip()[:60]
+    if cc and not cc.isalpha():
+        return web.json_response([], status=400)
+    if not cc and len(q) < 2:
+        return web.json_response([])
+    try:
+        stations = await radio_stations(cc=cc or None, q=q or None, limit=RADIO_LIST_LIMIT if cc else 60)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
+    out = [{"id": s["id"], "name": s["name"], "cc": s["cc"], "country": s["country"], "tags": s["tags"],
+            "votes": s["votes"], "codec": s["codec"], "bitrate": s["bitrate"], "favicon": s["favicon"],
+            "lat": s["lat"], "lng": s["lng"],
+            "direct": s["url"] if s["url"].startswith("https://") else ""} for s in stations]
+    return web.json_response(out, headers={"Cache-Control": "public, max-age=120"})
+
+
+async def web_radio_stream(request):
+    """Relays an http:// station through this server so an https page can play it."""
+    global _radio_proxy_active
+    uid = request.match_info["sid"]
+    url = await radio_station_url(uid)
+    if not url:
+        return web.Response(status=404, text="unknown station")
+    if _radio_proxy_active >= RADIO_PROXY_MAX:
+        return web.Response(status=503, text="the relay is busy, try again in a moment")
+    _radio_proxy_active += 1
+    upstream = None
+    try:
+        session = await radio_http()
+        cur = url
+        for _ in range(4):
+            if not await radio_url_is_public(cur):
+                return web.Response(status=403, text="blocked address")
+            r = await session.get(cur, allow_redirects=False, headers={"Icy-MetaData": "0"},
+                                  timeout=aiohttp.ClientTimeout(total=None, sock_connect=8, sock_read=15))
+            if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                cur = urljoin(cur, r.headers["Location"])
+                r.release()
+                continue
+            upstream = r
+            break
+        if upstream is None or upstream.status != 200:
+            return web.Response(status=502, text="station did not answer")
+        ctype = (upstream.headers.get("Content-Type") or "audio/mpeg").split(";")[0].strip().lower()
+        if not (ctype.startswith("audio/") or ctype in ("application/ogg", "application/octet-stream", "binary/octet-stream")):
+            return web.Response(status=502, text="not an audio stream")
+        resp = web.StreamResponse(headers={"Content-Type": ctype, "Cache-Control": "no-store"})
+        await resp.prepare(request)
+        try:
+            async for chunk in upstream.content.iter_chunked(8192):
+                await resp.write(chunk)
+        except (ConnectionResetError, aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        return resp
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return web.Response(status=502, text="station unreachable")
+    finally:
+        _radio_proxy_active -= 1
+        if upstream is not None:
+            upstream.release()
+
+
+RADIO_PAGE_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>LUX-NET Radio</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d12;--panel:#12151c;--line:#23283a;--mut:#8b94ad;--acc:#4d6bff;--ok:#3ddc97}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:#e6e8ee;font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}
+#app{display:grid;grid-template-columns:270px 1fr;grid-template-rows:auto 1fr auto;height:100%}
+header{grid-column:1/3;display:flex;gap:10px;align-items:center;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0;white-space:nowrap}
+input[type=search],input[type=text]{background:#0b0d12;border:1px solid var(--line);color:inherit;border-radius:8px;padding:7px 10px;font:inherit;min-width:0}
+#q{flex:1;max-width:420px}
+#side{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#cf{margin:10px}
+#cl{overflow:auto;flex:1}
+.c{display:flex;gap:8px;align-items:center;padding:7px 12px;cursor:pointer;border-left:3px solid transparent}
+.c:hover{background:#171b27}.c.on{background:#1b2236;border-left-color:var(--acc)}
+.c .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.c .k{color:var(--mut);font-size:12px}
+#main{display:flex;flex-direction:column;min-height:0;min-width:0}
+#mapw{position:relative;height:34%;min-height:150px;border-bottom:1px solid var(--line);background:#0e1119}
+#map{width:100%;height:100%;display:block;cursor:pointer}
+#maptip{position:absolute;left:10px;top:8px;color:var(--mut);font-size:12px;pointer-events:none;max-width:90%}
+#sl{overflow:auto;flex:1}
+.s{display:flex;gap:10px;align-items:center;padding:8px 14px;border-bottom:1px solid #171b27;cursor:pointer}
+.s:hover{background:#151925}.s.on{background:#1a2338}
+.s img,.s .ph{width:36px;height:36px;border-radius:8px;background:#1c2130;object-fit:cover;flex:none}
+.s .ph{display:flex;align-items:center;justify-content:center;font-size:18px}
+.s .t{flex:1;min-width:0}.s .t b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.s .t span{color:var(--mut);font-size:12px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#empty{padding:30px;text-align:center;color:var(--mut)}
+#bar{grid-column:1/3;display:flex;gap:12px;align-items:center;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line)}
+#now{flex:1;min-width:0}#now b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#now span{color:var(--mut);font-size:12px}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font:inherit;cursor:pointer}
+button.g{background:#1c2130;color:#cfd6ea}
+#vol{width:110px}
+.live{color:var(--ok)}
+@media(max-width:760px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr auto}
+ header{grid-column:1}#bar{grid-column:1}#side{border-right:0;border-bottom:1px solid var(--line);max-height:30vh}#vol{display:none}}
+</style>
+</head>
+<body>
+<div id="app">
+ <header><h1>📻 LUX-NET Radio</h1><input id="q" type="search" placeholder="Search stations by name…" autocomplete="off"></header>
+ <aside id="side"><input id="cf" type="search" placeholder="Filter countries…" autocomplete="off"><div id="cl"></div></aside>
+ <section id="main">
+  <div id="mapw"><canvas id="map"></canvas><div id="maptip">Pick a country to see its stations on the map</div></div>
+  <div id="sl"><div id="empty">Choose a country on the left, or search for a station.</div></div>
+ </section>
+ <div id="bar">
+  <div id="now"><b id="nt">Nothing playing</b><span id="ns">Pick a station to start listening</span></div>
+  <input id="vol" type="range" min="0" max="1" step="0.01" value="0.8" title="Volume">
+  <button id="stop" class="g">⏹ Stop</button>
+ </div>
+</div>
+<script>
+(function(){
+"use strict";
+var $=function(i){return document.getElementById(i)};
+var audio=new Audio();audio.preload="none";
+var countries=[],curCC="",stations=[],playing=null,triedProxy=false,dots=[],bounds=null;
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+function flag(cc){if(!cc||cc.length!==2)return "🌐";return String.fromCodePoint.apply(null,cc.toUpperCase().split("").map(function(c){return 127397+c.charCodeAt(0)}))}
+function getJSON(u){return fetch(u).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()})}
+
+try{var v=localStorage.getItem("lux_radio_vol");if(v!==null){$("vol").value=v}}catch(e){}
+audio.volume=parseFloat($("vol").value);
+$("vol").oninput=function(){audio.volume=parseFloat(this.value);try{localStorage.setItem("lux_radio_vol",this.value)}catch(e){}};
+
+function renderCountries(){
+  var f=$("cf").value.trim().toLowerCase(),h="";
+  countries.forEach(function(c){
+    if(f&&c.name.toLowerCase().indexOf(f)<0&&c.cc.toLowerCase()!==f)return;
+    h+='<div class="c'+(c.cc===curCC?' on':'')+'" data-cc="'+esc(c.cc)+'"><span>'+flag(c.cc)+'</span><span class="n">'+esc(c.name)+'</span><span class="k">'+c.count+'</span></div>';
+  });
+  $("cl").innerHTML=h||'<div id="empty">No match</div>';
+}
+$("cl").onclick=function(e){var el=e.target.closest(".c");if(el)openCountry(el.getAttribute("data-cc"))};
+$("cf").oninput=renderCountries;
+
+function renderStations(note){
+  if(!stations.length){$("sl").innerHTML='<div id="empty">'+esc(note||"No stations found.")+'</div>';return}
+  var h="";
+  stations.forEach(function(s,i){
+    var meta=[s.codec,s.bitrate?s.bitrate+"k":"",s.tags,s.votes?"♥ "+s.votes:""].filter(Boolean).join(" · ");
+    var img=s.favicon?'<img src="'+esc(s.favicon)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML=\'<div class=ph>📻</div>\'">':'<div class="ph">📻</div>';
+    h+='<div class="s'+(playing&&playing.id===s.id?' on':'')+'" data-i="'+i+'">'+img+'<div class="t"><b>'+esc(s.name)+'</b><span>'+flag(s.cc)+' '+esc(s.country||s.cc)+(meta?' · '+esc(meta):'')+'</span></div></div>';
+  });
+  $("sl").innerHTML=h;
+}
+$("sl").onclick=function(e){var el=e.target.closest(".s");if(el)play(stations[+el.getAttribute("data-i")])};
+
+function openCountry(cc){
+  curCC=cc;$("q").value="";renderCountries();
+  $("sl").innerHTML='<div id="empty">Loading…</div>';
+  getJSON("/radio/api/stations?cc="+encodeURIComponent(cc)).then(function(d){stations=d;renderStations();drawMap()})
+   .catch(function(e){stations=[];renderStations("Could not load stations ("+e.message+")");drawMap()});
+}
+var qt=null;
+$("q").oninput=function(){
+  clearTimeout(qt);var q=this.value.trim();
+  if(q.length<2)return;
+  qt=setTimeout(function(){
+    curCC="";renderCountries();
+    $("sl").innerHTML='<div id="empty">Searching…</div>';
+    getJSON("/radio/api/stations?q="+encodeURIComponent(q)).then(function(d){stations=d;renderStations();drawMap()})
+     .catch(function(e){stations=[];renderStations("Search failed ("+e.message+")");drawMap()});
+  },350);
+};
+
+function setNow(t,s,live){$("nt").textContent=t;$("ns").innerHTML=live?'<span class="live">● live</span> '+esc(s):esc(s)}
+function play(s){
+  if(!s)return;playing=s;triedProxy=false;
+  audio.src=s.direct||("/radio/stream/"+s.id);
+  setNow(s.name,"Connecting…",false);
+  audio.play().catch(function(){});
+  renderStations();drawMap();
+  if("mediaSession" in navigator){try{navigator.mediaSession.metadata=new MediaMetadata({title:s.name,artist:s.country||"Radio"})}catch(e){}}
+}
+audio.onplaying=function(){if(playing)setNow(playing.name,(playing.country||"")+(playing.bitrate?" · "+playing.bitrate+"k":""),true)};
+audio.onwaiting=function(){if(playing)setNow(playing.name,"Buffering…",false)};
+audio.onerror=function(){
+  if(!playing)return;
+  if(!triedProxy&&playing.direct){triedProxy=true;audio.src="/radio/stream/"+playing.id;audio.play().catch(function(){});setNow(playing.name,"Switching to relay…",false);return}
+  setNow(playing.name,"This station is not available right now. Try another one.",false);
+};
+$("stop").onclick=function(){audio.pause();audio.removeAttribute("src");audio.load();if(playing)setNow(playing.name,"Stopped",false);playing=null;renderStations();drawMap()};
+
+// ---- map: stations that report coordinates, fitted to the selection ----
+var cv=$("map"),ctx=cv.getContext("2d");
+function drawMap(){
+  var dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  if(!w||!h)return;
+  cv.width=w*dpr;cv.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+  var pts=[];stations.forEach(function(s,i){if(s.lat!=null&&s.lng!=null)pts.push({s:s,i:i})});
+  dots=[];
+  if(!pts.length){$("maptip").textContent=stations.length?"These stations have no map coordinates":"Pick a country to see its stations on the map";return}
+  var minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+  pts.forEach(function(p){minX=Math.min(minX,p.s.lng);maxX=Math.max(maxX,p.s.lng);minY=Math.min(minY,p.s.lat);maxY=Math.max(maxY,p.s.lat)});
+  var padX=Math.max((maxX-minX)*.08,.6),padY=Math.max((maxY-minY)*.08,.6);
+  minX-=padX;maxX+=padX;minY-=padY;maxY+=padY;
+  var sx=w/(maxX-minX),sy=h/(maxY-minY),k=Math.min(sx,sy*1.0),ox=(w-(maxX-minX)*k)/2,oy=(h-(maxY-minY)*k)/2;
+  ctx.strokeStyle="#1a2030";ctx.lineWidth=1;
+  for(var gx=Math.ceil(minX);gx<=maxX;gx+=Math.max(1,Math.round((maxX-minX)/8))){var x=ox+(gx-minX)*k;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}
+  for(var gy=Math.ceil(minY);gy<=maxY;gy+=Math.max(1,Math.round((maxY-minY)/5))){var y=h-(oy+(gy-minY)*k);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
+  pts.forEach(function(p){
+    var x=ox+(p.s.lng-minX)*k,y=h-(oy+(p.s.lat-minY)*k),on=playing&&playing.id===p.s.id;
+    dots.push({x:x,y:y,i:p.i});
+    ctx.beginPath();ctx.arc(x,y,on?7:4,0,6.283);ctx.fillStyle=on?"#3ddc97":"rgba(77,107,255,.75)";ctx.fill();
+    if(on){ctx.strokeStyle="#3ddc97";ctx.beginPath();ctx.arc(x,y,12,0,6.283);ctx.stroke()}
+  });
+  $("maptip").textContent=pts.length+" station"+(pts.length===1?"":"s")+" on the map · click a dot to listen";
+}
+cv.onclick=function(e){
+  var r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,best=null,bd=14*14;
+  dots.forEach(function(d){var dd=(d.x-x)*(d.x-x)+(d.y-y)*(d.y-y);if(dd<bd){bd=dd;best=d}});
+  if(best)play(stations[best.i]);
+};
+cv.onmousemove=function(e){
+  var r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,best=null,bd=10*10;
+  dots.forEach(function(d){var dd=(d.x-x)*(d.x-x)+(d.y-y)*(d.y-y);if(dd<bd){bd=dd;best=d}});
+  cv.title=best?stations[best.i].name:"";
+};
+window.addEventListener("resize",drawMap);
+
+getJSON("/radio/api/countries").then(function(d){countries=d;renderCountries()})
+ .catch(function(){$("cl").innerHTML='<div id="empty">Could not load the country list. Reload the page to retry.</div>'});
+})();
+</script>
+</body>
+</html>
+'''
+
+
+# ---- Discord voice playback -------------------------------------------------------------------
+def _radio_start_source(gid: int, vc, info: dict, gen: int):
+    source = discord.FFmpegPCMAudio(
+        info["url"],
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                       "-protocol_whitelist http,https,tcp,tls,crypto",
+        options="-vn -loglevel error",
+    )
+
+    def after(err):
+        if err:
+            logger.warning(f"Radio playback error in guild {gid}: {err}")
+        asyncio.run_coroutine_threadsafe(radio_ended(gid, gen), bot.loop)
+
+    vc.play(source, after=after)
+
+
+async def radio_ended(gid: int, gen: int):
+    """The stream stopped by itself (network drop): try to reconnect a few times."""
+    sess = radio_sessions.get(gid)
+    if not sess or sess["gen"] != gen:
+        return
+    now = time.monotonic()
+    sess["restarts"] = [t for t in sess["restarts"] if now - t < 120]
+    if len(sess["restarts"]) >= 4:
+        await radio_stop(gid)
+        return
+    sess["restarts"].append(now)
+    await asyncio.sleep(1.5)
+    if radio_sessions.get(gid) is not sess or sess["gen"] != gen or not sess["vc"].is_connected():
+        return
+    try:
+        _radio_start_source(gid, sess["vc"], sess["info"], gen)
+    except Exception as e:
+        logger.warning(f"Radio restart failed in guild {gid}: {e}")
+        await radio_stop(gid)
+
+
+async def radio_stop(gid: int) -> bool:
+    sess = radio_sessions.pop(gid, None)
+    if not sess:
+        return False
+    sess["gen"] += 1
+    vc = sess["vc"]
+    try:
+        if vc.is_playing():
+            vc.stop()
+    except Exception:
+        pass
+    try:
+        await vc.disconnect(force=True)
+    except Exception as e:
+        logger.warning(f"Radio disconnect error in guild {gid}: {e}")
+    return True
+
+
+async def radio_maybe_leave(channel):
+    sess = radio_sessions.get(channel.guild.id)
+    if sess and sess["vc"].channel and sess["vc"].channel.id == channel.id and humans_in(channel) == 0:
+        await radio_stop(channel.guild.id)
+
+
+async def radio_country_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        countries = await asyncio.wait_for(radio_countries(), 2.5)
+    except Exception:
+        return []
+    cur = current.strip().lower()
+    out = []
+    for c in countries:
+        if not cur or cur in c["name"].lower() or cur == c["cc"].lower():
+            out.append(app_commands.Choice(name=f"{c['name']} ({c['count']})"[:100], value=c["cc"]))
+            if len(out) >= 25:
+                break
+    return out
+
+
+async def radio_station_autocomplete(interaction: discord.Interaction, current: str):
+    cc = getattr(interaction.namespace, "country", None)
+    q = current.strip()
+    if not cc and len(q) < 2:
+        return []
+    try:
+        if cc:
+            stations = await asyncio.wait_for(radio_stations(cc=cc), 2.5)
+            if q:
+                stations = [s for s in stations if q.lower() in s["name"].lower()]
+        else:
+            stations = await asyncio.wait_for(radio_stations(q=q, limit=25), 2.5)
+    except Exception:
+        return []
+    return [app_commands.Choice(name=(f"{s['name']} ({s['bitrate']}k)" if s["bitrate"] else s["name"])[:100], value=s["id"])
+            for s in stations[:25]]
+
+
+@bot.tree.command(name="radio", description="Open the LUX-NET Radio web player (browse stations by country).")
+async def radio_cmd(interaction: discord.Interaction):
+    if not EMU_WEB_BASE:
+        await interaction.response.send_message(
+            "⚠️ The radio web player needs a public address. Set the `PUBLIC_URL` environment variable "
+            "(Render sets `RENDER_EXTERNAL_URL` automatically for web services).", ephemeral=True)
+        return
+    link = discord.ui.View()
+    link.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open LUX-NET Radio", url=f"{EMU_WEB_BASE}/radio"))
+    await interaction.response.send_message(
+        "\U0001F4FB **LUX-NET Radio**: browse stations from every country and listen in your browser.\n"
+        "To play a station for everyone in a voice channel, use `/radio-play`.", view=link, ephemeral=True)
+
+
+@bot.tree.command(name="radio-play", description="Play a radio station in your voice channel.")
+@app_commands.describe(station="Station to play (type to search)", country="Browse a country first (optional)",
+                       voice_channel="Voice channel (optional, defaults to the one you're in)")
+@app_commands.autocomplete(country=radio_country_autocomplete, station=radio_station_autocomplete)
+async def radio_play(interaction: discord.Interaction, station: str, country: str = None, voice_channel: discord.VoiceChannel = None):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    if not shutil.which("ffmpeg"):
+        await interaction.response.send_message("❌ FFmpeg is not installed on the bot host (add `ffmpeg` to the Dockerfile).", ephemeral=True)
+        return
+    gid = interaction.guild.id
+    if gid in voice_sessions or gid in _voice_connecting:
+        await interaction.response.send_message("⚠️ The voice bridge is using voice in this server right now, so radio can't play here.", ephemeral=True)
+        return
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message("❌ Join a voice channel first, or pick a `voice_channel`.", ephemeral=True)
+        return
+    perms = target.permissions_for(interaction.guild.me)
+    if not (perms.connect and perms.speak):
+        await interaction.response.send_message(f"❌ I need **Connect** and **Speak** permissions in {target.mention}.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        info = await radio_station_info(station)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Couldn't reach the radio directory: {e}", ephemeral=True)
+        return
+    if not info:
+        await interaction.followup.send("❌ Pick a station from the list.", ephemeral=True)
+        return
+    if not await radio_url_is_public(info["url"]):
+        await interaction.followup.send("❌ That station's address isn't allowed.", ephemeral=True)
+        return
+
+    try:
+        sess = radio_sessions.get(gid)
+        if sess and not sess["vc"].is_connected():
+            radio_sessions.pop(gid, None)
+            sess = None
+        if sess:
+            sess["gen"] += 1
+            vc = sess["vc"]
+            if vc.is_playing():
+                vc.stop()
+            if vc.channel.id != target.id:
+                await vc.move_to(target)
+        else:
+            if interaction.guild.voice_client:
+                await interaction.followup.send("⚠️ I'm already in a voice channel in this server.", ephemeral=True)
+                return
+            vc = await target.connect(timeout=20, self_deaf=True)
+            sess = radio_sessions[gid] = {"vc": vc, "info": info, "gen": 0, "restarts": []}
+        sess["info"] = info
+        sess["restarts"] = []
+        _radio_start_source(gid, vc, info, sess["gen"])
+    except Exception as e:
+        logger.error(f"radio-play failed: {e}")
+        await radio_stop(gid)
+        await interaction.followup.send(f"❌ Couldn't start the radio: {e}", ephemeral=True)
+        return
+
+    asyncio.create_task(radio_click(info["id"]))
+    place = f" ({info['country']})" if info["country"] else ""
+    await interaction.followup.send(f"\U0001F4FB **{interaction.user.display_name}** tuned **{info['name']}**{place} in {target.mention}. Use `/radio-stop` to stop.")
+
+
+@bot.tree.command(name="radio-stop", description="Stop the radio and leave the voice channel.")
+async def radio_stop_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not await radio_stop(interaction.guild.id):
+        await interaction.response.send_message("⚠️ No radio is playing in this server.", ephemeral=True)
+        return
+    await interaction.response.send_message("⏹️ Radio stopped.")
+
+
+# ------------------------------------------------------------------------------
 # MAIN RUNNER
 # ------------------------------------------------------------------------------
 def main():
@@ -3455,8 +4075,11 @@ def main():
 
     async def runner():
         await start_web()          # bind the port first so Render's health check passes even if Discord is slow
-        async with bot:
-            await bot.start(token)
+        try:
+            async with bot:
+                await bot.start(token)
+        finally:
+            await radio_shutdown()
 
     try:
         asyncio.run(runner())
