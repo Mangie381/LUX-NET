@@ -21,6 +21,7 @@ from threading import Thread, Lock
 from datetime import datetime, timedelta, timezone
 
 import discord
+import aiohttp
 from discord import app_commands
 from discord.ext import commands
 from aiohttp import web, WSMsgType   # ships with discord.py
