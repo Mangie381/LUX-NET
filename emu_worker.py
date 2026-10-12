@@ -123,6 +123,10 @@ AUDIO_QUEUE_CHUNKS = 90         # ~1.5 s of audio at most waiting for the pipe
 IDLE_STATS_EVERY = 1.0
 
 
+class Live:
+    last = b""       # last picture sent (identical pictures are not sent again)
+
+
 def log(*a):
     print("[worker]", *a, file=sys.stderr, flush=True)
 
@@ -143,12 +147,14 @@ class Out:
         self.quality = 72
         self.sent = 0               # frames written (for the stats event)
         self.bio = io.BytesIO()
+        self._wlock = threading.Lock()
         # Some cores printf() to stdout, which would corrupt the binary protocol. Keep a private
         # copy of the real stdout for ourselves and point fd 1 at stderr (the bot logs that).
         proto_fd = os.dup(1)
         os.dup2(2, 1)
         self._stdout = os.fdopen(proto_fd, "wb")
         threading.Thread(target=self._run, daemon=True, name="writer").start()
+        threading.Thread(target=self._run_video, daemon=True, name="video").start()
 
     # ---- called from the emulation thread ----
     def reply(self, obj):
@@ -160,12 +166,12 @@ class Out:
     def _post(self, kind, payload):
         with self.cv:
             self.reliable.append(kind + payload)
-            self.cv.notify()
+            self.cv.notify_all()
 
     def audio_chunk(self, pcm):
         with self.cv:
             self.audio.append(pcm)
-            self.cv.notify()
+            self.cv.notify_all()
 
     def publish(self, src: bytearray, n: int, meta):
         """Copy the newest frame into the slot (latest wins). ~10 microseconds."""
@@ -174,40 +180,44 @@ class Out:
                 self.slot = bytearray(n)
             self.slot[:n] = memoryview(src)[:n]
             self.slot_len, self.slot_meta, self.pending = n, meta, True
-            self.cv.notify()
+            self.cv.notify_all()
 
     # ---- writer thread ----
     def _write(self, body: bytes):
         try:
-            self._stdout.write(struct.pack("<I", len(body)) + body)
-            self._stdout.flush()
+            with self._wlock:
+                self._stdout.write(struct.pack("<I", len(body)) + body)
+                self._stdout.flush()
         except (BrokenPipeError, ValueError, OSError):
             os._exit(0)
 
     def _run(self):
+        """Replies, events and audio: small messages that must never wait for a JPEG."""
         while True:
-            frame = None
             with self.cv:
-                while not (self.reliable or self.audio or self.pending):
+                while not (self.reliable or self.audio):
                     self.cv.wait()
                 if self.reliable:
                     body = self.reliable.popleft()
-                elif self.audio:
+                else:
                     body = b"A\x00" + b"".join(self.audio)
                     self.audio.clear()
-                else:
-                    n = self.slot_len
-                    if len(self.encbuf) < n:
-                        self.encbuf = bytearray(n)
-                    self.encbuf[:n] = memoryview(self.slot)[:n]
-                    frame = (self.slot_meta, n)
-                    self.pending = False
-                    body = None
-            if frame is not None:
-                body = self._encode(*frame)
-                if body is None:
-                    continue
-                self.sent += 1
+            self._write(body)
+
+    def _run_video(self):
+        while True:
+            with self.cv:
+                while not self.pending:
+                    self.cv.wait()
+                n, meta = self.slot_len, self.slot_meta
+                if len(self.encbuf) < n:
+                    self.encbuf = bytearray(n)
+                self.encbuf[:n] = memoryview(self.slot)[:n]
+                self.pending = False
+            body = self._encode(meta, n)
+            if body is None:
+                continue
+            self.sent += 1
             self._write(body)
 
     def _encode(self, meta, n):
@@ -474,6 +484,27 @@ class Emu:
         return bio.getvalue()
 
 
+def snap_async(emu, out, scale):
+    """PNG encoding runs on a helper thread so a Discord picture update never stalls the game."""
+    if emu.cur_meta is None:
+        emu.run_frames(1, 0)
+    w, h, pitch, raw = emu.cur_meta
+    data = bytes(memoryview(emu.cur)[:emu.cur_len])
+
+    def job():
+        try:
+            im = Image.frombuffer("RGB", (w, h), data, "raw", raw, pitch, 1)
+            if scale > 1:
+                im = im.resize((im.width * scale, im.height * scale), Image.NEAREST)
+            bio = io.BytesIO()
+            im.save(bio, "PNG", compress_level=1)
+            out.reply({"ok": True, "png": bio.getvalue()})
+        except Exception as e:
+            out.reply({"ok": False, "err": f"snapshot failed: {e}"})
+
+    threading.Thread(target=job, daemon=True, name="snap").start()
+
+
 def _atomic_write(path, data):
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
@@ -553,6 +584,7 @@ def main():
                 last_input = time.monotonic()
                 send_acc = 0.0
                 next_t = 0.0
+                Live.last = b""
                 if live:
                     set_paused(False)
                 else:
@@ -574,7 +606,7 @@ def main():
                 out.reply({"ok": True})
                 next_t = 0.0
             elif op == "snap":
-                out.reply({"ok": True, "png": emu.snap_png(max(1, int(m.get("scale", 1))))})
+                snap_async(emu, out, max(1, int(m.get("scale", 1))))
             elif op == "clip":
                 out.reply({"ok": True, "gif": emu.clip_gif(int(m.get("mask", 0)) & 0x0FFF, int(m.get("hold", 8)),
                                                              m.get("frames", 90), m.get("every", 3),
@@ -641,8 +673,11 @@ def main():
         send_acc += min(stream_fps, emu.fps)
         if send_acc >= emu.fps - 1e-6:
             send_acc -= emu.fps
-            if emu.frame_new and emu.cur_meta:
-                out.publish(emu.cur, emu.cur_len, emu.cur_meta)
+            if emu.frame_new and emu.cur_meta and time.perf_counter() - next_t < 0.03:
+                snapshot = bytes(memoryview(emu.cur)[:emu.cur_len])
+                if snapshot != Live.last:         # unchanged picture (menus, pauses): nothing to encode or send
+                    Live.last = snapshot
+                    out.publish(emu.cur, emu.cur_len, emu.cur_meta)
         emu.frame_new = False
 
         # AFK: nobody touched a key for a while and nothing is held -> sleep with 0 CPU
