@@ -139,9 +139,6 @@ def get_mirrored_targets(msg_id: int):
 # ------------------------------------------------------------------------------
 # GLOBAL BOT BAN HELPERS
 # ------------------------------------------------------------------------------
-# Bans are kept in memory and refreshed in the background. is_user_banned() is called for
-# every message, reaction, button click and (most importantly) every 20 ms voice frame, so it
-# must never touch the network.
 _banned_ids: set = set()
 
 def refresh_ban_cache() -> bool:
@@ -214,16 +211,13 @@ def google_search(query: str, num_results: int = 5):
     return results
 
 # ------------------------------------------------------------------------------
-# GEMINI AI OVERVIEW (shown above the search links in /search)
-# Needs GEMINI_API_KEY (free key from Google AI Studio). GEMINI_MODEL is optional.
-# Uses Gemini's built-in Google Search grounding so the overview reflects current results.
+# GEMINI AI OVERVIEW
 # ------------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 def gemini_overview(query: str):
-    """Returns a short AI overview for the query, or None if unavailable."""
     if not GEMINI_API_KEY:
         return None
     payload = {
@@ -275,7 +269,6 @@ bot = commands.Bot(
 
 RELAYED_THREAD_IDS = set()
 
-# Global check for all slash commands
 @bot.tree.interaction_check
 async def global_interaction_check(interaction: discord.Interaction) -> bool:
     if is_user_banned(interaction.user.id):
@@ -309,8 +302,7 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
         return None
 
 # ------------------------------------------------------------------------------
-# STAR RATING POLLS (1-5 stars, persistent buttons, synced across relayed channels)
-# Needs the tables in rating_poll_setup.sql.
+# STAR RATING POLLS
 # ------------------------------------------------------------------------------
 _LEGACY_DEFAULT_PROMPT = "So go on and react to television programs by reacting one of the five ratings mentioned!"
 RATING_TEXT = {
@@ -644,9 +636,8 @@ async def post_auto_poll(thread: discord.Thread, starter_message: discord.Messag
     except Exception as e:
         logger.error(f"Auto poll failed for thread {thread.id}: {e}")
 
-
 # ------------------------------------------------------------------------------
-# BOT EVENTS (TEXT, THREADS, FORUMS, VOICE, & REACTIONS)
+# BOT EVENTS
 # ------------------------------------------------------------------------------
 _ready_done = False
 
@@ -660,7 +651,7 @@ async def on_ready():
     _ready_done = True
 
     if VOICE_OK and not ensure_opus():
-        logger.warning("libopus not found - voice bridge disabled until it is installed.")
+        logger.warning("libopus not found - voice bridge disabled.")
     asyncio.create_task(keepalive_loop())
     asyncio.create_task(ban_cache_loop())
     asyncio.create_task(emu_reaper_loop())
@@ -706,7 +697,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
                     except discord.HTTPException:
                         pass
         except Exception as e:
-            logger.error(f"Failed to add cross-server reaction to message {target_msg_id}: {e}")
+            logger.error(f"Failed to add cross-server reaction: {e}")
 
 @bot.event
 async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | discord.Member):
@@ -741,7 +732,7 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
                         except discord.HTTPException:
                             pass
         except Exception as e:
-            logger.error(f"Failed to remove cross-server reaction from message {target_msg_id}: {e}")
+            logger.error(f"Failed to remove cross-server reaction: {e}")
 
 async def _relay_new_forum_post(thread: discord.Thread):
     copies = []
@@ -825,10 +816,10 @@ async def _relay_new_forum_post(thread: discord.Thread):
                     file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
                     files.append(file_obj)
                 except Exception as e:
-                    logger.error(f"Failed to process attachment {attachment.filename}: {e}")
+                    logger.error(f"Failed to process attachment: {e}")
 
         if skipped_files:
-            skip_notice = f"\n*⚠ [Skipped oversized file(s): {', '.join(skipped_files)}]*"
+            skip_notice = f"\n*⚠ [Skipped oversized file(s)]*"
             post_body += skip_notice
 
         send_kwargs = {
@@ -868,7 +859,7 @@ async def _relay_new_forum_post(thread: discord.Thread):
                                 
                             register_message_mapping(starter_message.id, target_forum.id, sent_msg.id)
                     except Exception as e:
-                        logger.error(f"Error relaying forum post to {fid}: {e}")
+                        logger.error(f"Error relaying forum post: {e}")
     except Exception as e:
         logger.error(f"Failed to relay new forum post: {e}")
     return starter_message, copies
@@ -887,7 +878,7 @@ async def on_thread_create(thread: discord.Thread):
         await post_auto_poll(thread, starter_message, copies)
 
 # ------------------------------------------------------------------------------
-# VOICE BRIDGE (LIVE AUDIO RELAY BETWEEN LINKED VOICE CHANNELS)
+# VOICE BRIDGE
 # ------------------------------------------------------------------------------
 FRAME_BYTES = 3840                 
 SILENCE = b"\x00" * FRAME_BYTES
@@ -958,9 +949,6 @@ def patch_opus_decode_safety():
             return original(self, packet)
         except discord.opus.OpusError as e:
             voice_stats["decode_err"] += 1
-            if voice_stats["decode_err"] <= 5:
-                d = getattr(packet, "decrypted_data", None) or b""
-                logger.warning(f"Skipped undecodable voice packet ({e})")
             return packet, SILENCE
 
     vr_opus.PacketDecoder._decode_packet = safe_decode
@@ -1414,7 +1402,7 @@ async def on_message(message: discord.Message):
                         logger.error(f"Error relaying message: {e}")
 
 # ------------------------------------------------------------------------------
-# SLASH COMMANDS (BRIDGES, POLLS, YOUTUBE, SEARCH, & BANS)
+# SLASH COMMANDS
 # ------------------------------------------------------------------------------
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
@@ -2853,7 +2841,6 @@ async def radio_stations(cc: str = None, q: str = None, limit: int = RADIO_LIST_
 
 
 async def fetch_somafm_stations() -> list:
-    """Adapter for SomaFM curated official feeds."""
     stations = []
     try:
         session = await radio_http()
@@ -2886,7 +2873,6 @@ async def fetch_somafm_stations() -> list:
 
 
 def extract_frequency(name: str, tags: str) -> float | None:
-    """Approach 1: Read frequency from station names and tags (e.g. '101.1 FM')[cite: 1]."""
     text = f"{name} {tags}"
     match = re.search(r'\b(8[7-9]\.\d|9\d\.\d|10[0-7]\.\d)\s*(?:MHz|FM)?\b', text, re.IGNORECASE)
     if match:
@@ -2898,7 +2884,6 @@ def extract_frequency(name: str, tags: str) -> float | None:
 
 
 async def multi_source_search(cc: str = None, q: str = None, frequency: float = None) -> list:
-    """Aggregates stations from Radio Browser, SomaFM, deduplicates, and filters[cite: 1]."""
     raw_stations = []
     
     try:
@@ -3119,9 +3104,9 @@ async def radio_frequency(interaction: discord.Interaction, frequency: float, co
 
 
 @bot.tree.command(name="radio-play", description="Play a radio station in voice.")
-@app_commands.describe(station="Station ID", country="Country", voice_channel="Voice channel")
+@app_commands.describe(country="Country", station="Station ID", voice_channel="Voice channel")
 @app_commands.autocomplete(country=radio_country_autocomplete, station=radio_station_autocomplete)
-async def radio_play(interaction: discord.Interaction, station: str, country: str = None, voice_channel: discord.VoiceChannel = None):
+async def radio_play(interaction: discord.Interaction, country: str, station: str, voice_channel: discord.VoiceChannel = None):
     if not interaction.guild:
         await interaction.response.send_message("❌ Server only.", ephemeral=True)
         return
