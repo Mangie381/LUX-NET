@@ -4,31 +4,34 @@ import asyncio
 import logging
 import io
 import json
-import resource
-import math
 import re
 import uuid
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import socket
 import ipaddress
 import time
+import resource
 import pickle
 import struct
 import zipfile
-import shutil
 import atexit
 import secrets
+import shutil
 import random
-from collections import deque
-from threading import Thread, Lock
-from datetime import datetime, timedelta, timezone
+import csv
+import math
+from collections import deque, OrderedDict
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from threading import Lock
+from datetime import datetime, timezone
 
 import discord
 import aiohttp
 from discord import app_commands
 from discord.ext import commands
-from aiohttp import web, WSMsgType   # ships with discord.py
+from aiohttp import web   # ships with discord.py
 
 # Voice relay dependencies are optional: if they are missing the bot still runs
 # all text/forum/thread features and simply disables the voice commands.
@@ -47,7 +50,10 @@ except ImportError:
     davey = None
 from supabase import create_client, Client
 import yt_dlp
-from duckduckgo_search import DDGS  # using duckduckgo_search package with underscore
+try:
+    from ddgs import DDGS  # new package name
+except ImportError:
+    from duckduckgo_search import DDGS  # legacy package name
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -91,6 +97,7 @@ def add_link(table: str, code: str, item_id: int):
             on_conflict="network_code," + col
         ).execute()
         logger.info(f"Successfully added/upserted {item_id} to {table} under {code}")
+        invalidate_relay_cache()
     except Exception as e:
         logger.error(f"CRITICAL Supabase insert error in ({table}): {e}")
 
@@ -98,6 +105,7 @@ def remove_link(table: str, code: str, item_id: int):
     try:
         col = _LINK_COLS.get(table, "thread_id")
         supabase.table(table).delete().eq("network_code", code).eq(col, item_id).execute()
+        invalidate_relay_cache()
     except Exception as e:
         logger.error(f"Failed to remove link from Supabase ({table}): {e}")
 
@@ -113,33 +121,35 @@ def get_links(table: str, code: str):
         return []
 
 # Persistent Message Mapping Helpers via Supabase
-def register_message_mapping(source_msg_id: int, target_channel_id: int, target_msg_id: int):
+def register_message_mappings(source_msg_id: int, source_channel_id: int, copies: list):
+    """Store a source message and all of its relayed copies with ONE upsert.
+    copies = [(channel_id, message_id), ...]"""
+    if not copies:
+        return
     try:
-        res = supabase.table("message_mappings").select("root_message_id").or_(f"message_id.eq.{source_msg_id},message_id.eq.{target_msg_id}").limit(1).execute()
-        if res.data:
-            root_id = res.data[0]["root_message_id"]
-        else:
-            root_id = source_msg_id
-
-        supabase.table("message_mappings").upsert([
-            {"root_message_id": root_id, "channel_id": target_channel_id, "message_id": target_msg_id},
-            {"root_message_id": root_id, "channel_id": source_msg_id, "message_id": source_msg_id}
-        ], on_conflict="channel_id,message_id").execute()
+        rows = [{"root_message_id": source_msg_id, "channel_id": source_channel_id, "message_id": source_msg_id}]
+        rows += [{"root_message_id": source_msg_id, "channel_id": int(c), "message_id": int(m)} for c, m in copies]
+        supabase.table("message_mappings").upsert(rows, on_conflict="channel_id,message_id").execute()
     except Exception as e:
         logger.error(f"Failed to register message mapping in Supabase: {e}")
 
-def get_mirrored_targets(msg_id: int):
+def get_mirror_rows(msg_id: int):
+    """Return (root_id, [(channel_id, message_id), ...]) for every message in the same relay group."""
     try:
         res = supabase.table("message_mappings").select("root_message_id").eq("message_id", msg_id).limit(1).execute()
         if not res.data:
-            return []
-        root_id = res.data[0]["root_message_id"]
-
+            return None, []
+        root_id = int(res.data[0]["root_message_id"])
         all_res = supabase.table("message_mappings").select("channel_id,message_id").eq("root_message_id", root_id).execute()
-        return [(row["channel_id"], row["message_id"]) for row in all_res.data]
+        return root_id, [(int(r["channel_id"]), int(r["message_id"])) for r in all_res.data]
     except Exception as e:
         logger.error(f"Failed to fetch message mapping from Supabase: {e}")
-        return []
+        return None, []
+
+def get_mirrored_targets(msg_id: int):
+    """Copies of msg_id elsewhere (excludes msg_id itself and legacy placeholder rows)."""
+    _root, rows = get_mirror_rows(msg_id)
+    return [(c, m) for c, m in rows if m != msg_id and c != m]
 
 # ------------------------------------------------------------------------------
 # GLOBAL BOT BAN HELPERS
@@ -284,27 +294,392 @@ async def global_interaction_check(interaction: discord.Interaction) -> bool:
 # ------------------------------------------------------------------------------
 # WEBHOOK HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
-async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.Webhook | None:
-    target_channel = channel.parent if isinstance(channel, discord.Thread) else channel
+_webhook_cache: dict = {}
+_webhook_locks: dict = {}
+_bg_tasks: set = set()
 
-    if isinstance(target_channel, discord.Thread):
-        target_channel = target_channel.parent
 
-    if not isinstance(target_channel, (discord.TextChannel, discord.ForumChannel)):
+def spawn(coro):
+    """Fire-and-forget a coroutine while keeping a reference so it isn't garbage-collected."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+
+def _webhook_root(channel):
+    root = channel.parent if isinstance(channel, discord.Thread) else channel
+    return root if isinstance(root, (discord.TextChannel, discord.ForumChannel)) else None
+
+
+async def get_or_create_webhook(channel: discord.abc.GuildChannel, refresh: bool = False) -> discord.Webhook | None:
+    """Return the bot's webhook for a channel. Cached, so a relayed message no longer
+    costs an extra Discord API call per target."""
+    root = _webhook_root(channel)
+    if root is None:
         return None
+    if not refresh:
+        cached = _webhook_cache.get(root.id)
+        if cached is not None:
+            return cached
+    lock = _webhook_locks.setdefault(root.id, asyncio.Lock())
+    async with lock:
+        if not refresh and root.id in _webhook_cache:
+            return _webhook_cache[root.id]
+        try:
+            for wh in await root.webhooks():
+                if wh.user and wh.user.id == bot.user.id and wh.token:
+                    _webhook_cache[root.id] = wh
+                    return wh
+            wh = await root.create_webhook(name="LUX-NET Relay Bridge")
+            _webhook_cache[root.id] = wh
+            return wh
+        except discord.Forbidden:
+            logger.error(f"Missing 'Manage Webhooks' permission in #{root.name}")
+        except Exception as e:
+            logger.error(f"Failed to get/create webhook in #{root.name}: {e}")
+        return None
+
+
+def forget_webhook(channel):
+    root = _webhook_root(channel)
+    if root is not None:
+        _webhook_cache.pop(root.id, None)
+
+
+# ------------------------------------------------------------------------------
+# RELAY ENGINE (cached lookups, concurrent sends, safe attachment handling)
+# ------------------------------------------------------------------------------
+RELAY_MAX_FILE_MB = int(os.environ.get("RELAY_MAX_FILE_MB", "25"))
+RELAY_SYNC_EDITS = os.environ.get("RELAY_SYNC_EDITS", "1") == "1"
+RELAY_SYNC_DELETES = os.environ.get("RELAY_SYNC_DELETES", "1") == "1"
+RELAY_CACHE_TTL = int(os.environ.get("RELAY_CACHE_TTL", "120"))
+
+_target_cache: dict = {}          # (table, id) -> (expires_at, tuple_of_ids)
+_thread_pairs: dict = {}          # forum thread id -> set of linked thread ids
+_chunked_sources: OrderedDict = OrderedDict()   # source ids that were split into several messages
+_reply_prefixes: OrderedDict = OrderedDict()    # source id -> reply prefix, so edits keep it
+
+
+def _remember(od: OrderedDict, key, value=True, cap: int = 3000):
+    od[key] = value
+    od.move_to_end(key)
+    while len(od) > cap:
+        od.popitem(last=False)
+
+
+def invalidate_relay_cache():
+    _target_cache.clear()
+
+
+def _query_targets(table: str, item_id: int) -> list:
+    col = _LINK_COLS[table]
+    res = supabase.table(table).select("network_code").eq(col, item_id).execute()
+    codes = list({row["network_code"] for row in res.data})
+    if not codes:
+        return []
+    r = supabase.table(table).select(col).in_("network_code", codes).neq(col, item_id).execute()
+    return list({int(x[col]) for x in r.data})
+
+
+def cached_targets(table: str, item_id: int) -> list:
+    key = (table, item_id)
+    now = time.monotonic()
+    hit = _target_cache.get(key)
+    if hit and hit[0] > now:
+        return list(hit[1])
+    try:
+        ids = _query_targets(table, item_id)
+    except Exception:
+        if hit:                      # database hiccup: fall back to the stale answer
+            return list(hit[1])
+        raise
+    _target_cache[key] = (now + RELAY_CACHE_TTL, tuple(ids))
+    return ids
+
+
+async def get_targets(table: str, item_id: int) -> list:
+    hit = _target_cache.get((table, item_id))
+    if hit and hit[0] > time.monotonic():
+        return list(hit[1])          # fast path, no thread hop, no network
+    return await asyncio.to_thread(cached_targets, table, item_id)
+
+
+def relay_targets_for(channel) -> list:
+    table = "thread_relays" if isinstance(channel, discord.Thread) else "text_relays"
+    return cached_targets(table, channel.id)
+
+
+def forum_targets_for(forum_id: int) -> list:
+    return cached_targets("forum_relays", forum_id)
+
+
+async def resolve_channel(cid: int):
+    ch = bot.get_channel(cid)
+    if ch is not None:
+        return ch
+    try:
+        return await bot.fetch_channel(cid)
+    except Exception:
+        return None
+
+
+async def relay_channels_for(channel) -> list:
+    """Every channel/thread that mirrors `channel` (empty list = channel isn't relayed)."""
+    if not supabase:
+        return []
+    out = []
+    if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+        for tid in _thread_pairs.get(channel.id, ()):
+            t = bot.get_channel(tid)
+            if t is not None:
+                out.append(t)
+        forum_ids = await get_targets("forum_relays", channel.parent.id)
+        for fid in forum_ids:
+            forum = bot.get_channel(fid)
+            if isinstance(forum, discord.ForumChannel):
+                name = channel.name.lower()
+                out.extend(t for t in forum.threads if t.name.lower() == name)
+    elif isinstance(channel, discord.Thread):
+        for tid in await get_targets("thread_relays", channel.id):
+            t = await resolve_channel(tid)
+            if isinstance(t, discord.Thread):
+                out.append(t)
+    elif isinstance(channel, discord.TextChannel):
+        for cid in await get_targets("text_relays", channel.id):
+            c = bot.get_channel(cid)
+            if isinstance(c, discord.TextChannel):
+                out.append(c)
+    seen, uniq = set(), []
+    for c in out:
+        if c.id not in seen and c.id != channel.id:
+            seen.add(c.id)
+            uniq.append(c)
+    return uniq
+
+
+_BAD_WEBHOOK_WORDS = (("discord", "disc\u043erd"), ("clyde", "cl\u0443de"))
+
+
+def safe_webhook_name(name: str) -> str:
+    """Discord rejects webhook usernames containing 'discord' or 'clyde'. Swap one letter for a
+    look-alike so users/servers with those words in their names can still relay."""
+    for word, repl in _BAD_WEBHOOK_WORDS:
+        name = re.sub(word, lambda m, r=repl: r if m.group(0).islower() else r.capitalize(), name, flags=re.IGNORECASE)
+    name = name.strip()[:80]
+    return name if len(name) >= 1 else "User"
+
+
+def split_text(text: str, limit: int = 2000) -> list:
+    text = text or ""
+    if len(text) <= limit:
+        return [text] if text else []
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        parts.append(text)
+    return parts
+
+
+@dataclass
+class RelayAttachment:
+    filename: str
+    url: str
+    size: int
+    data: bytes | None = None
+    description: str | None = None
+
+
+@dataclass
+class RelayPayload:
+    username: str
+    avatar_url: str
+    content: str
+    embeds: list
+    attachments: list
+    source_id: int
+    source_channel_id: int
+
+
+async def _download_attachment(att: discord.Attachment, limit_bytes: int) -> RelayAttachment:
+    ra = RelayAttachment(filename=att.filename, url=att.url, size=att.size, description=att.description)
+    if att.size <= limit_bytes:
+        try:
+            ra.data = await att.read()
+        except Exception as e:
+            logger.warning(f"Could not download attachment {att.filename}: {e}")
+    return ra
+
+
+async def build_relay_payload(message: discord.Message, *, with_reply: bool = True, extra_text: str = "") -> RelayPayload:
+    content = message.content or ""
+    embeds = list(message.embeds)
+    atts = list(message.attachments)
+    stickers = list(message.stickers)
+
+    snaps = getattr(message, "message_snapshots", None) or []     # forwarded messages
+    if snaps and not (content or atts or embeds):
+        snap = snaps[0]
+        content = "\u21AA\uFE0F **Forwarded**\n" + (getattr(snap, "content", "") or "")
+        embeds = list(getattr(snap, "embeds", []) or [])
+        atts = list(getattr(snap, "attachments", []) or [])
+        stickers = list(getattr(snap, "stickers", []) or [])
+
+    # Link previews (video / gifv / image / article) are regenerated by Discord from the URL in the
+    # text; copying them as embeds duplicates previews, so only real rich embeds are forwarded.
+    rich = [e for e in embeds if e.type == "rich"][:10]
+
+    for st in stickers:
+        if str(getattr(st, "format", "")).lower().endswith("lottie"):
+            content += f"\n*[Sticker: {st.name}]*"
+        else:
+            content += f"\n{st.url}"
+
+    prefix = ""
+    if with_reply and message.reference:
+        ref = message.reference.resolved if isinstance(message.reference.resolved, discord.Message) else None
+        if ref is None and message.reference.message_id:
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+            except Exception:
+                ref = None
+        if ref is not None:
+            snippet = ref.content[:60] + "..." if len(ref.content) > 60 else ref.content
+            if not snippet and ref.attachments:
+                snippet = "[Attachment]"
+            prefix = f"> \u21A9 **Replying to {ref.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
+    if prefix:
+        _remember(_reply_prefixes, message.id, prefix)
+
+    limit_bytes = RELAY_MAX_FILE_MB * 1024 * 1024
+    attachments = await asyncio.gather(*(_download_attachment(a, limit_bytes) for a in atts[:10]))
+
+    guild_name = message.guild.name if message.guild else "Unknown"
+    username = safe_webhook_name(f"{message.author.display_name} [{guild_name}]")
+    text = (prefix + content + extra_text).strip("\n") if (prefix or content or extra_text) else ""
+    return RelayPayload(
+        username=username,
+        avatar_url=message.author.display_avatar.url,
+        content=text,
+        embeds=rich,
+        attachments=list(attachments),
+        source_id=message.id,
+        source_channel_id=message.channel.id,
+    )
+
+
+async def webhook_send(channel, *, files_factory=None, thread=None, **kwargs):
+    """Send through the cached webhook. Fresh File objects are built for every attempt (a File can
+    only be uploaded once, which is what used to break video/image relays on all but the first server)."""
+    last_err = None
+    for attempt in (0, 1):
+        wh = await get_or_create_webhook(channel, refresh=bool(attempt))
+        if wh is None:
+            return None
+        kw = dict(kwargs)
+        if files_factory:
+            files = files_factory()
+            if files:
+                kw["files"] = files
+        t = thread if thread is not None else _thread_kw(channel).get("thread")
+        if t is not None:
+            kw["thread"] = t
+        try:
+            return await wh.send(wait=True, **kw)
+        except discord.NotFound as e:           # webhook (or thread) was deleted: rebuild once
+            last_err = e
+            forget_webhook(channel)
+            continue
+        except discord.HTTPException:
+            raise
+    if last_err:
+        raise last_err
+    return None
+
+
+async def relay_to_target(ch, p: RelayPayload, *, thread_name: str | None = None):
+    """Relay one payload to one channel/thread. Returns the first sent message or None."""
+    limit = ch.guild.filesize_limit if getattr(ch, "guild", None) else 10 * 1024 * 1024
+    inline = [a for a in p.attachments if a.data is not None and a.size <= limit]
+    links = [a.url for a in p.attachments if a not in inline]
+    no_mentions = discord.AllowedMentions.none()
+
+    def build(use_files: bool):
+        extra = list(links) + ([] if use_files else [a.url for a in inline])
+        text = (p.content + ("\n" if p.content and extra else "") + "\n".join(extra)).strip()
+        return split_text(text)
+
+    def make_files():
+        return [discord.File(io.BytesIO(a.data), filename=a.filename, description=a.description) for a in inline]
+
+    async def run(use_files: bool):
+        chunks = build(use_files)
+        first = None
+        thread_obj = None
+        for i, chunk in enumerate(chunks or [""]):
+            kw = dict(username=p.username, avatar_url=p.avatar_url, allowed_mentions=no_mentions)
+            if chunk:
+                kw["content"] = chunk
+            if i == 0:
+                if p.embeds:
+                    kw["embeds"] = p.embeds
+                if thread_name:
+                    kw["thread_name"] = thread_name[:100]
+                factory = make_files if (use_files and inline) else None
+                if not chunk and not p.embeds and not factory:
+                    return None
+            else:
+                factory = None
+            sent = await webhook_send(ch, files_factory=factory, thread=thread_obj, **kw)
+            if sent is None:
+                return first
+            if first is None:
+                first = sent
+                if thread_name:
+                    thread_obj = sent.channel if isinstance(sent.channel, discord.Thread) else None
+                    if thread_obj is None and getattr(sent, "thread", None) is not None:
+                        thread_obj = sent.thread
+        if len(chunks) > 1:
+            _remember(_chunked_sources, p.source_id)
+        return first
 
     try:
-        webhooks = await target_channel.webhooks()
-        for wh in webhooks:
-            if wh.user and wh.user.id == bot.user.id:
-                return wh
-        return await target_channel.create_webhook(name="LUX-NET Relay Bridge")
-    except discord.Forbidden:
-        logger.error(f"Missing 'Manage Webhooks' permission in #{target_channel.name}")
-        return None
+        return await run(True)
+    except discord.HTTPException as e:
+        if inline:
+            logger.warning(f"Relay with files failed in {ch.id} ({e.status}/{e.code}); retrying with links")
+            try:
+                return await run(False)
+            except Exception as e2:
+                logger.warning(f"Relay retry failed in {ch.id}: {e2}")
+                return None
+        logger.warning(f"Relay failed in {ch.id}: {e}")
     except Exception as e:
-        logger.error(f"Failed to create webhook in #{target_channel.name}: {e}")
-        return None
+        logger.warning(f"Relay failed in {ch.id}: {e}")
+    return None
+
+
+async def relay_payload(p: RelayPayload, targets: list) -> list:
+    """Send to every target at once. Returns [(target_channel, first_message), ...] for successes."""
+    results = await asyncio.gather(*(relay_to_target(t, p) for t in targets), return_exceptions=True)
+    out = []
+    for t, r in zip(targets, results):
+        if isinstance(r, discord.Message) or (r is not None and not isinstance(r, Exception)):
+            out.append((t, r))
+    return out
+
+
+def schedule_mapping(source_id: int, source_channel_id: int, sent: list):
+    pairs = [(t.id, m.id) for t, m in sent]
+    spawn(asyncio.to_thread(register_message_mappings, source_id, source_channel_id, pairs))
+
 
 # ------------------------------------------------------------------------------
 # STAR RATING POLLS
@@ -563,29 +938,6 @@ async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username
         return None
 
 
-def relay_targets_for(channel) -> list:
-    if isinstance(channel, discord.Thread):
-        table, col = "thread_relays", _LINK_COLS["thread_relays"]
-    else:
-        table, col = "text_relays", _LINK_COLS["text_relays"]
-    ids = set()
-    res = supabase.table(table).select("network_code").eq(col, channel.id).execute()
-    for row in res.data:
-        r = supabase.table(table).select(col).eq("network_code", row["network_code"]).neq(col, channel.id).execute()
-        ids.update(int(x[col]) for x in r.data)
-    return list(ids)
-
-
-def forum_targets_for(forum_id: int) -> list:
-    col = _LINK_COLS["forum_relays"]
-    ids = set()
-    res = supabase.table("forum_relays").select("network_code").eq(col, forum_id).execute()
-    for row in res.data:
-        r = supabase.table("forum_relays").select(col).eq("network_code", row["network_code"]).neq(col, forum_id).execute()
-        ids.update(int(x[col]) for x in r.data)
-    return list(ids)
-
-
 _auto_poll_forums: set = set()
 
 
@@ -663,208 +1015,211 @@ async def on_ready():
     asyncio.create_task(emu_startup())
     asyncio.create_task(radio_warm())
 
-    for guild in bot.guilds:
-        try:
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-        except Exception as e:
-            logger.error(f"Could not clear guild commands for {guild.name}: {e}")
-
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} global slash commands.")
     except Exception as e:
         logger.error(f"Failed to sync global slash commands: {e}")
 
+    if os.environ.get("SKIP_GUILD_CLEANUP", "0") != "1":
+        spawn(_cleanup_guild_commands())
+
+
+async def _cleanup_guild_commands():
+    """Remove leftover per-guild commands. Runs in the background (a few at a time) so it no longer
+    delays startup or the global command sync."""
+    sem = asyncio.Semaphore(3)
+
+    async def one(guild):
+        async with sem:
+            try:
+                bot.tree.clear_commands(guild=guild)
+                await bot.tree.sync(guild=guild)
+            except Exception as e:
+                logger.error(f"Could not clear guild commands for {guild.name}: {e}")
+
+    await asyncio.gather(*(one(g) for g in list(bot.guilds)))
+
+
+async def _mirror_copies(msg_id: int):
+    return await asyncio.to_thread(get_mirrored_targets, msg_id)
+
+
+async def _react_copy(cid: int, mid: int, emoji, add: bool, source_still_has: bool = False):
+    ch = await resolve_channel(cid)
+    if ch is None or isinstance(ch, discord.ForumChannel) or not hasattr(ch, "get_partial_message"):
+        return
+    try:
+        pm = ch.get_partial_message(mid)
+        if add:
+            await pm.add_reaction(emoji)
+        elif not source_still_has:
+            await pm.remove_reaction(emoji, bot.user)
+    except discord.HTTPException:
+        pass
+    except Exception as e:
+        logger.error(f"Failed to mirror reaction: {e}")
+
+
 @bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
-    if user.bot or is_user_banned(user.id):
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id or payload.user_id == bot.user.id or is_user_banned(payload.user_id):
         return
-
-    msg = reaction.message
-    mirrored_targets = get_mirrored_targets(msg.id)
-    if not mirrored_targets:
+    if payload.member and payload.member.bot:
         return
+    ch = bot.get_channel(payload.channel_id)
+    if ch is None or not supabase or not await relay_channels_for(ch):
+        return
+    copies = await _mirror_copies(payload.message_id)
+    if copies:
+        await asyncio.gather(*(_react_copy(c, m, payload.emoji, True) for c, m in copies))
 
-    emoji = reaction.emoji
-
-    for channel_id, target_msg_id in mirrored_targets:
-        if channel_id == msg.channel.id and target_msg_id == msg.id:
-            continue
-
-        try:
-            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-            if channel and not isinstance(channel, discord.ForumChannel):
-                target_msg = await channel.fetch_message(target_msg_id)
-                if target_msg:
-                    try:
-                        await target_msg.add_reaction(emoji)
-                    except discord.HTTPException:
-                        pass
-        except Exception as e:
-            logger.error(f"Failed to add cross-server reaction: {e}")
 
 @bot.event
-async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | discord.Member):
-    if user.bot or is_user_banned(user.id):
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if not payload.guild_id or payload.user_id == bot.user.id or is_user_banned(payload.user_id):
         return
-
-    msg = reaction.message
-    mirrored_targets = get_mirrored_targets(msg.id)
-    if not mirrored_targets:
+    ch = bot.get_channel(payload.channel_id)
+    if ch is None or not supabase or not await relay_channels_for(ch):
         return
+    copies = await _mirror_copies(payload.message_id)
+    if not copies:
+        return
+    still = False
+    try:
+        msg = await ch.fetch_message(payload.message_id)
+        still = any(str(r.emoji) == str(payload.emoji) and r.count > 0 for r in msg.reactions)
+    except Exception:
+        return
+    if not still:
+        await asyncio.gather(*(_react_copy(c, m, payload.emoji, False, False) for c, m in copies))
 
-    emoji = reaction.emoji
 
-    for channel_id, target_msg_id in mirrored_targets:
-        if channel_id == msg.channel.id and target_msg_id == msg.id:
-            continue
+async def _edit_copy(cid: int, mid: int, content: str):
+    ch = await resolve_channel(cid)
+    if ch is None:
+        return
+    wh = await get_or_create_webhook(ch)
+    if wh is None:
+        return
+    try:
+        await wh.edit_message(mid, content=content, allowed_mentions=discord.AllowedMentions.none(), **_thread_kw(ch))
+    except Exception as e:
+        logger.warning(f"Could not sync edit to {cid}/{mid}: {e}")
 
-        try:
-            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-            if channel and not isinstance(channel, discord.ForumChannel):
-                target_msg = await channel.fetch_message(target_msg_id)
-                if target_msg:
-                    source_count = 0
-                    for r in msg.reactions:
-                        if str(r.emoji) == str(emoji):
-                            source_count = r.count
-                            break
 
-                    if source_count == 0:
-                        try:
-                            await target_msg.remove_reaction(emoji, bot.user)
-                        except discord.HTTPException:
-                            pass
-        except Exception as e:
-            logger.error(f"Failed to remove cross-server reaction: {e}")
+async def _delete_copy(cid: int, mid: int):
+    ch = await resolve_channel(cid)
+    if ch is None:
+        return
+    wh = await get_or_create_webhook(ch)
+    if wh is None:
+        return
+    try:
+        await wh.delete_message(mid, **_thread_kw(ch))
+    except discord.NotFound:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not sync delete to {cid}/{mid}: {e}")
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    if not RELAY_SYNC_EDITS or not payload.guild_id or not supabase:
+        return
+    data = payload.data or {}
+    if "content" not in data or data.get("webhook_id") or (data.get("author") or {}).get("bot"):
+        return
+    new_content = data["content"] or ""
+    cached = payload.cached_message
+    if cached is not None and cached.content == new_content:
+        return                                           # embed/link-preview refresh, not a real edit
+    if payload.message_id in _chunked_sources or len(new_content) > 2000:
+        return
+    ch = bot.get_channel(payload.channel_id)
+    if ch is None or not await relay_channels_for(ch):
+        return
+    root, rows = await asyncio.to_thread(get_mirror_rows, payload.message_id)
+    if root != payload.message_id:
+        return                                           # only the original drives edits
+    text = (_reply_prefixes.get(payload.message_id, "") + new_content).strip("\n")[:2000]
+    copies = [(c, m) for c, m in rows if m != root and c != m]
+    if text and copies:
+        await asyncio.gather(*(_edit_copy(c, m, text) for c, m in copies))
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if not RELAY_SYNC_DELETES or not payload.guild_id or not supabase:
+        return
+    ch = bot.get_channel(payload.channel_id)
+    if ch is None or not await relay_channels_for(ch):
+        return
+    root, rows = await asyncio.to_thread(get_mirror_rows, payload.message_id)
+    if root != payload.message_id:
+        return                                           # deleting a copy never cascades
+    copies = [(c, m) for c, m in rows if m != root and c != m]
+    if copies:
+        await asyncio.gather(*(_delete_copy(c, m) for c, m in copies))
 
 async def _relay_new_forum_post(thread: discord.Thread):
     copies = []
-    if not isinstance(thread.parent, discord.ForumChannel):
+    if not isinstance(thread.parent, discord.ForumChannel) or thread.id in RELAYED_THREAD_IDS or not supabase:
         return None, copies
 
-    if thread.id in RELAYED_THREAD_IDS:
+    starter_message = None
+    for delay in (0, 0.5, 1.0):          # starter message usually exists immediately; don't always wait
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async for msg in thread.history(limit=1, oldest_first=True):
+                starter_message = msg
+                break
+        except Exception:
+            pass
+        if starter_message:
+            break
+    if not starter_message:
         return None, copies
 
-    current_forum_id = thread.parent.id
-
-    if not supabase:
+    if is_user_banned(starter_message.author.id):
+        return None, copies
+    if starter_message.webhook_id or starter_message.author.bot:   # our own relayed copy
+        RELAYED_THREAD_IDS.add(thread.id)
         return None, copies
 
     try:
-        await asyncio.sleep(1.0)
-        try:
-            webhooks = await thread.parent.webhooks()
-            webhook_ids = {wh.id for wh in webhooks}
-        except Exception:
-            webhook_ids = set()
-
-        starter_message = None
-        async for msg in thread.history(limit=1, oldest_first=True):
-            starter_message = msg
-            break
-
-        if starter_message:
-            if is_user_banned(starter_message.author.id):
-                return None, copies
-            if (starter_message.webhook_id and starter_message.webhook_id in webhook_ids) or starter_message.author.bot:
-                RELAYED_THREAD_IDS.add(thread.id)
-                return None, copies
-
-        if not starter_message:
-            return None, copies
-
-        res = supabase.table("forum_relays").select("network_code").eq("forum_channel_id", current_forum_id).execute()
-        codes = [row["network_code"] for row in res.data]
-        if not codes:
-            return starter_message, copies
-
-        target_forum_ids = []
-        for code in codes:
-            f_res = supabase.table("forum_relays").select("forum_channel_id").eq("network_code", code).neq("forum_channel_id", current_forum_id).execute()
-            target_forum_ids.extend([row["forum_channel_id"] for row in f_res.data])
+        target_forum_ids = await get_targets("forum_relays", thread.parent.id)
     except Exception as e:
         logger.error(f"Database error in on_thread_create: {e}")
         return starter_message, copies
-
-    target_forum_ids = list(set(target_forum_ids))
-    if not target_forum_ids:
+    targets = [f for f in (bot.get_channel(i) for i in target_forum_ids) if isinstance(f, discord.ForumChannel)]
+    if not targets:
         return starter_message, copies
 
     try:
-        author = starter_message.author
-        author_name = author.display_name
-        guild_name = thread.guild.name
-        post_title = thread.name
-        post_body = starter_message.content or ""
-
-        webhook_username = f"{author_name} [{guild_name}]"
-        if len(webhook_username) > 80:
-            webhook_username = webhook_username[:80]
-
-        avatar_url = author.display_avatar.url
-
-        files = []
-        skipped_files = []
-        MAX_FILE_SIZE = 10 * 1024 * 1024
-
-        if starter_message.attachments:
-            for attachment in starter_message.attachments:
-                if attachment.size > MAX_FILE_SIZE:
-                    skipped_files.append(attachment.filename)
-                    continue
-                try:
-                    file_bytes = await attachment.read()
-                    fp = io.BytesIO(file_bytes)
-                    fp.seek(0)
-                    file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
-                    files.append(file_obj)
-                except Exception as e:
-                    logger.error(f"Failed to process attachment: {e}")
-
-        if skipped_files:
-            skip_notice = f"\n*⚠ [Skipped oversized file(s)]*"
-            post_body += skip_notice
-
-        send_kwargs = {
-            "username": webhook_username,
-            "avatar_url": avatar_url,
-            "allowed_mentions": discord.AllowedMentions.none(),
-            "thread_name": post_title[:100],
-            "wait": True
-        }
-
-        if post_body:
-            send_kwargs["content"] = post_body
-
-        if starter_message.embeds:
-            send_kwargs["embeds"] = starter_message.embeds
-
-        if files:
-            send_kwargs["files"] = files
-
-        if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
-            send_kwargs["content"] = f"*[Forum Post: {post_title}]*"
-
-        for fid in target_forum_ids:
-            target_forum = bot.get_channel(fid)
-            if target_forum and isinstance(target_forum, discord.ForumChannel):
-                webhook = await get_or_create_webhook(target_forum)
-                if webhook:
-                    try:
-                        sent_msg = await webhook.send(**send_kwargs)
-                        if sent_msg:
-                            if isinstance(sent_msg.channel, discord.Thread):
-                                RELAYED_THREAD_IDS.add(sent_msg.channel.id)
-                                copies.append(sent_msg.channel)
-                            elif sent_msg.thread:
-                                RELAYED_THREAD_IDS.add(sent_msg.thread.id)
-                                copies.append(sent_msg.thread)
-                                
-                            register_message_mapping(starter_message.id, target_forum.id, sent_msg.id)
-                    except Exception as e:
-                        logger.error(f"Error relaying forum post: {e}")
+        payload = await build_relay_payload(starter_message, with_reply=False)
+        if not payload.content and not payload.embeds and not payload.attachments:
+            payload.content = f"*[Forum Post: {thread.name}]*"
+        results = await asyncio.gather(*(relay_to_target(f, payload, thread_name=thread.name) for f in targets),
+                                       return_exceptions=True)
+        sent = []
+        for _forum, r in zip(targets, results):
+            if not r or isinstance(r, Exception):
+                continue
+            t = r.channel if isinstance(r.channel, discord.Thread) else getattr(r, "thread", None)
+            if t is None:
+                continue
+            RELAYED_THREAD_IDS.add(t.id)
+            copies.append(t)
+            sent.append((t, r))
+        group = [thread] + copies
+        for x in group:
+            for y in group:
+                if x.id != y.id:
+                    _thread_pairs.setdefault(x.id, set()).add(y.id)
+        if sent:
+            schedule_mapping(starter_message.id, thread.id, sent)
     except Exception as e:
         logger.error(f"Failed to relay new forum post: {e}")
     return starter_message, copies
@@ -1260,151 +1615,24 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    current_channel = message.channel
-    is_thread = isinstance(current_channel, discord.Thread)
-    is_forum_thread = is_thread and isinstance(current_channel.parent, discord.ForumChannel)
-
-    target_channel_ids = []
-    target_thread_ids = []
+    if not supabase:
+        return
+    if not (message.content or message.attachments or message.embeds or message.stickers
+            or getattr(message, "message_snapshots", None)):
+        return
 
     try:
-        if is_forum_thread:
-            current_forum_id = current_channel.parent.id
-            res = supabase.table("forum_relays").select("network_code").eq("forum_channel_id", current_forum_id).execute()
-            codes = [row["network_code"] for row in res.data]
-            if not codes:
-                return
-            for code in codes:
-                f_res = supabase.table("forum_relays").select("forum_channel_id").eq("network_code", code).neq("forum_channel_id", current_forum_id).execute()
-                forum_ids = [row["forum_channel_id"] for row in f_res.data]
-                for fid in forum_ids:
-                    f_ch = bot.get_channel(fid)
-                    if f_ch and isinstance(f_ch, discord.ForumChannel):
-                        for active_thread in f_ch.threads:
-                            if active_thread.name.lower() == current_channel.name.lower():
-                                target_thread_ids.append(active_thread.id)
-        elif is_thread:
-            res = supabase.table("thread_relays").select("network_code").eq("thread_id", current_channel.id).execute()
-            codes = [row["network_code"] for row in res.data]
-            if not codes:
-                return
-            for code in codes:
-                t_res = supabase.table("thread_relays").select("thread_id").eq("network_code", code).neq("thread_id", current_channel.id).execute()
-                target_thread_ids.extend([row["thread_id"] for row in t_res.data])
-        else:
-            res = supabase.table("text_relays").select("network_code").eq("channel_id", current_channel.id).execute()
-            codes = [row["network_code"] for row in res.data]
-            
-            if not codes:
-                return
-
-            for code in codes:
-                c_res = supabase.table("text_relays").select("channel_id").eq("network_code", code).neq("channel_id", current_channel.id).execute()
-                target_channel_ids.extend([row["channel_id"] for row in c_res.data])
+        targets = await relay_channels_for(message.channel)
     except Exception as e:
         logger.error(f"Database query error in on_message: {e}")
         return
-
-    target_channel_ids = list(set(target_channel_ids))
-    target_thread_ids = list(set(target_thread_ids))
-
-    if not target_channel_ids and not target_thread_ids:
+    if not targets:
         return
 
-    author_name = message.author.display_name
-    guild_name = message.guild.name
-
-    webhook_username = f"{author_name} [{guild_name}]"
-    if len(webhook_username) > 80:
-        webhook_username = webhook_username[:80]
-
-    raw_content = message.content or ""
-    reply_prefix = ""
-    if message.reference and message.reference.message_id:
-        try:
-            ref_msg = await current_channel.fetch_message(message.reference.message_id)
-            if ref_msg:
-                snippet = ref_msg.content[:60] + "..." if len(ref_msg.content) > 60 else ref_msg.content
-                if not snippet and ref_msg.attachments:
-                    snippet = "[Attachment]"
-                reply_prefix = f"> ↩ **Replying to {ref_msg.author.display_name}:** *{snippet or '[Embed/Sticker]'}*\n"
-        except Exception:
-            pass
-
-    final_content = f"{reply_prefix}{raw_content}".strip()
-
-    send_kwargs = {
-        "username": webhook_username,
-        "avatar_url": message.author.display_avatar.url,
-        "allowed_mentions": discord.AllowedMentions.none(),
-        "wait": True
-    }
-
-    if final_content:
-        send_kwargs["content"] = final_content
-
-    if message.embeds:
-        send_kwargs["embeds"] = message.embeds
-
-    files = []
-    skipped_files = []
-    MAX_FILE_SIZE = 10 * 1024 * 1024
-
-    if message.attachments:
-        for attachment in message.attachments:
-            if attachment.size > MAX_FILE_SIZE:
-                skipped_files.append(attachment.filename)
-                continue
-            try:
-                file_bytes = await attachment.read()
-                fp = io.BytesIO(file_bytes)
-                fp.seek(0)
-                file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
-                files.append(file_obj)
-            except Exception as e:
-                logger.error(f"Failed to process attachment: {e}")
-
-    if skipped_files:
-        skip_notice = f"\n*⚠ [Skipped oversized file(s)]*"
-        if "content" in send_kwargs:
-            send_kwargs["content"] += skip_notice
-        else:
-            send_kwargs["content"] = skip_notice.strip()
-
-    if files:
-        send_kwargs["files"] = files
-
-    if "content" not in send_kwargs and "embeds" not in send_kwargs and "files" not in send_kwargs:
-        if message.stickers:
-            send_kwargs["content"] = f"*[Sticker: {message.stickers[0].name}]*"
-        else:
-            return
-
-    if target_thread_ids:
-        for tid in target_thread_ids:
-            t_channel = bot.get_channel(tid)
-            if t_channel and isinstance(t_channel, discord.Thread):
-                webhook = await get_or_create_webhook(t_channel)
-                if webhook:
-                    try:
-                        sent_msg = await webhook.send(thread=t_channel, **send_kwargs)
-                        if sent_msg:
-                            register_message_mapping(message.id, t_channel.id, sent_msg.id)
-                    except Exception as e:
-                        logger.error(f"Error relaying thread message: {e}")
-
-    if target_channel_ids:
-        for target_id in target_channel_ids:
-            target_channel = bot.get_channel(target_id)
-            if target_channel and isinstance(target_channel, discord.TextChannel):
-                webhook = await get_or_create_webhook(target_channel)
-                if webhook:
-                    try:
-                        sent_msg = await webhook.send(**send_kwargs)
-                        if sent_msg:
-                            register_message_mapping(message.id, target_channel.id, sent_msg.id)
-                    except Exception as e:
-                        logger.error(f"Error relaying message: {e}")
+    payload = await build_relay_payload(message)
+    sent = await relay_payload(payload, targets)
+    if sent:
+        schedule_mapping(message.id, message.channel.id, sent)
 
 # ------------------------------------------------------------------------------
 # SLASH COMMANDS
@@ -1910,7 +2138,7 @@ async def play(interaction: discord.Interaction, search: str):
 
         if not entries:
             try:
-                for item in google_search(f"{search} site:youtube.com/watch", num_results=5):
+                for item in await asyncio.to_thread(google_search, f"{search} site:youtube.com/watch", 5):
                     url = item.get("href", "")
                     if "youtube.com/watch" in url:
                         entries.append({'title': item.get("title", 'YouTube Video Result'), 'uploader': 'Google Search', 'webpage_url': url})
@@ -2743,19 +2971,26 @@ async def emu_stop(interaction: discord.Interaction):
 # ------------------------------------------------------------------------------
 # RADIO: MULTI-SOURCE ADAPTER LAYER & FREQUENCY LOOKUP
 # ------------------------------------------------------------------------------
-RADIO_HOSTS = [h.strip() for h in os.environ.get(
-    "RADIO_HOSTS", "de1.api.radio-browser.info,de2.api.radio-browser.info,fi1.api.radio-browser.info"
-).split(",") if h.strip()]
-RADIO_UA = "LUX-NET-Bridge/1.0 (Discord bot)"
+# Every source (Radio Browser, SomaFM, Radio Garden, Wikidata, FCC file) is a small adapter that
+# returns stations in ONE common dict format. Results are merged, de-duplicated (same stream URL, or
+# same name + country), ranked, and shown with their source. A source that errors out or changes its
+# API is skipped (circuit breaker) and the others keep working.
+RADIO_DEFAULT_HOSTS = "de1.api.radio-browser.info,de2.api.radio-browser.info,fi1.api.radio-browser.info,at1.api.radio-browser.info,nl1.api.radio-browser.info"
+RADIO_HOSTS = [h.strip() for h in os.environ.get("RADIO_HOSTS", RADIO_DEFAULT_HOSTS).split(",") if h.strip()]
+RADIO_UA = "LUX-NET-Bridge/2.0 (Discord bot; radio directory client)"
 RADIO_PROXY_MAX = int(os.environ.get("RADIO_PROXY_MAX", "6"))
-RADIO_LIST_LIMIT = 300
+RADIO_GARDEN_ON = os.environ.get("RADIO_GARDEN", "1") == "1"        # unofficial API: optional
+RADIO_WIKIDATA_ON = os.environ.get("RADIO_WIKIDATA", "1") == "1"
+RADIO_FCC_FILE = os.environ.get("FCC_FM_FILE", "").strip()           # CSV: callsign,frequency,city,state
 
 radio_sessions: dict = {}
 _radio_cache: dict = {}
-_radio_urls: dict = {}
+_radio_by_id: OrderedDict = OrderedDict()     # station id -> station dict (lets menus/autocomplete refer to ids)
 _radio_http = None
 _radio_proxy_active = 0
-_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+_radio_hosts_cache = {"hosts": None, "at": 0.0}
+_cc_names: dict = {}
+_src_health: dict = {}
 
 
 async def radio_http():
@@ -2770,6 +3005,263 @@ async def radio_shutdown():
         await _radio_http.close()
 
 
+async def http_json(url: str, params: dict = None, headers: dict = None, timeout: float = 8, ttl: int = 0):
+    key = url + "?" + json.dumps(params or {}, sort_keys=True)
+    now = time.monotonic()
+    hit = _radio_cache.get(key)
+    if ttl and hit and hit[0] > now:
+        return hit[1]
+    session = await radio_http()
+    async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}")
+        data = await r.json(content_type=None)
+    if ttl:
+        _radio_cache[key] = (now + ttl, data)
+        if len(_radio_cache) > 600:
+            for k in list(_radio_cache)[:200]:
+                _radio_cache.pop(k, None)
+    return data
+
+
+# ---------------------------------------------------------------- source health (circuit breaker)
+def _health(name: str) -> dict:
+    return _src_health.setdefault(name, {"fails": 0, "until": 0.0, "err": "", "ok": 0})
+
+
+async def run_source(name: str, factory, timeout: float, track: bool = True) -> list:
+    h = _health(name)
+    if time.monotonic() < h["until"]:
+        return []
+    try:
+        res = await asyncio.wait_for(factory(), timeout)
+        if track:
+            h["fails"] = 0
+            h["ok"] += 1
+        return res or []
+    except Exception as e:
+        if track:
+            h["fails"] += 1
+            h["err"] = f"{type(e).__name__}: {e}"[:120]
+            if h["fails"] >= 3:
+                h["until"] = time.monotonic() + 300     # skip this source for 5 minutes
+                logger.warning(f"Radio source '{name}' disabled for 5 min: {h['err']}")
+        return []
+
+
+# ---------------------------------------------------------------- frequency parsing
+_RE_FM_DEC = re.compile(r"(?<![\d.,])(\d{2,3})[.,](\d{1,2})(?!\d|\s*(?:k|kb|kbps|%))", re.I)
+_RE_FM_INT = re.compile(r"(?<![\d.,])(\d{2,3})\s*(?:fm|mhz|f\.m\.)(?![a-z])", re.I)
+_RE_FM_PRE = re.compile(r"\bfm\s*(\d{2,3})(?:[.,](\d{1,2}))?(?!\d)", re.I)
+_RE_AM = re.compile(r"(?<![\d.,])(\d{3,4})\s*(?:am|khz)(?![a-z])|\bam\s*(\d{3,4})(?!\d)", re.I)
+_RE_FREQ_Q = re.compile(r"^\s*(am|fm)?\s*(\d{2,4}(?:[.,]\d{1,2})?)\s*(fm|mhz|am|khz)?\s*$", re.I)
+
+
+def _fm_ok(v: float) -> bool:
+    return 64.0 <= v <= 108.0
+
+
+def extract_frequencies(name: str, tags: str = "") -> dict:
+    """Frequencies written in a station's name/tags -> {(band, value): 'name'}."""
+    text = f"{name} {tags}"
+    out = {}
+    for m in _RE_FM_DEC.finditer(text):
+        v = float(f"{m.group(1)}.{m.group(2)}")
+        if _fm_ok(v):
+            out[("FM", round(v, 2))] = "name"
+    for m in _RE_FM_INT.finditer(text):
+        v = float(m.group(1))
+        if _fm_ok(v):
+            out[("FM", v)] = "name"
+    for m in _RE_FM_PRE.finditer(text):
+        v = float(f"{m.group(1)}.{m.group(2) or 0}")
+        if _fm_ok(v):
+            out[("FM", round(v, 2))] = "name"
+    for m in _RE_AM.finditer(text):
+        v = float(m.group(1) or m.group(2))
+        if 500 <= v <= 1800:
+            out[("AM", v)] = "name"
+    return out
+
+
+def parse_frequency(text: str):
+    """'101.1', '101.1 FM', 'FM 101,1', '1010 AM' -> ('FM', 101.1) / ('AM', 1010.0); None if not a frequency."""
+    m = _RE_FREQ_Q.match(text or "")
+    if not m:
+        return None
+    pre, num, unit = (m.group(1) or "").lower(), m.group(2), (m.group(3) or "").lower()
+    has_dec = bool(re.search(r"[.,]", num))
+    val = float(num.replace(",", "."))
+    if "am" in (pre, unit) or unit == "khz":
+        band = "AM"
+    elif "fm" in (pre, unit) or unit == "mhz":
+        band = "FM"
+    elif _fm_ok(val):
+        band = "FM"
+    elif 500 <= val <= 1800 and not has_dec:
+        band = "AM"
+    else:
+        return None
+    if band == "FM" and not _fm_ok(val):
+        return None
+    if band == "AM" and not (500 <= val <= 1800):
+        return None
+    return band, round(val, 2)
+
+
+def fmt_freq(band: str, val: float) -> str:
+    return f"{val:g} FM" if band == "FM" else f"{int(val)} AM"
+
+
+def freq_match(st: dict, band: str, val: float) -> bool:
+    tol = 0.011 if band == "FM" else 0.5
+    return any(b == band and abs(v - val) < tol for (b, v) in st["freq_ev"])
+
+
+def freq_query_variants(band: str, val: float) -> list:
+    if band == "FM":
+        if abs(val - round(val)) < 1e-9:
+            n = int(round(val))
+            return [f"{n} fm", f"fm {n}", f"{n}.0"]
+        out = [f"{val:.1f}"] if abs(val * 10 - round(val * 10)) < 1e-9 else [f"{val:.2f}"]
+        return out
+    n = int(val)
+    return [f"{n} am", f"am {n}", f"{n} khz"]
+
+
+# ---------------------------------------------------------------- common station format
+def _norm_name(n: str) -> str:
+    n = re.sub(r"[^a-z0-9]+", " ", (n or "").lower())
+    drop = {"radio", "fm", "am", "online", "live", "the", "stream", "hq", "mp3", "aac", "hd", "web"}
+    return " ".join(t for t in n.split() if t not in drop)
+
+
+def _norm_url(u: str) -> str:
+    u = (u or "").strip().lower()
+    u = re.sub(r"^https?://", "", u).split("#")[0].split("?")[0]
+    return u.rstrip("/")
+
+
+def mk_station(*, id: str, name: str, url: str, source: str, cc: str = "", country: str = "", city: str = "",
+               tags: str = "", votes: int = 0, codec: str = "", bitrate: int = 0, favicon: str = "",
+               hls=None, freq_ev: dict = None, alts: list = None) -> dict:
+    url = (url or "").strip()
+    name = (name or "Unknown").strip()[:80]
+    if hls is None:
+        hls = ".m3u8" in url.lower().split("?")[0]
+    ev = dict(freq_ev) if freq_ev is not None else extract_frequencies(name, tags)
+    return {
+        "id": id, "name": name, "url": url, "alts": list(alts or []), "source": source, "sources": [source],
+        "cc": (cc or "").upper(), "country": country or "", "city": city or "", "tags": (tags or "")[:60],
+        "votes": int(votes or 0), "codec": codec or "", "bitrate": int(bitrate or 0),
+        "favicon": favicon if (favicon or "").startswith("https://") else "", "hls": bool(hls),
+        "freq_ev": ev, "score": 0.0,
+    }
+
+
+def radio_register(st: dict) -> dict:
+    _radio_by_id[st["id"]] = st
+    _radio_by_id.move_to_end(st["id"])
+    while len(_radio_by_id) > 4000:
+        _radio_by_id.popitem(last=False)
+    return st
+
+
+def merge_stations(stations: list) -> list:
+    """De-duplicate: same stream URL, or same normalised name + country. Alternate URLs are kept as fallbacks."""
+    idx, by_name, out = {}, {}, []
+    for st in stations:
+        ukey = ("u", _norm_url(st["url"]))
+        nn = _norm_name(st["name"])
+        ex = idx.get(ukey)
+        if ex is None and nn:        # same name + same country (an unknown country matches any)
+            ex = next((c for c in by_name.get(nn, []) if not c["cc"] or not st["cc"] or c["cc"] == st["cc"]), None)
+        if ex is None:
+            out.append(st)
+            idx[ukey] = st
+            if nn:
+                by_name.setdefault(nn, []).append(st)
+            continue
+        idx.setdefault(ukey, ex)
+        if not ex["cc"] and st["cc"]:
+            ex["cc"] = st["cc"]
+        if _norm_url(st["url"]) != _norm_url(ex["url"]) and st["url"] not in ex["alts"]:
+            ex["alts"].append(st["url"])
+        for a in st["alts"]:
+            if a not in ex["alts"] and a != ex["url"]:
+                ex["alts"].append(a)
+        for s in st["sources"]:
+            if s not in ex["sources"]:
+                ex["sources"].append(s)
+        for f, e in st["freq_ev"].items():
+            if f not in ex["freq_ev"] or e != "name":
+                ex["freq_ev"][f] = e if e != "name" else ex["freq_ev"].get(f, "name")
+        for fld in ("favicon", "city", "country", "tags", "codec"):
+            if not ex[fld] and st[fld]:
+                ex[fld] = st[fld]
+        ex["votes"] = max(ex["votes"], st["votes"])
+        ex["bitrate"] = max(ex["bitrate"], st["bitrate"])
+    for st in out:
+        st["alts"] = st["alts"][:4]
+    return out
+
+
+_EVIDENCE_WEIGHT = {"name": 0.0, "Wikidata": 6.0, "FCC": 8.0}
+_SOURCE_WEIGHT = {"SomaFM": 3.0, "Radio Browser": 0.0, "Radio Garden": -1.0}
+
+
+def rank_stations(stations: list, query: str = "", freq=None, city: str = None) -> list:
+    qn = _norm_name(query)
+    qtok = set(qn.split())
+    cl = (city or "").lower().strip()
+    for st in stations:
+        s = math.log1p(st["votes"])
+        nn = _norm_name(st["name"])
+        if qn:
+            if nn == qn:
+                s += 15
+            elif qn in nn:
+                s += 8
+            if qtok:
+                s += 5 * len(qtok & set(nn.split())) / len(qtok)
+        if freq:
+            band, val = freq
+            tol = 0.011 if band == "FM" else 0.5
+            for (b, v), ev in st["freq_ev"].items():
+                if b == band and abs(v - val) < tol:
+                    s += 40 + _EVIDENCE_WEIGHT.get(ev, 0.0)
+                    break
+        if cl and (cl in st["city"].lower() or cl in st["name"].lower() or cl in st["tags"].lower()):
+            s += 10
+        s += max((_SOURCE_WEIGHT.get(x, 0.0) for x in st["sources"]), default=0.0)
+        s += 2.0 * (len(st["sources"]) - 1)
+        if st["url"].startswith("https://"):
+            s += 1
+        if st["bitrate"] >= 64:
+            s += 1
+        st["score"] = s
+    stations.sort(key=lambda x: x["score"], reverse=True)
+    return stations
+
+
+# ---------------------------------------------------------------- source: Radio Browser
+async def radio_hosts() -> list:
+    now = time.monotonic()
+    if _radio_hosts_cache["hosts"] and now - _radio_hosts_cache["at"] < 21600:
+        return _radio_hosts_cache["hosts"]
+    hosts = list(RADIO_HOSTS)
+    try:
+        data = await http_json("https://all.api.radio-browser.info/json/servers", timeout=5)
+        for item in data:
+            n = (item.get("name") or "").strip()
+            if n and n not in hosts:
+                hosts.append(n)
+    except Exception:
+        pass
+    _radio_hosts_cache.update(hosts=hosts, at=now)
+    return hosts
+
+
 async def radio_api(path: str, params: dict = None, ttl: int = 900):
     key = path + "?" + json.dumps(params or {}, sort_keys=True)
     now = time.monotonic()
@@ -2777,13 +3269,13 @@ async def radio_api(path: str, params: dict = None, ttl: int = 900):
     if hit and hit[0] > now:
         return hit[1]
     session = await radio_http()
-    hosts = RADIO_HOSTS[:]
+    hosts = (await radio_hosts())[:]
     random.shuffle(hosts)
     last = None
-    for host in hosts:
+    for host in hosts[:4]:
         try:
             async with session.get(f"https://{host}/json/{path}", params=params,
-                                   timeout=aiohttp.ClientTimeout(total=8)) as r:
+                                   timeout=aiohttp.ClientTimeout(total=6)) as r:
                 if r.status != 200:
                     last = f"{host}: HTTP {r.status}"
                     continue
@@ -2797,158 +3289,287 @@ async def radio_api(path: str, params: dict = None, ttl: int = 900):
     raise RuntimeError(f"radio directory unavailable ({last})")
 
 
-def radio_norm(s: dict):
+def rb_norm(s: dict):
     url = (s.get("url_resolved") or s.get("url") or "").strip()
     uid = s.get("stationuuid")
-    if not uid or not url.startswith(("http://", "https://")) or s.get("hls") == 1:
+    if not uid or not url.startswith(("http://", "https://")):
         return None
-    _radio_urls[uid] = url
-    icon = (s.get("favicon") or "").strip()
+    return mk_station(
+        id=f"rb:{uid}", name=s.get("name") or "Unknown", url=url, source="Radio Browser",
+        cc=s.get("countrycode") or "", country=s.get("country") or "", city=s.get("state") or "",
+        tags=s.get("tags") or "", votes=s.get("votes") or 0, codec=s.get("codec") or "",
+        bitrate=s.get("bitrate") or 0, favicon=(s.get("favicon") or "").strip(),
+        hls=True if s.get("hls") == 1 else None,
+    )
 
-    def num(v):
-        try:
-            f = float(v)
-            return f if f == f else None
-        except (TypeError, ValueError):
-            return None
 
-    lat, lng = num(s.get("geo_lat")), num(s.get("geo_long"))
-    return {
-        "id": uid,
-        "name": (s.get("name") or "Unknown").strip()[:80],
-        "cc": s.get("countrycode") or "",
-        "country": s.get("country") or "",
-        "tags": (s.get("tags") or "")[:60],
-        "votes": int(s.get("votes") or 0),
-        "codec": s.get("codec") or "",
-        "bitrate": int(s.get("bitrate") or 0),
-        "favicon": icon if icon.startswith("https://") else "",
-        "lat": lat, "lng": lng,
-        "url": url,
-    }
+async def src_rb_name(q: str, cc: str = None, limit: int = 60) -> list:
+    params = {"name": q, "hidebroken": "true", "order": "votes", "reverse": "true", "limit": limit}
+    if cc:
+        params["countrycode"] = cc
+    data = await radio_api("stations/search", params, ttl=300)
+    return [x for x in map(rb_norm, data) if x]
+
+
+async def src_rb_tag(tag: str, cc: str = None, limit: int = 40) -> list:
+    params = {"tag": tag, "hidebroken": "true", "order": "votes", "reverse": "true", "limit": limit}
+    if cc:
+        params["countrycode"] = cc
+    data = await radio_api("stations/search", params, ttl=300)
+    return [x for x in map(rb_norm, data) if x]
 
 
 async def radio_countries() -> list:
     data = await radio_api("countries", {"hidebroken": "true", "order": "name"}, ttl=3600)
-    out = [{"cc": c["iso_3166_1"], "name": c["name"], "count": int(c.get("stationcount") or 0)}
-           for c in data if c.get("iso_3166_1") and c.get("stationcount")]
-    return sorted(out, key=lambda c: c["name"].lower())
+    out = []
+    for c in data:
+        cc = (c.get("iso_3166_1") or "").upper()
+        if cc and (c.get("stationcount") or 0) > 0:
+            out.append({"name": c.get("name") or cc, "cc": cc, "count": int(c.get("stationcount") or 0)})
+            _cc_names[cc] = c.get("name") or cc
+    return out
 
 
-async def radio_stations(cc: str = None, q: str = None, limit: int = RADIO_LIST_LIMIT) -> list:
-    params = {"hidebroken": "true", "order": "votes", "reverse": "true", "limit": limit}
-    if cc:
-        params["countrycode"] = cc.upper()
-    if q:
-        params["name"] = q
-    data = await radio_api("stations/search", params, ttl=900 if cc else 300)
-    return [s for s in (radio_norm(x) for x in data) if s]
+_ALL_WORDS = {"", "all", "any", "world", "worldwide", "global", "everywhere", "all countries"}
 
 
-async def fetch_somafm_stations() -> list:
-    stations = []
+async def resolve_cc(text: str | None):
+    """Country text -> ISO code. None = worldwide. Accepts codes ('GB'), names ('united kingdom'), 'ALL'."""
+    t = (text or "").replace("\U0001F30D", "").strip()
+    if t.lower() in _ALL_WORDS:
+        return None
+    if len(t) == 2 and t.isalpha():
+        return t.upper()
     try:
-        session = await radio_http()
-        async with session.get("https://somafm.com/channels.json", timeout=8) as r:
-            if r.status == 200:
-                data = await r.json()
-                for ch in data.get("channels", []):
-                    fastest_stream = next((s for s in ch.get("playlists", []) if "mp3" in s.get("format", "") and "highest" in s.get("quality", "")), None)
-                    if not fastest_stream and ch.get("playlists"):
-                        fastest_stream = ch.get("playlists")[0]
-                    stream_url = fastest_stream.get("url") if fastest_stream else None
-                    if stream_url:
-                        stations.append({
-                            "id": f"somafm-{ch.get('id')}",
-                            "name": ch.get("title", "SomaFM Station"),
-                            "cc": "US",
-                            "country": "United States",
-                            "tags": ", ".join(ch.get("genres", [])),
-                            "votes": ch.get("listeners", 100),
-                            "codec": "MP3",
-                            "bitrate": 128,
-                            "favicon": ch.get("image", ""),
-                            "url": stream_url,
-                            "source": "SomaFM",
-                            "frequency": None
-                        })
-    except Exception as e:
-        logger.warning(f"SomaFM fetch error: {e}")
-    return stations
-
-
-def extract_frequency(name: str, tags: str) -> float | None:
-    text = f"{name} {tags}"
-    match = re.search(r'\b(8[7-9]\.\d|9\d\.\d|10[0-7]\.\d)\s*(?:MHz|FM)?\b', text, re.IGNORECASE)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            pass
+        countries = await radio_countries()
+    except Exception:
+        return None
+    tl = t.lower()
+    for c in countries:
+        if c["name"].lower() == tl:
+            return c["cc"]
+    for c in countries:
+        if tl in c["name"].lower():
+            return c["cc"]
     return None
 
 
-async def multi_source_search(cc: str = None, q: str = None, frequency: float = None) -> list:
-    raw_stations = []
-    
-    try:
-        rb_data = await radio_stations(cc=cc, q=q, limit=150)
-        for s in rb_data:
-            s["source"] = "Radio Browser"
-            s["frequency"] = extract_frequency(s["name"], s["tags"])
-            raw_stations.append(s)
-    except Exception as e:
-        logger.warning(f"Radio Browser source skipped: {e}")
-
-    if not cc or cc.upper() == "US":
-        soma_data = await fetch_somafm_stations()
-        for s in soma_data:
-            s["frequency"] = extract_frequency(s["name"], s["tags"])
-            raw_stations.append(s)
-
-    seen_urls = set()
-    seen_names = set()
-    deduped = []
-
-    for s in raw_stations:
-        url = s.get("url")
-        norm_name = re.sub(r'\W+', '', s.get("name", "")).lower()
-        if url in seen_urls or norm_name in seen_names:
+# ---------------------------------------------------------------- source: SomaFM (official public API)
+async def src_somafm(q: str, cc: str = None) -> list:
+    if cc and cc != "US":
+        return []
+    data = await http_json("https://somafm.com/channels.json", timeout=6, ttl=3600)
+    toks = [t for t in re.split(r"\W+", q.lower()) if t]
+    out = []
+    for ch in data.get("channels", []):
+        hay = f"{ch.get('title', '')} {ch.get('description', '')} {ch.get('genre', '')} somafm".lower()
+        if toks and not all(t in hay for t in toks):
             continue
-        if frequency and s.get("frequency") and abs(s["frequency"] - frequency) > 0.05:
+        cid = ch.get("id")
+        if not cid:
             continue
-        seen_urls.add(url)
-        seen_names.add(norm_name)
-        deduped.append(s)
-
-    deduped.sort(key=lambda x: x.get("votes", 0), reverse=True)
-    return deduped
-
-
-async def radio_station_info(uid: str):
-    if not _UUID_RE.match(uid or ""):
-        return None
-    data = await radio_api(f"stations/byuuid/{uid}", None, ttl=3600)
-    return radio_norm(data[0]) if data else None
+        out.append(mk_station(
+            id=f"sm:{cid}", name=f"SomaFM {ch.get('title', cid)}", url=f"https://ice1.somafm.com/{cid}-128-mp3",
+            alts=[f"https://ice2.somafm.com/{cid}-128-mp3", f"https://ice4.somafm.com/{cid}-128-mp3"],
+            source="SomaFM", cc="US", country="United States", city="San Francisco",
+            tags=(ch.get("genre") or "").replace("|", ","), votes=int(ch.get("listeners") or 0) * 5,
+            codec="MP3", bitrate=128, favicon=ch.get("image") or "", hls=False,
+        ))
+    return out
 
 
-async def radio_station_url(uid: str):
-    if not _UUID_RE.match(uid or ""):
-        return None
-    url = _radio_urls.get(uid)
-    if url:
-        return url
-    info = await radio_station_info(uid)
-    return info["url"] if info else None
+# ---------------------------------------------------------------- source: Radio Garden (unofficial)
+async def src_garden(q: str, cc: str = None) -> list:
+    data = await http_json("https://radio.garden/api/search", params={"q": q}, timeout=6, ttl=300)
+    hits = ((data.get("hits") or {}).get("hits")) or []
+    cc_name = (_cc_names.get(cc) or "").lower() if cc else ""
+    out = []
+    for h in hits:
+        src = h.get("_source") or {}
+        url = src.get("url") or ""
+        if src.get("type") not in (None, "channel") or not url.startswith("/listen/"):
+            continue
+        cid = url.rstrip("/").split("/")[-1]
+        title = src.get("title") or ""
+        sub = src.get("subtitle") or ""
+        city, _, country = sub.rpartition(",")
+        country = country.strip() or sub
+        if cc_name and country and country.lower() != cc_name:
+            continue
+        out.append(mk_station(
+            id=f"rg:{cid}", name=title, url=f"https://radio.garden/api/ara/content/listen/{cid}/channel.mp3",
+            source="Radio Garden", cc=cc or "", country=country, city=city.strip(), hls=False,
+        ))
+    return out
 
 
-async def radio_click(uid: str):
-    try:
-        await radio_api(f"url/{uid}", None, ttl=0)
-    except Exception:
-        pass
+# ---------------------------------------------------------------- source: Wikidata (frequency -> station name)
+_STOP = re.compile(r"[^a-z0-9]+")
 
 
+def _name_sim(a: str, b: str) -> float:
+    a, b = _norm_name(a), _norm_name(b)
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+async def src_wikidata_freq(val: float, cc: str = None) -> list:
+    lo, hi = int(val * 1e6 - 5000), int(val * 1e6 + 5000)
+    cc_filter = f'FILTER(!BOUND(?cc) || STR(?cc) = "{cc}")' if cc else ""
+    query = f"""SELECT ?itemLabel ?cityLabel ?cc WHERE {{
+  ?item p:P2144 ?st . ?st psn:P2144 ?v . ?v wikibase:quantityAmount ?amt .
+  FILTER(?amt >= {lo} && ?amt <= {hi})
+  ?item wdt:P31/wdt:P279* wd:Q14350 .
+  OPTIONAL {{ ?item wdt:P17 ?country . OPTIONAL {{ ?country wdt:P297 ?cc }} }}
+  OPTIONAL {{ ?item wdt:P131 ?city }}
+  {cc_filter}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}} LIMIT 25"""
+    data = await http_json("https://query.wikidata.org/sparql", params={"query": query, "format": "json"},
+                           headers={"Accept": "application/sparql-results+json"}, timeout=12, ttl=3600)
+    rows, seen = [], set()
+    for b in (data.get("results") or {}).get("bindings", []):
+        label = (b.get("itemLabel") or {}).get("value", "")
+        if not label or re.fullmatch(r"Q\d+", label) or label.lower() in seen:
+            continue
+        seen.add(label.lower())
+        rows.append((label, (b.get("cityLabel") or {}).get("value", ""), ((b.get("cc") or {}).get("value") or "").upper()))
+    rows = rows[:8]
+
+    async def resolve(label, city, rcc):
+        try:
+            cands = await src_rb_name(label, rcc or cc, 20)
+        except Exception:
+            return []
+        good = [c for c in cands if _name_sim(label, c["name"]) >= 0.6]
+        good.sort(key=lambda c: (_name_sim(label, c["name"]), c["votes"]), reverse=True)
+        for c in good[:3]:
+            c["freq_ev"][("FM", round(val, 2))] = "Wikidata"
+            if city and not c["city"]:
+                c["city"] = city
+            c["sources"] = ["Radio Browser", "Wikidata"]
+        return good[:3]
+
+    lists = await asyncio.gather(*(resolve(*r) for r in rows))
+    return [s for lst in lists for s in lst]
+
+
+# ---------------------------------------------------------------- source: FCC (US) from a local data file
+_fcc_rows = None
+
+
+def _fcc_load() -> list:
+    """Reads a CSV exported from FCC broadcast station data. Needs columns for call sign and frequency
+    (names like callsign/call_sign, frequency/freq); city/community and state are optional."""
+    global _fcc_rows
+    if _fcc_rows is not None:
+        return _fcc_rows
+    rows = []
+    with open(RADIO_FCC_FILE, newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            low = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
+            call = low.get("callsign") or low.get("call_sign") or low.get("call sign") or low.get("call")
+            fr = low.get("frequency") or low.get("freq") or low.get("frequency_mhz")
+            try:
+                fv = float(re.sub(r"[^\d.]", "", fr or ""))
+            except ValueError:
+                continue
+            if call and _fm_ok(fv):
+                rows.append((call.upper(), fv, low.get("city") or low.get("community") or low.get("community_city") or "",
+                             (low.get("state") or "").upper()))
+    _fcc_rows = rows
+    logger.info(f"FCC file loaded: {len(rows)} FM stations")
+    return rows
+
+
+async def src_fcc_freq(val: float, cc: str = None, city: str = None) -> list:
+    if not RADIO_FCC_FILE or (cc and cc != "US"):
+        return []
+    rows = await asyncio.to_thread(_fcc_load)
+    hits = [r for r in rows if abs(r[1] - val) < 0.011 and (not city or city.lower() in r[2].lower() or city.upper() == r[3])]
+    hits = hits[:10]
+
+    async def resolve(call, _fv, rcity, state):
+        base = re.sub(r"-(FM|AM|TV)$", "", call)
+        try:
+            cands = await src_rb_name(base, "US", 20)
+        except Exception:
+            return []
+        out = []
+        for c in cands:
+            if re.search(rf"\b{re.escape(base)}\b", c["name"].upper()):
+                c["freq_ev"][("FM", round(val, 2))] = "FCC"
+                c["city"] = c["city"] or f"{rcity}, {state}".strip(", ")
+                c["sources"] = ["Radio Browser", "FCC"]
+                out.append(c)
+        return out
+
+    lists = await asyncio.gather(*(resolve(*h) for h in hits))
+    return [s for lst in lists for s in lst]
+
+
+# ---------------------------------------------------------------- search entry points
+async def radio_search_all(query: str, cc: str = None, fast: bool = False, limit: int = 25) -> list:
+    query = query.strip()
+    to = 2.0 if fast else 7.0
+    track = not fast
+    jobs = [("Radio Browser", lambda: src_rb_name(query, cc, 60)), ("SomaFM", lambda: src_somafm(query, cc))]
+    if " " not in query and len(query) >= 3:
+        jobs.append(("Radio Browser", lambda: src_rb_tag(query.lower(), cc, 40)))
+    if RADIO_GARDEN_ON:
+        jobs.append(("Radio Garden", lambda: src_garden(query, cc)))
+    lists = await asyncio.gather(*(run_source(n, f, to, track) for n, f in jobs))
+    merged = merge_stations([s for lst in lists for s in lst])
+    rank_stations(merged, query=query)
+    return [radio_register(s) for s in merged[:limit]]
+
+
+async def radio_find_frequency(text: str, cc: str = None, city: str = None, fast: bool = False, limit: int = 25):
+    parsed = parse_frequency(text)
+    if not parsed:
+        return [], None
+    band, val = parsed
+    to = 2.0 if fast else 8.0
+    track = not fast
+    jobs = [("Radio Browser", (lambda q=q: src_rb_name(q, cc, 150))) for q in freq_query_variants(band, val)]
+    probe = freq_query_variants(band, val)[0]
+    if RADIO_GARDEN_ON:
+        jobs.append(("Radio Garden", lambda: src_garden(probe, cc)))
+    if not fast and band == "FM":
+        if RADIO_WIKIDATA_ON:
+            jobs.append(("Wikidata", lambda: src_wikidata_freq(val, cc)))
+        if RADIO_FCC_FILE:
+            jobs.append(("FCC", lambda: src_fcc_freq(val, cc, city)))
+    lists = await asyncio.gather(*(run_source(n, f, to, track) for n, f in jobs))
+    stations = [s for lst in lists for s in lst if freq_match(s, band, val)]
+    if cc:
+        stations = [s for s in stations if not s["cc"] or s["cc"] == cc]
+    merged = merge_stations(stations)
+    rank_stations(merged, freq=(band, val), city=city)
+    return [radio_register(s) for s in merged[:limit]], parsed
+
+
+async def radio_browse_country(cc: str = None, tag: str = None, limit: int = 300) -> list:
+    params = {"hidebroken": "true", "order": "votes", "reverse": "true", "limit": limit}
+    if cc:
+        params["countrycode"] = cc
+    if tag:
+        params["tag"] = tag
+    data = await radio_api("stations/search", params, ttl=900)
+    return [radio_register(s) for s in (rb_norm(x) for x in data) if s]
+
+
+def direct_station(url: str) -> dict:
+    u = urlparse(url)
+    label = (u.hostname or "stream") + (u.path if len(u.path) > 1 else "")
+    return radio_register(mk_station(id="url:" + uuid.uuid5(uuid.NAMESPACE_URL, url).hex, name=label[:60], url=url,
+                                     source="Direct URL", freq_ev={}))
+
+
+# ---------------------------------------------------------------- stream helpers
 async def radio_url_is_public(url: str) -> bool:
     try:
         u = urlparse(url)
@@ -2961,48 +3582,68 @@ async def radio_url_is_public(url: str) -> bool:
         return False
 
 
-async def radio_warm():
+async def resolve_stream_url(url: str) -> str:
+    """.pls / .m3u / .asx playlist -> the real stream URL. HLS (.m3u8) and plain streams pass straight through."""
+    low = url.lower().split("?")[0]
+    if not low.endswith((".pls", ".m3u", ".asx")):
+        return url
     try:
-        await radio_countries()
+        session = await radio_http()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            body = (await r.content.read(16384)).decode("utf-8", "ignore")
+        if low.endswith(".asx"):
+            m = re.search(r'href\s*=\s*["\'](https?://[^"\']+)', body, re.I)
+            return m.group(1) if m else url
+        for line in body.splitlines():
+            line = line.strip()
+            if line.lower().startswith("file") and "=" in line:
+                cand = line.split("=", 1)[1].strip()
+            else:
+                cand = line
+            if cand.lower().startswith(("http://", "https://")):
+                return cand
     except Exception as e:
-        logger.warning(f"Radio warm-up failed: {e}")
+        logger.warning(f"Could not read playlist {url}: {e}")
+    return url
 
 
-async def web_radio_page(request):
-    return web.Response(text="Radio Player Online", content_type="text/html")
+def radio_label(st: dict) -> str:
+    f = next(iter(sorted(st["freq_ev"])), None)
+    bits = [st["name"]]
+    if f:
+        bits.append(fmt_freq(*f))
+    if st["cc"]:
+        bits.append(st["cc"])
+    return " \u00b7 ".join(bits)[:100]
 
 
-async def web_radio_countries(request):
-    try:
-        data = await radio_countries()
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=502)
-    return web.json_response(data)
+def radio_describe(st: dict) -> str:
+    bits = []
+    if st["city"]:
+        bits.append(st["city"][:20])
+    if st["cc"]:
+        bits.append(st["cc"])
+    f = next(iter(sorted(st["freq_ev"])), None)
+    if f:
+        ev = st["freq_ev"][f]
+        bits.append(fmt_freq(*f) + ("" if ev == "name" else f" ({ev})"))
+    if st["codec"] or st["bitrate"]:
+        bits.append(f"{st['codec']} {st['bitrate']}k".strip())
+    bits.append("HLS" if st["hls"] else "stream")
+    bits.append("+".join(st["sources"]))
+    return " \u2022 ".join(bits)[:100]
 
 
-async def web_radio_stations(request):
-    cc = (request.query.get("cc") or "").strip()[:2]
-    q = (request.query.get("q") or "").strip()[:60]
-    try:
-        stations = await radio_stations(cc=cc or None, q=q or None)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=502)
-    return web.json_response(stations)
-
-
-async def web_radio_stream(request):
-    global _radio_proxy_active
-    uid = request.match_info["sid"]
-    url = await radio_station_url(uid)
-    if not url:
-        return web.Response(status=404, text="unknown")
-    return web.Response(status=502, text="proxy stream offline")
-
-
-def _radio_start_source(gid: int, vc, info: dict, gen: int):
+# ---------------------------------------------------------------- playback
+def _radio_start_source(gid: int, vc, sess: dict):
+    urls = sess["urls"]
+    url = urls[sess["idx"] % len(urls)]
+    sess["started"] = time.monotonic()
+    gen = sess["gen"]
     source = discord.FFmpegPCMAudio(
-        info["url"],
-        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -protocol_whitelist http,https,tcp,tls,crypto",
+        url,
+        before_options=("-user_agent \"LUX-NET-Bridge/2.0\" -reconnect 1 -reconnect_streamed 1 "
+                        "-reconnect_delay_max 5 -protocol_whitelist http,https,tcp,tls,crypto"),
         options="-vn -loglevel error",
     )
 
@@ -3015,10 +3656,42 @@ def _radio_start_source(gid: int, vc, info: dict, gen: int):
 
 
 async def radio_ended(gid: int, gen: int):
+    """The stream ended or errored. Reconnect (trying alternate URLs) instead of silently dropping."""
     sess = radio_sessions.get(gid)
     if not sess or sess["gen"] != gen:
         return
-    await radio_stop(gid)
+    now = time.monotonic()
+    ran = now - sess.get("started", now)
+    sess["restarts"] = [t for t in sess["restarts"] if now - t < 120]
+    if ran < 8:
+        sess["idx"] += 1
+        sess["fast_fails"] = sess.get("fast_fails", 0) + 1
+    else:
+        sess["fast_fails"] = 0
+    if len(sess["restarts"]) >= 6 or sess["fast_fails"] >= max(3, len(sess["urls"]) * 2):
+        ch = sess.get("notify")
+        await radio_stop(gid)
+        if ch:
+            try:
+                await ch.send("\U0001F4FB The station's stream keeps failing, so I stopped. Try another station or `/radio-search`.")
+            except Exception:
+                pass
+        return
+    sess["restarts"].append(now)
+    await asyncio.sleep(min(1 + len(sess["restarts"]), 5))
+    sess = radio_sessions.get(gid)
+    if not sess or sess["gen"] != gen:
+        return
+    vc = sess["vc"]
+    if not vc.is_connected():
+        await radio_stop(gid)
+        return
+    sess["gen"] += 1
+    try:
+        _radio_start_source(gid, vc, sess)
+    except Exception as e:
+        logger.warning(f"Radio restart failed: {e}")
+        await radio_stop(gid)
 
 
 async def radio_stop(gid: int) -> bool:
@@ -3044,92 +3717,29 @@ async def radio_maybe_leave(channel):
         await radio_stop(channel.guild.id)
 
 
-async def radio_country_autocomplete(interaction: discord.Interaction, current: str):
+async def radio_click(uid: str):
     try:
-        countries = await asyncio.wait_for(radio_countries(), 2.5)
+        await radio_api(f"url/{uid}", None, ttl=0)      # tells the directory the station was used
     except Exception:
-        return []
-    cur = current.strip().lower()
-    out = []
-    for c in countries:
-        if not cur or cur in c["name"].lower() or cur == c["cc"].lower():
-            out.append(app_commands.Choice(name=c["name"][:100], value=c["cc"]))
-            if len(out) >= 25:
-                break
-    return out
+        pass
 
 
-async def radio_station_autocomplete(interaction: discord.Interaction, current: str):
-    cc = getattr(interaction.namespace, "country", None)
-    q = current.strip()
-    try:
-        if cc:
-            stations = await asyncio.wait_for(radio_stations(cc=cc), 2.5)
-        else:
-            stations = await asyncio.wait_for(radio_stations(q=q, limit=25), 2.5)
-    except Exception:
-        return []
-    return [app_commands.Choice(name=s["name"][:100], value=s["id"]) for s in stations[:25]]
-
-
-@bot.tree.command(name="radio", description="Open the radio web player.")
-async def radio_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message("Radio player available.", ephemeral=True)
-
-
-@bot.tree.command(name="radio-search", description="Search across multiple radio directories.")
-@app_commands.describe(query="Station name, genre, or keyword")
-async def radio_search(interaction: discord.Interaction, query: str):
-    await interaction.response.defer(ephemeral=True)
-    stations = await multi_source_search(q=query)
-    if not stations:
-        await interaction.followup.send(f"⚠️ No stations found matching `{query}`.", ephemeral=True)
-        return
-
-    desc = []
-    for s in stations[:10]:
-        freq_str = f" [{s['frequency']} MHz]" if s.get('frequency') else ""
-        desc.append(f"• **{s['name']}**{freq_str} ({s['codec']} {s['bitrate']}k) — *Source: {s['source']}*")
-    
-    embed = discord.Embed(title=f"📻 Search Results for '{query}'", description="\n".join(desc), color=discord.Color.blurple())
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="radio-frequency", description="Find and tune into a station by its frequency.")
-@app_commands.describe(frequency="Frequency in MHz (e.g. 101.1)", country="Country code filter")
-async def radio_frequency(interaction: discord.Interaction, frequency: float, country: str = "US"):
-    await interaction.response.defer(ephemeral=True)
-    stations = await multi_source_search(cc=country, frequency=frequency)
-    if not stations:
-        await interaction.followup.send(f"⚠️ No streams found matching frequency `{frequency} MHz` in {country}.", ephemeral=True)
-        return
-
-    s = stations[0]
-    await interaction.followup.send(f"✅ Found matching frequency: **{s['name']}** ({s['frequency']} MHz) from *{s['source']}*.")
-
-
-@bot.tree.command(name="radio-play", description="Play a radio station in voice.")
-@app_commands.describe(country="Country", station="Station ID", voice_channel="Voice channel")
-@app_commands.autocomplete(country=radio_country_autocomplete, station=radio_station_autocomplete)
-async def radio_play(interaction: discord.Interaction, country: str, station: str, voice_channel: discord.VoiceChannel = None):
-    if not interaction.guild:
-        await interaction.response.send_message("❌ Server only.", ephemeral=True)
-        return
-    if not shutil.which("ffmpeg"):
-        await interaction.response.send_message("❌ FFmpeg not installed.", ephemeral=True)
-        return
+async def radio_begin(interaction: discord.Interaction, st: dict, target: discord.VoiceChannel):
+    """Start a station in a voice channel. Returns an error string, or None on success."""
     gid = interaction.guild.id
-    target = _resolve_voice_channel(interaction, voice_channel)
-    if not target:
-        await interaction.response.send_message("❌ Join a voice channel first.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-    info = await radio_station_info(station)
-    if not info:
-        await interaction.followup.send("❌ Pick a valid station.", ephemeral=True)
-        return
-
+    if not shutil.which("ffmpeg"):
+        return "\u274c FFmpeg isn't installed on the host."
+    if gid in voice_sessions or gid in _voice_connecting:
+        return "\u274c The voice relay is active in this server. End it before starting the radio."
+    raw = [st["url"]] + list(st.get("alts", []))
+    resolved = await asyncio.gather(*(resolve_stream_url(u) for u in raw[:4]))
+    checks = await asyncio.gather(*(radio_url_is_public(u) for u in resolved))
+    urls = []
+    for u, ok in zip(resolved, checks):
+        if ok and u not in urls:
+            urls.append(u)
+    if not urls:
+        return "\u274c That stream address isn't reachable or isn't a public URL."
     try:
         sess = radio_sessions.get(gid)
         if sess:
@@ -3141,23 +3751,496 @@ async def radio_play(interaction: discord.Interaction, country: str, station: st
                 await vc.move_to(target)
         else:
             vc = await target.connect(timeout=20, self_deaf=True)
-            sess = radio_sessions[gid] = {"vc": vc, "info": info, "gen": 0, "restarts": []}
-        sess["info"] = info
-        _radio_start_source(gid, vc, info, sess["gen"])
+            sess = radio_sessions[gid] = {"vc": vc, "gen": 0, "restarts": []}
+        sess.update(info=st, urls=urls, idx=0, fast_fails=0, restarts=[], notify=interaction.channel)
+        _radio_start_source(gid, vc, sess)
     except Exception as e:
         await radio_stop(gid)
-        await interaction.followup.send(f"❌ Couldn't start radio: {e}", ephemeral=True)
+        return f"\u274c Couldn't start radio: {e}"
+    if st["id"].startswith("rb:"):
+        spawn(radio_click(st["id"][3:]))
+    return None
+
+
+def radio_now_embed(st: dict, vc_mention: str) -> discord.Embed:
+    e = discord.Embed(title=f"\U0001F4FB {st['name']}", color=discord.Color.blurple())
+    e.description = f"Playing in {vc_mention}"
+    f = next(iter(sorted(st["freq_ev"])), None)
+    if f:
+        ev = st["freq_ev"][f]
+        e.add_field(name="Frequency", value=fmt_freq(*f) + ("" if ev == "name" else f" (via {ev})"), inline=True)
+    place = ", ".join(x for x in (st["city"], st["country"] or st["cc"]) if x)
+    if place:
+        e.add_field(name="Location", value=place[:100], inline=True)
+    e.add_field(name="Source", value=" + ".join(st["sources"]), inline=True)
+    if st["codec"] or st["bitrate"]:
+        e.add_field(name="Audio", value=f"{st['codec']} {st['bitrate']}k".strip(), inline=True)
+    if st["tags"]:
+        e.add_field(name="Tags", value=st["tags"][:100], inline=False)
+    if st["favicon"]:
+        e.set_thumbnail(url=st["favicon"])
+    e.set_footer(text="Plays the station's internet stream, which can differ from the air signal (ads, delay, geo-blocks).")
+    return e
+
+
+# ---------------------------------------------------------------- menus
+class RadioStationSelect(discord.ui.Select):
+    def __init__(self, stations: list, placeholder: str = "Pick a station to play..."):
+        opts = []
+        for st in stations[:25]:
+            radio_register(st)
+            opts.append(discord.SelectOption(label=st["name"][:100] or "Station", value=st["id"][:100],
+                                             description=radio_describe(st)))
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if interaction.user.id != view.owner_id:
+            await interaction.response.send_message("\u274c This menu belongs to someone else. Run the command yourself.", ephemeral=True)
+            return
+        st = _radio_by_id.get(self.values[0])
+        if not st:
+            await interaction.response.send_message("\u274c That result expired. Search again.", ephemeral=True)
+            return
+        target = _resolve_voice_channel(interaction, view.vc)
+        if not target:
+            await interaction.response.send_message("\u274c Join a voice channel first, then pick again.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        err = await radio_begin(interaction, st, target)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=radio_now_embed(st, target.mention))
+
+
+class RadioPickView(discord.ui.View):
+    def __init__(self, owner_id: int, stations: list, vc=None):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.vc = vc
+        self.add_item(RadioStationSelect(stations))
+
+
+class RadioCountrySelect(discord.ui.Select):
+    def __init__(self, countries: list):
+        opts = [discord.SelectOption(label=c["name"][:100], value=c["cc"], description=f"{c['count']} stations")
+                for c in countries[:25]]
+        super().__init__(placeholder="Choose a country...", min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if interaction.user.id != view.owner_id:
+            await interaction.response.send_message("\u274c This menu belongs to someone else.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            stations = await radio_browse_country(self.values[0], view.tag)
+        except Exception as e:
+            await interaction.followup.send(f"\u274c Radio directory unavailable: {e}", ephemeral=True)
+            return
+        if not stations:
+            await interaction.followup.send("\u26a0\ufe0f No stations found there.", ephemeral=True)
+            return
+        nv = RadioBrowseView(view.owner_id, stations, f"{_cc_names.get(self.values[0], self.values[0])}", view.vc)
+        await interaction.edit_original_response(content=None, embed=nv.embed(), view=nv)
+
+
+class RadioCountryView(discord.ui.View):
+    def __init__(self, owner_id: int, countries: list, tag: str = None, vc=None):
+        super().__init__(timeout=180)
+        self.owner_id, self.tag, self.vc = owner_id, tag, vc
+        self.add_item(RadioCountrySelect(countries))
+
+
+class RadioBrowseView(discord.ui.View):
+    PAGE = 25
+
+    def __init__(self, owner_id: int, stations: list, title: str, vc=None, page: int = 0):
+        super().__init__(timeout=300)
+        self.owner_id, self.stations, self.title, self.vc, self.page = owner_id, stations, title, vc, page
+        self._build()
+
+    def pages(self) -> int:
+        return max(1, math.ceil(len(self.stations) / self.PAGE))
+
+    def _build(self):
+        self.clear_items()
+        chunk = self.stations[self.page * self.PAGE:(self.page + 1) * self.PAGE]
+        self.add_item(RadioStationSelect(chunk))
+        prev_b = discord.ui.Button(label="\u25C0 Prev", style=discord.ButtonStyle.secondary, disabled=self.page == 0, row=1)
+        next_b = discord.ui.Button(label="Next \u25B6", style=discord.ButtonStyle.secondary,
+                                   disabled=self.page >= self.pages() - 1, row=1)
+        prev_b.callback = lambda i: self._turn(i, -1)
+        next_b.callback = lambda i: self._turn(i, 1)
+        self.add_item(prev_b)
+        self.add_item(next_b)
+
+    async def _turn(self, interaction: discord.Interaction, d: int):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("\u274c This menu belongs to someone else.", ephemeral=True)
+            return
+        self.page = max(0, min(self.pages() - 1, self.page + d))
+        self._build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    def embed(self) -> discord.Embed:
+        chunk = self.stations[self.page * self.PAGE:(self.page + 1) * self.PAGE]
+        lines = [f"**{i}.** {radio_label(s)}" for i, s in enumerate(chunk, self.page * self.PAGE + 1)]
+        e = discord.Embed(title=f"\U0001F4FB Browse: {self.title}", description="\n".join(lines)[:4000], color=discord.Color.blurple())
+        e.set_footer(text=f"Page {self.page + 1}/{self.pages()} \u2022 {len(self.stations)} stations \u2022 pick one below")
+        return e
+
+
+def results_embed(title: str, stations: list, note: str = "") -> discord.Embed:
+    lines = []
+    for i, s in enumerate(stations[:10], 1):
+        f = next(iter(sorted(s["freq_ev"])), None)
+        fs = ""
+        if f:
+            ev = s["freq_ev"][f]
+            fs = f" [{fmt_freq(*f)}{'' if ev == 'name' else ', ' + ev}]"
+        place = f" \u2014 {s['city']}, {s['cc']}" if s["city"] and s["cc"] else (f" \u2014 {s['cc']}" if s["cc"] else "")
+        extra = f" ({s['codec']} {s['bitrate']}k)" if s["codec"] and s["bitrate"] else ""
+        lines.append(f"**{i}.** {s['name']}{fs}{place}{extra}\n\u2003*Source: {' + '.join(s['sources'])}*")
+    e = discord.Embed(title=title, description="\n".join(lines)[:4000], color=discord.Color.blurple())
+    foot = "Pick a station below to play it in your voice channel."
+    e.set_footer(text=(note + " \u2022 " if note else "") + foot)
+    return e
+
+
+async def radio_present(interaction: discord.Interaction, stations: list, title: str, vc=None, autoplay: bool = True, note: str = ""):
+    """Single result + voice channel known -> play it; otherwise show results with a play menu."""
+    target = _resolve_voice_channel(interaction, vc)
+    if autoplay and len(stations) == 1 and target:
+        err = await radio_begin(interaction, stations[0], target)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=radio_now_embed(stations[0], target.mention))
+        return
+    view = RadioPickView(interaction.user.id, stations, vc)
+    await interaction.followup.send(embed=results_embed(title, stations, note), view=view, ephemeral=True)
+
+
+# ---------------------------------------------------------------- web player
+def _public_station(st: dict) -> dict:
+    f = next(iter(sorted(st["freq_ev"])), None)
+    return {"id": st["id"], "name": st["name"], "cc": st["cc"], "country": st["country"], "city": st["city"],
+            "tags": st["tags"], "codec": st["codec"], "bitrate": st["bitrate"], "hls": st["hls"],
+            "source": " + ".join(st["sources"]), "favicon": st["favicon"],
+            "frequency": fmt_freq(*f) if f else "", "hlsUrl": st["url"] if st["hls"] else ""}
+
+
+RADIO_PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LUX-NET Radio</title><style>
+:root{color-scheme:dark}body{margin:0;font:15px system-ui,sans-serif;background:#0f1117;color:#e8e8ee}
+main{max-width:760px;margin:0 auto;padding:16px}h1{font-size:20px;margin:6px 0 12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}select,input,button{padding:9px;border-radius:8px;border:1px solid #333;background:#1a1d27;color:inherit;font:inherit}
+input{flex:1;min-width:160px}button{cursor:pointer;background:#5865f2;border-color:#5865f2}
+#now{margin:8px 0;min-height:20px;color:#9fb0ff}audio{width:100%}
+ul{list-style:none;padding:0;margin:10px 0}li{padding:10px;border:1px solid #262a38;border-radius:8px;margin-bottom:6px;cursor:pointer}
+li:hover{background:#171a24}small{color:#8b90a5;display:block;margin-top:2px}</style></head><body><main>
+<h1>\U0001F4FB LUX-NET Radio</h1>
+<div class="row"><select id="cc"><option value="">\U0001F30D All countries</option></select>
+<input id="q" placeholder="Station, genre, or frequency (e.g. 101.1 FM)"><button id="go">Search</button></div>
+<audio id="a" controls autoplay></audio><div id="now"></div><ul id="list"></ul>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);let hls=null;
+async function j(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()}
+async function init(){try{const cs=await j('/radio/api/countries');for(const c of cs){const o=document.createElement('option');o.value=c.cc;o.textContent=c.name+' ('+c.count+')';$('cc').appendChild(o)}}catch(e){}search()}
+async function search(){$('list').innerHTML='<li>Loading...</li>';
+ try{const s=await j('/radio/api/stations?cc='+encodeURIComponent($('cc').value)+'&q='+encodeURIComponent($('q').value));
+ $('list').innerHTML='';if(!s.length){$('list').innerHTML='<li>No stations found.</li>';return}
+ for(const st of s){const li=document.createElement('li');li.textContent=st.name+(st.frequency?' \\u00b7 '+st.frequency:'');
+ const sm=document.createElement('small');sm.textContent=[st.city,st.cc,st.codec&&(st.codec+' '+st.bitrate+'k'),st.hls?'HLS':'',st.source].filter(Boolean).join(' \\u2022 ');li.appendChild(sm);li.onclick=()=>play(st);$('list').appendChild(li)}}
+ catch(e){$('list').innerHTML='<li>Directory unavailable. Try again shortly.</li>'}}
+function play(st){const a=$('a');if(hls){hls.destroy();hls=null}$('now').textContent='Loading '+st.name+'...';
+ if(st.hls&&st.hlsUrl){if(window.Hls&&Hls.isSupported()){hls=new Hls();hls.loadSource(st.hlsUrl);hls.attachMedia(a)}else{a.src=st.hlsUrl}}
+ else{a.src='/radio/stream/'+encodeURIComponent(st.id)}
+ a.play().then(()=>$('now').textContent='\\u25B6 '+st.name).catch(()=>$('now').textContent='Press play to start '+st.name)}
+$('go').onclick=search;$('q').onkeydown=e=>{if(e.key==='Enter')search()};init();
+</script></main></body></html>"""
+
+
+async def web_radio_page(request):
+    return web.Response(text=RADIO_PAGE, content_type="text/html")
+
+
+async def web_radio_countries(request):
+    try:
+        data = await radio_countries()
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
+    return web.json_response(data)
+
+
+async def web_radio_stations(request):
+    cc = (request.query.get("cc") or "").strip().upper()[:2] or None
+    q = (request.query.get("q") or "").strip()[:60]
+    try:
+        if q and parse_frequency(q):
+            stations, _ = await radio_find_frequency(q, cc, fast=True)
+        elif q:
+            stations = await radio_search_all(q, cc, fast=True, limit=60)
+        else:
+            stations = (await radio_browse_country(cc, None, 100))
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
+    return web.json_response([_public_station(s) for s in stations])
+
+
+async def web_radio_stream(request):
+    """Proxy a (non-HLS) station so browsers can play http:// streams on this https page."""
+    global _radio_proxy_active
+    st = _radio_by_id.get(request.match_info["sid"])
+    if not st or st["hls"]:
+        return web.Response(status=404, text="unknown station")
+    if _radio_proxy_active >= RADIO_PROXY_MAX:
+        return web.Response(status=503, text="too many listeners right now")
+    _radio_proxy_active += 1
+    upstream = None
+    try:
+        session = await radio_http()
+        url = await resolve_stream_url(st["url"])
+        for _ in range(4):
+            if not await radio_url_is_public(url):
+                return web.Response(status=403, text="blocked")
+            upstream = await session.get(url, allow_redirects=False, headers={"Icy-MetaData": "0"},
+                                         timeout=aiohttp.ClientTimeout(total=None, sock_connect=8, sock_read=20))
+            if upstream.status in (301, 302, 303, 307, 308) and upstream.headers.get("Location"):
+                url = urljoin(url, upstream.headers["Location"])
+                upstream.release()
+                upstream = None
+                continue
+            break
+        if upstream is None or upstream.status != 200:
+            return web.Response(status=502, text="station unavailable")
+        resp = web.StreamResponse(headers={"Content-Type": upstream.headers.get("Content-Type", "audio/mpeg"),
+                                           "Cache-Control": "no-store"})
+        await resp.prepare(request)
+        async for chunk in upstream.content.iter_chunked(8192):
+            await resp.write(chunk)
+        return resp
+    except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError):
+        return web.Response(status=502, text="stream ended")
+    finally:
+        _radio_proxy_active -= 1
+        if upstream is not None:
+            upstream.release()
+
+
+async def radio_warm():
+    try:
+        await radio_hosts()
+        await radio_countries()
+    except Exception as e:
+        logger.warning(f"Radio warm-up failed: {e}")
+
+
+# ---------------------------------------------------------------- slash commands
+async def radio_country_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        countries = await asyncio.wait_for(radio_countries(), 2.5)
+    except Exception:
+        return []
+    cur = current.replace("\U0001F30D", "").strip().lower()
+    out = []
+    if not cur or cur in "all countries worldwide":
+        out.append(app_commands.Choice(name="\U0001F30D All countries", value="ALL"))
+    for c in countries:
+        if not cur or cur in c["name"].lower() or cur == c["cc"].lower():
+            out.append(app_commands.Choice(name=f"{c['name']} ({c['cc']})"[:100], value=c["cc"]))
+            if len(out) >= 25:
+                break
+    return out
+
+
+async def radio_query_autocomplete(interaction: discord.Interaction, current: str):
+    cur = current.strip()
+    if len(cur) < 2 or cur.lower().startswith("http"):
+        return []
+    try:
+        cc = await resolve_cc(getattr(interaction.namespace, "country", None))
+        if parse_frequency(cur):
+            stations, _ = await asyncio.wait_for(radio_find_frequency(cur, cc, fast=True), 2.6)
+        else:
+            stations = await asyncio.wait_for(radio_search_all(cur, cc, fast=True), 2.6)
+    except Exception:
+        return []
+    return [app_commands.Choice(name=radio_label(s), value=s["id"][:100]) for s in stations[:25]]
+
+
+@bot.tree.command(name="radio", description="How to use the radio, plus the web player link.")
+async def radio_cmd(interaction: discord.Interaction):
+    e = discord.Embed(title="\U0001F4FB LUX-NET Radio", color=discord.Color.blurple())
+    e.description = (
+        "`/radio-play` \u2014 station name, frequency (`101.1 FM`) or a direct stream URL\n"
+        "`/radio-frequency` \u2014 find stations on a frequency (add a country/city to narrow it)\n"
+        "`/radio-search` \u2014 search every source worldwide\n"
+        "`/radio-browse` \u2014 browse by country, then pick a station\n"
+        "`/radio-now`, `/radio-stop`, `/radio-sources`"
+    )
+    if EMU_WEB_BASE:
+        e.add_field(name="Web player", value=f"{EMU_WEB_BASE}/radio", inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="radio-search", description="Search radio stations across every directory, worldwide.")
+@app_commands.describe(query="Station name, genre, or keyword", country="Limit to a country (optional)", voice_channel="Voice channel to play in")
+@app_commands.autocomplete(country=radio_country_autocomplete)
+async def radio_search(interaction: discord.Interaction, query: str, country: str = None, voice_channel: discord.VoiceChannel = None):
+    await interaction.response.defer(ephemeral=True)
+    cc = await resolve_cc(country)
+    stations = await radio_search_all(query, cc)
+    if not stations:
+        await interaction.followup.send(f"\u26a0\ufe0f No stations found for `{query}`" + (f" in {country}" if cc else "") + ".", ephemeral=True)
+        return
+    await radio_present(interaction, stations, f"\U0001F4FB Results for '{query}'", voice_channel, autoplay=False)
+
+
+@bot.tree.command(name="radio-frequency", description="Find a station by its radio frequency (e.g. 101.1 FM or 1010 AM).")
+@app_commands.describe(frequency="e.g. 101.1, 101.1 FM, 1010 AM", country="Country (strongly recommended: frequencies repeat worldwide)",
+                       city="City or region to prefer (optional)", voice_channel="Voice channel to play in")
+@app_commands.autocomplete(country=radio_country_autocomplete)
+async def radio_frequency(interaction: discord.Interaction, frequency: str, country: str = None, city: str = None,
+                          voice_channel: discord.VoiceChannel = None):
+    await interaction.response.defer(ephemeral=True)
+    if not parse_frequency(frequency):
+        await interaction.followup.send("\u274c I couldn't read that as a frequency. Try `101.1`, `101.1 FM` or `1010 AM`.", ephemeral=True)
+        return
+    cc = await resolve_cc(country)
+    stations, parsed = await radio_find_frequency(frequency, cc, city)
+    label = fmt_freq(*parsed)
+    where = f" in {country}" if cc else ""
+    if not stations:
+        await interaction.followup.send(
+            f"\u26a0\ufe0f I couldn't find an internet stream for **{label}**{where}. Many small stations have no online stream, "
+            "and some listings don't include their frequency. Adding a country (and city) helps, or try `/radio-search` with the station name.",
+            ephemeral=True)
+        return
+    note = "Matches are read from station listings, so double-check the source" if any(
+        s["freq_ev"].get(parsed) == "name" for s in stations) else ""
+    await radio_present(interaction, stations, f"\U0001F4FB {label}{where}", voice_channel, autoplay=False, note=note)
+
+
+@bot.tree.command(name="radio-play", description="Play a radio station: by name, frequency, or direct stream URL.")
+@app_commands.describe(query="Station name, frequency (101.1 FM), or a stream URL", country="Limit to a country (optional)",
+                       voice_channel="Voice channel to play in")
+@app_commands.autocomplete(query=radio_query_autocomplete, country=radio_country_autocomplete)
+async def radio_play(interaction: discord.Interaction, query: str, country: str = None, voice_channel: discord.VoiceChannel = None):
+    if not interaction.guild:
+        await interaction.response.send_message("\u274c Server only.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    query = query.strip()
+    cc = await resolve_cc(country)
+    st = _radio_by_id.get(query)
+    target = _resolve_voice_channel(interaction, voice_channel)
+
+    if st is None and re.match(r"^rb:[0-9a-fA-F-]{36}$", query):      # id from an older menu (cache was reset)
+        try:
+            data = await radio_api(f"stations/byuuid/{query[3:]}", None, ttl=3600)
+            st = radio_register(rb_norm(data[0])) if data and rb_norm(data[0]) else None
+        except Exception:
+            st = None
+    if st is None and re.match(r"^https?://", query, re.I):
+        st = direct_station(query)
+
+    if st is not None:
+        if not target:
+            await interaction.followup.send("\u274c Join a voice channel first (or choose one in the command).", ephemeral=True)
+            return
+        err = await radio_begin(interaction, st, target)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=radio_now_embed(st, target.mention))
         return
 
-    await interaction.followup.send(f"📻 Playing **{info['name']}** in {target.mention}.")
+    if parse_frequency(query):
+        stations, parsed = await radio_find_frequency(query, cc)
+        title = f"\U0001F4FB {fmt_freq(*parsed)}" + (f" in {country}" if cc else "")
+        empty = (f"\u26a0\ufe0f No internet stream found for **{fmt_freq(*parsed)}**. Try adding a country, or search by name.")
+    else:
+        stations = await radio_search_all(query, cc)
+        title = f"\U0001F4FB Results for '{query}'"
+        empty = f"\u26a0\ufe0f No stations found for `{query}`."
+    if not stations:
+        await interaction.followup.send(empty, ephemeral=True)
+        return
+    await radio_present(interaction, stations, title, voice_channel, autoplay=True)
+
+
+@bot.tree.command(name="radio-browse", description="Browse stations by country, then pick one to play.")
+@app_commands.describe(country="Country (leave empty to pick from a menu)", genre="Genre/tag filter (optional)",
+                       voice_channel="Voice channel to play in")
+@app_commands.autocomplete(country=radio_country_autocomplete)
+async def radio_browse(interaction: discord.Interaction, country: str = None, genre: str = None, voice_channel: discord.VoiceChannel = None):
+    await interaction.response.defer(ephemeral=True)
+    tag = genre.strip().lower() if genre else None
+    try:
+        cc = await resolve_cc(country)
+        if cc or (country and country.strip().lower() not in _ALL_WORDS):
+            if not cc:
+                await interaction.followup.send(f"\u26a0\ufe0f I don't know a country called `{country}`.", ephemeral=True)
+                return
+            stations = await radio_browse_country(cc, tag)
+            if not stations:
+                await interaction.followup.send("\u26a0\ufe0f No stations found there.", ephemeral=True)
+                return
+            view = RadioBrowseView(interaction.user.id, stations, _cc_names.get(cc, cc), voice_channel)
+            await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
+            return
+        if country:      # explicit "all": worldwide top stations
+            stations = await radio_browse_country(None, tag)
+            view = RadioBrowseView(interaction.user.id, stations, "Worldwide", voice_channel)
+            await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
+            return
+        countries = sorted(await radio_countries(), key=lambda c: c["count"], reverse=True)[:25]
+        view = RadioCountryView(interaction.user.id, countries, tag, voice_channel)
+        await interaction.followup.send("\U0001F30D **Pick a country** (the 25 biggest are shown; type a country in the `country` option for any other):",
+                                        view=view, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"\u274c Radio directory unavailable: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="radio-now", description="Show what's playing on the radio.")
+async def radio_now(interaction: discord.Interaction):
+    sess = radio_sessions.get(interaction.guild.id) if interaction.guild else None
+    if not sess:
+        await interaction.response.send_message("\u26a0\ufe0f No radio playing.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=radio_now_embed(sess["info"], sess["vc"].channel.mention if sess["vc"].channel else "voice"))
+
+
+@bot.tree.command(name="radio-sources", description="Show which radio directories are working.")
+async def radio_sources(interaction: discord.Interaction):
+    def line(name: str, enabled: bool = True, note: str = "") -> str:
+        if not enabled:
+            return f"\u26aa **{name}** \u2014 off ({note})"
+        h = _health(name)
+        if time.monotonic() < h["until"]:
+            return f"\U0001F534 **{name}** \u2014 paused after repeated errors: `{h['err']}`"
+        if h["fails"]:
+            return f"\U0001F7E1 **{name}** \u2014 last error: `{h['err']}`"
+        return f"\U0001F7E2 **{name}** \u2014 ok ({h['ok']} requests)" if h["ok"] else f"\u26aa **{name}** \u2014 not used yet"
+    lines = [
+        line("Radio Browser"), line("SomaFM"),
+        line("Radio Garden", RADIO_GARDEN_ON, "RADIO_GARDEN=0"),
+        line("Wikidata", RADIO_WIKIDATA_ON, "RADIO_WIKIDATA=0"),
+        line("FCC", bool(RADIO_FCC_FILE), "set FCC_FM_FILE to a CSV of US FM stations"),
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="radio-stop", description="Stop the radio.")
 async def radio_stop_cmd(interaction: discord.Interaction):
     if not interaction.guild or not await radio_stop(interaction.guild.id):
-        await interaction.response.send_message("⚠️ No radio playing.", ephemeral=True)
+        await interaction.response.send_message("\u26a0\ufe0f No radio playing.", ephemeral=True)
         return
-    await interaction.response.send_message("⏹️ Radio stopped.")
+    await interaction.response.send_message("\u23F9\uFE0F Radio stopped.")
 
 
 async def start_web():
