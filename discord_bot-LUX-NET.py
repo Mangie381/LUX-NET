@@ -252,11 +252,6 @@ def gemini_overview(query: str):
         return None
 
 # ------------------------------------------------------------------------------
-# WEB SERVER (Render health check on '/' plus the live emulator player).
-# It is started from main() before the bot logs in, see start_web() in the emulator section.
-# ------------------------------------------------------------------------------
-
-# ------------------------------------------------------------------------------
 # DISCORD BOT INITIALIZATION
 # ------------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -317,7 +312,6 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel) -> discord.We
 # STAR RATING POLLS (1-5 stars, persistent buttons, synced across relayed channels)
 # Needs the tables in rating_poll_setup.sql.
 # ------------------------------------------------------------------------------
-# Old polls stored this default text in the database; it is hidden when their embeds refresh.
 _LEGACY_DEFAULT_PROMPT = "So go on and react to television programs by reacting one of the five ratings mentioned!"
 RATING_TEXT = {
     1: ("1 star", "the worst rating"),
@@ -337,7 +331,6 @@ _rating_meta: dict = {}
 
 
 def _parse_ts(value: str) -> datetime:
-    """Tolerant ISO parser (Postgres can return 5-digit fractions, which older Pythons reject)."""
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
@@ -365,7 +358,6 @@ def build_rating_embed(title: str, prompt: str, counts: dict, created_at: dateti
     prompt = (prompt or "").strip()
     if prompt and prompt != _LEGACY_DEFAULT_PROMPT:
         description += f"\n\n{prompt}"
-    # No footer text: Discord renders the timestamp on its own as "\u2014 dd/mm/yyyy, hh:mm".
     return discord.Embed(
         title=f"\u2b50 {title}"[:256],
         description=description[:4000],
@@ -375,8 +367,6 @@ def build_rating_embed(title: str, prompt: str, counts: dict, created_at: dateti
 
 
 class RatingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"lux_rate:(?P<poll>[0-9a-f]{8,32}):(?P<n>[1-5])"):
-    """One star button. Registered as a dynamic item so it keeps working after bot restarts."""
-
     def __init__(self, poll_id: str, n: int):
         super().__init__(
             discord.ui.Button(
@@ -451,7 +441,7 @@ def rating_db_create(poll_id: str, title: str, prompt: str, created_at: datetime
         _rating_meta[poll_id] = {"title": title, "prompt": prompt, "created_at": created_at}
         return True
     except Exception as e:
-        logger.error(f"Failed to create rating poll (did you run rating_poll_setup.sql?): {e}")
+        logger.error(f"Failed to create rating poll: {e}")
         return False
 
 
@@ -485,7 +475,6 @@ def _rating_counts(poll_id: str) -> dict:
             counts[int(row["star"])] = int(row["votes"])
         return counts
     except Exception:
-        # Fallback if the rating_counts() SQL function was not created.
         counts = {n: 0 for n in range(1, 6)}
         res = supabase.table("rating_votes").select("rating").eq("poll_id", poll_id).limit(100000).execute()
         for row in res.data:
@@ -494,7 +483,6 @@ def _rating_counts(poll_id: str) -> dict:
 
 
 def rating_vote(poll_id: str, user_id: int, rating: int):
-    """Toggle/replace a user's vote. Returns (meta, counts, my_vote_or_None, [(channel_id, message_id)])."""
     meta = _rating_get_meta(poll_id)
     if meta is None:
         return None
@@ -521,7 +509,6 @@ def _thread_kw(channel) -> dict:
 
 
 async def sync_rating_copies(embed: discord.Embed, targets: list, exclude_message_id: int | None = None):
-    """Push the fresh embed to every copy of a poll in every linked server."""
     async def one(channel_id: int, message_id: int):
         if message_id == exclude_message_id:
             return
@@ -547,8 +534,6 @@ async def sync_rating_copies(embed: discord.Embed, targets: list, exclude_messag
 
 
 async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username: str, avatar_url: str, reply_to_id: int = None):
-    # Attach the poll to a specific message (the first post) as a reply. Only the bot can reply;
-    # webhooks can't, so this goes first and the webhook path below stays as the fallback.
     if reply_to_id:
         try:
             return await channel.send(
@@ -559,7 +544,7 @@ async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception as e:
-            logger.warning(f"Could not reply to first message {reply_to_id} in {channel.id}, using normal poll post: {e}")
+            logger.warning(f"Could not reply to first message {reply_to_id} in {channel.id}: {e}")
     webhook = await get_or_create_webhook(channel)
     if webhook:
         try:
@@ -573,7 +558,7 @@ async def post_rating_copy(channel, embed: discord.Embed, poll_id: str, username
                 **_thread_kw(channel),
             )
         except Exception as e:
-            logger.warning(f"Webhook poll post failed in {channel.id}, falling back to bot message: {e}")
+            logger.warning(f"Webhook poll post failed in {channel.id}: {e}")
     try:
         return await channel.send(embed=embed, view=build_rating_view(poll_id))
     except Exception as e:
@@ -595,7 +580,6 @@ def relay_targets_for(channel) -> list:
 
 
 def forum_targets_for(forum_id: int) -> list:
-    """Forum channels linked (via /link-forum) to the given forum."""
     col = _LINK_COLS["forum_relays"]
     ids = set()
     res = supabase.table("forum_relays").select("network_code").eq(col, forum_id).execute()
@@ -605,10 +589,6 @@ def forum_targets_for(forum_id: int) -> list:
     return list(ids)
 
 
-# ------------------------------------------------------------------------------
-# AUTO POLL (automatically adds the 1-5 rating poll to every new post in a forum)
-# Needs the auto_poll_forums table in auto_poll_setup.sql.
-# ------------------------------------------------------------------------------
 _auto_poll_forums: set = set()
 
 
@@ -619,7 +599,7 @@ def refresh_auto_poll_cache() -> bool:
         _auto_poll_forums = {int(row["forum_channel_id"]) for row in res.data}
         return True
     except Exception as e:
-        logger.error(f"Failed to load auto poll forums (did you run auto_poll_setup.sql?): {e}")
+        logger.error(f"Failed to load auto poll forums: {e}")
         return False
 
 
@@ -640,7 +620,6 @@ def set_auto_poll(forum_id: int, enabled: bool) -> bool:
 
 
 async def post_auto_poll(thread: discord.Thread, starter_message: discord.Message, copies: list):
-    """Post a rating poll in a new forum post and in every relayed copy of that post."""
     try:
         poll_id = uuid.uuid4().hex[:12]
         title = thread.name.strip()[:200] or "Rating"
@@ -654,8 +633,6 @@ async def post_auto_poll(thread: discord.Thread, starter_message: discord.Messag
         username = f"{starter_message.author.display_name} [{thread.guild.name}] (Poll)"[:80]
         avatar_url = starter_message.author.display_avatar.url
 
-        # In a forum post the first message shares its ID with the thread, in the original
-        # and in every relayed copy, so the poll replies straight to that first message.
         seen = set()
         for channel in [thread] + list(copies):
             if channel.id in seen:
@@ -683,7 +660,7 @@ async def on_ready():
     _ready_done = True
 
     if VOICE_OK and not ensure_opus():
-        logger.warning("libopus not found - voice bridge disabled until it is installed (see Dockerfile).")
+        logger.warning("libopus not found - voice bridge disabled until it is installed.")
     asyncio.create_task(keepalive_loop())
     asyncio.create_task(ban_cache_loop())
     asyncio.create_task(emu_reaper_loop())
@@ -767,8 +744,6 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User | di
             logger.error(f"Failed to remove cross-server reaction from message {target_msg_id}: {e}")
 
 async def _relay_new_forum_post(thread: discord.Thread):
-    """Relays a new forum post to linked forums. Returns (starter_message or None, [copied threads]).
-    starter_message is None when the post should not get an auto poll (bot/webhook/banned/empty)."""
     copies = []
     if not isinstance(thread.parent, discord.ForumChannel):
         return None, copies
@@ -853,7 +828,7 @@ async def _relay_new_forum_post(thread: discord.Thread):
                     logger.error(f"Failed to process attachment {attachment.filename}: {e}")
 
         if skipped_files:
-            skip_notice = f"\n*⚠ [Skipped oversized file(s): {', '.join(skipped_files)} - Exceeds Discord size limit]*"
+            skip_notice = f"\n*⚠ [Skipped oversized file(s): {', '.join(skipped_files)}]*"
             post_body += skip_notice
 
         send_kwargs = {
@@ -908,7 +883,6 @@ async def on_thread_create(thread: discord.Thread):
 
     starter_message, copies = await _relay_new_forum_post(thread)
 
-    # Auto poll: add the 1-5 rating poll to new posts in forums where /auto-poll is enabled.
     if starter_message is not None and thread.parent.id in _auto_poll_forums:
         await post_auto_poll(thread, starter_message, copies)
 
@@ -917,21 +891,13 @@ async def on_thread_create(thread: discord.Thread):
 # ------------------------------------------------------------------------------
 FRAME_BYTES = 3840                 
 SILENCE = b"\x00" * FRAME_BYTES
-# --- latency / quality tuning (all overridable with environment variables) ---------
-# Per-speaker playback queue, in 20 ms frames. Hard cap on how far behind live audio can get.
 MAX_BUFFERED_FRAMES = int(os.environ.get("VOICE_MAX_QUEUE_FRAMES", "4"))
-# A new talk-spurt waits until this many frames are queued (or PRIME_MAX_WAIT ticks pass).
-# This is the only place network jitter gets smoothed, and it costs at most ~20-40 ms.
 PRIME_FRAMES = int(os.environ.get("VOICE_PRIME_FRAMES", "2"))
 PRIME_MAX_WAIT = 2
-# Keep the player alive ~0.6 s after the last frame so short pauses don't restart it.
 IDLE_FRAMES_BEFORE_STOP = 30
-# voice_recv jitter buffer (per speaker). maxsize also bounds how long output stalls when a
-# packet is lost/late (library default is 10 frames = 200 ms). prefsize is reorder tolerance.
 JITTER_MAX_PACKETS = int(os.environ.get("VOICE_JITTER_MAX", "4"))
 JITTER_PREF_PACKETS = int(os.environ.get("VOICE_JITTER_PREF", "1"))
-# Outgoing Opus encoder.
-OPUS_APPLICATION = os.environ.get("VOICE_OPUS_APPLICATION", "audio")   # audio | voip | lowdelay
+OPUS_APPLICATION = os.environ.get("VOICE_OPUS_APPLICATION", "audio")
 OPUS_BITRATE_KBPS = int(os.environ.get("VOICE_BITRATE_KBPS", "96"))
 OPUS_EXPECTED_LOSS = float(os.environ.get("VOICE_EXPECTED_LOSS", "0.05"))
 MAX_VOICE_SESSIONS = int(os.environ.get("MAX_VOICE_SESSIONS", "4"))
@@ -994,15 +960,11 @@ def patch_opus_decode_safety():
             voice_stats["decode_err"] += 1
             if voice_stats["decode_err"] <= 5:
                 d = getattr(packet, "decrypted_data", None) or b""
-                logger.warning(
-                    f"Skipped undecodable voice packet ({e}): ssrc={self.ssrc} len={len(d)} "
-                    f"head={d[:6].hex()} tail={d[-4:].hex()}"
-                )
+                logger.warning(f"Skipped undecodable voice packet ({e})")
             return packet, SILENCE
 
     vr_opus.PacketDecoder._decode_packet = safe_decode
 
-    # Smaller jitter buffer = lower latency and no 200 ms stall after a lost packet.
     original_init = vr_opus.PacketDecoder.__init__
 
     def tuned_init(self, router, ssrc):
@@ -1043,8 +1005,6 @@ def install_dave_receive(vc):
             return out
         except Exception as e:
             voice_stats["dave_fail"] += 1
-            if voice_stats["dave_fail"] <= 5:
-                logger.warning(f"DAVE decrypt failed for user {user_id}: {e!r}")
             return OPUS_SILENCE
 
     reader.decryptor.decrypt_rtp = decrypt_rtp
@@ -1072,7 +1032,7 @@ if VOICE_OK:
                 sp = self.buffers[speaker_id] = _Speaker()
             dq = sp.dq
             if len(dq) == dq.maxlen:
-                voice_stats["mix_drop"] += 1   # oldest frame is discarded to stay near live
+                voice_stats["mix_drop"] += 1
             dq.append(pcm)
 
         def has_audio(self) -> bool:
@@ -1100,15 +1060,14 @@ if VOICE_OK:
                 self.idle += 1
                 if self.idle >= IDLE_FRAMES_BEFORE_STOP and not self.has_audio():
                     self.buffers.clear()
-                    self.playing = False   # lets the next frame restart playback immediately
+                    self.playing = False
                     return b""
                 return SILENCE
 
             self.idle = 0
             if len(frames) == 1:
-                return frames[0]           # one speaker: pass through untouched
+                return frames[0]
 
-            # Several speakers: scale each so the sum has headroom instead of hard clipping.
             gain = 1.0 / math.sqrt(len(frames))
             out = audioop.mul(frames[0], 2, gain)
             for f in frames[1:]:
@@ -1138,7 +1097,6 @@ if VOICE_OK:
             self._gen = 0
 
         def ensure_playing(self):
-            """Safe to call from any thread; starts the player without waiting on the event loop."""
             if self.mixer.playing or not self.vc.is_connected():
                 return
             with self._lock:
@@ -1161,11 +1119,11 @@ if VOICE_OK:
                     )
                 except Exception as e:
                     self.mixer.playing = False
-                    logger.debug(f"Could not start voice playback in guild {self.guild_id}: {e}")
+                    logger.debug(f"Could not start voice playback: {e}")
 
         def _after_play(self, error, gen):
             if error:
-                logger.error(f"Voice playback error in guild {self.guild_id}: {error}")
+                logger.error(f"Voice playback error: {error}")
             if gen == self._gen:
                 self.mixer.playing = False
             if self.mixer.has_audio():
@@ -1190,7 +1148,6 @@ if VOICE_OK:
             return False
 
         def write(self, user, data):
-            # Runs on the packet-router thread ~50x/second per speaker: no network, no awaits.
             if user is None or user.bot or user.id in _banned_ids:
                 return
             pcm = data.pcm
@@ -1228,9 +1185,8 @@ async def end_voice_session(guild_id: int):
     try:
         await session.vc.disconnect(force=True)
     except Exception as e:
-        logger.error(f"Error disconnecting voice in guild {guild_id}: {e}")
+        logger.error(f"Error disconnecting voice: {e}")
     session.mixer.buffers.clear()
-    logger.info(f"Voice session ended in guild {guild_id}")
 
 
 async def maybe_join_voice(channel: discord.VoiceChannel):
@@ -1258,10 +1214,8 @@ async def maybe_join_voice(channel: discord.VoiceChannel):
         voice_sessions[gid] = session
         vc.listen(RelaySink(session))
         install_dave_receive(vc)
-        logger.info(f"DAVE receive patch active: {davey is not None}")
-        logger.info(f"Voice session started in guild {gid} on #{channel.name} (codes: {sorted(codes)})")
     except Exception as e:
-        logger.error(f"Failed to join voice channel {channel.id}: {e}")
+        logger.error(f"Failed to join voice channel: {e}")
         try:
             if channel.guild.voice_client:
                 await channel.guild.voice_client.disconnect(force=True)
@@ -1308,7 +1262,6 @@ async def on_message(message: discord.Message):
     if is_user_banned(message.author.id):
         return
 
-    # Typed emulator controls (w/a/s/d ...) in a channel with a running game.
     if message.channel.id in emu_sessions and await emu_chat_input(message):
         return
 
@@ -1416,10 +1369,10 @@ async def on_message(message: discord.Message):
                 file_obj = discord.File(fp=fp, filename=attachment.filename.lower())
                 files.append(file_obj)
             except Exception as e:
-                logger.error(f"Failed to process attachment {attachment.filename}: {e}")
+                logger.error(f"Failed to process attachment: {e}")
 
     if skipped_files:
-        skip_notice = f"\n*⚠ [Skipped oversized file(s): {', '.join(skipped_files)} - Exceeds Discord size limit]*"
+        skip_notice = f"\n*⚠ [Skipped oversized file(s)]*"
         if "content" in send_kwargs:
             send_kwargs["content"] += skip_notice
         else:
@@ -1445,7 +1398,7 @@ async def on_message(message: discord.Message):
                         if sent_msg:
                             register_message_mapping(message.id, t_channel.id, sent_msg.id)
                     except Exception as e:
-                        logger.error(f"Error relaying thread message to {tid}: {e}")
+                        logger.error(f"Error relaying thread message: {e}")
 
     if target_channel_ids:
         for target_id in target_channel_ids:
@@ -1458,7 +1411,7 @@ async def on_message(message: discord.Message):
                         if sent_msg:
                             register_message_mapping(message.id, target_channel.id, sent_msg.id)
                     except Exception as e:
-                        logger.error(f"Error relaying message to {target_channel.id}: {e}")
+                        logger.error(f"Error relaying message: {e}")
 
 # ------------------------------------------------------------------------------
 # SLASH COMMANDS (BRIDGES, POLLS, YOUTUBE, SEARCH, & BANS)
@@ -1486,7 +1439,7 @@ async def ban_bot(interaction: discord.Interaction, user_id: str):
         return
 
     await asyncio.to_thread(add_bot_ban, target_id)
-    await interaction.response.send_message(f"🔨 Successfully banned user ID `{target_id}` from using the bot globally.", ephemeral=True)
+    await interaction.response.send_message(f"🔨 Successfully banned user ID `{target_id}`.", ephemeral=True)
 
 @bot.tree.command(name="unban-bot", description="Remove a global bot ban from a user.")
 @app_commands.describe(user_id="The Discord User ID to unban")
@@ -1525,10 +1478,7 @@ async def list_bot_bans(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error fetching banned users: {e}", ephemeral=True)
 
 @bot.tree.command(name="poll", description="Post a 1-5 star rating poll and sync it across connected relay channels.")
-@app_commands.describe(
-    title="What people are rating (e.g. a TV show)",
-    message="Line shown under the ratings (optional)"
-)
+@app_commands.describe(title="What people are rating", message="Line shown under the ratings (optional)")
 async def poll(interaction: discord.Interaction, title: str, message: str = None):
     if not interaction.guild or not interaction.channel:
         await interaction.response.send_message("\u274c This command can only be used in a server.", ephemeral=True)
@@ -1543,17 +1493,13 @@ async def poll(interaction: discord.Interaction, title: str, message: str = None
 
     created = await asyncio.to_thread(rating_db_create, poll_id, clean_title, prompt, created_at, interaction.user.id)
     if not created:
-        await interaction.followup.send(
-            "\u274c Couldn't create the poll. Make sure `rating_poll_setup.sql` has been run in Supabase.", ephemeral=True
-        )
+        await interaction.followup.send("\u274c Couldn't create the poll.", ephemeral=True)
         return
 
     origin = interaction.channel
     target_channels = []
     try:
         if isinstance(origin, discord.Thread) and isinstance(origin.parent, discord.ForumChannel):
-            # Forum post: copy the poll into the matching post (same title) in every linked forum,
-            # exactly like messages are matched by the relay.
             forum_ids = await asyncio.to_thread(forum_targets_for, origin.parent.id)
             for fid in forum_ids:
                 forum = bot.get_channel(fid)
@@ -1583,20 +1529,17 @@ async def poll(interaction: discord.Interaction, title: str, message: str = None
     if posted:
         await interaction.followup.send(f"\u2705 Rating poll posted in {posted} channel(s).", ephemeral=True)
     else:
-        await interaction.followup.send("\u274c I couldn't post the poll here (check my Send Messages / Manage Webhooks permissions).", ephemeral=True)
+        await interaction.followup.send("\u274c I couldn't post the poll here.", ephemeral=True)
 
 @bot.tree.command(name="auto-poll", description="Auto-add the 1-5 star rating poll to every new post in a forum.")
-@app_commands.describe(
-    enabled="Turn auto poll on or off for the forum",
-    forum_channel="Forum to change (optional, defaults to the forum you're in)"
-)
+@app_commands.describe(enabled="Turn auto poll on or off", forum_channel="Forum to change (optional)")
 @app_commands.choices(enabled=[
     app_commands.Choice(name="on", value=1),
     app_commands.Choice(name="off", value=0),
 ])
 async def auto_poll(interaction: discord.Interaction, enabled: app_commands.Choice[int], forum_channel: discord.ForumChannel = None):
     if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("\u274c You need the **Manage Channels** permission to change auto poll.", ephemeral=True)
+        await interaction.response.send_message("\u274c You need the **Manage Channels** permission.", ephemeral=True)
         return
 
     target = forum_channel
@@ -1608,30 +1551,23 @@ async def auto_poll(interaction: discord.Interaction, enabled: app_commands.Choi
             target = ch
 
     if not target:
-        await interaction.response.send_message(
-            "\u274c Pick a `forum_channel` in the option, or run this inside a forum or forum post.", ephemeral=True
-        )
+        await interaction.response.send_message("\u274c Pick a `forum_channel` or run inside a forum.", ephemeral=True)
         return
 
     await interaction.response.defer()
     on = bool(enabled.value)
     ok = await asyncio.to_thread(set_auto_poll, target.id, on)
     if not ok:
-        await interaction.followup.send(
-            "\u274c Couldn't save that. Make sure `auto_poll_setup.sql` has been run in Supabase.", ephemeral=True
-        )
+        await interaction.followup.send("\u274c Couldn't save that.", ephemeral=True)
         return
 
     if on:
-        await interaction.followup.send(
-            f"\u2b50 Auto poll is **on** for **{target.name}**. Every new post there gets a 1-5 star rating poll "
-            f"(also copied into the matching post in linked forums)."
-        )
+        await interaction.followup.send(f"\u2b50 Auto poll is **on** for **{target.name}**.")
     else:
         await interaction.followup.send(f"\U0001F6D1 Auto poll is **off** for **{target.name}**.")
 
 
-@bot.tree.command(name="list-bridges", description="List all servers (with member counts), channels, threads, and forums connected to a network code.")
+@bot.tree.command(name="list-bridges", description="List all connected channels/forums to a network code.")
 @app_commands.describe(network_code="The network code to inspect")
 async def list_bridges(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
@@ -1644,8 +1580,6 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
 
     embed = discord.Embed(title=f"🌐 Bridge Status for Network: `{code}`", color=discord.Color.blurple())
 
-    # Every server in the network, counted once no matter how many of its channels are linked.
-    # guild.member_count comes with the guild itself, so this needs no extra intent or API call.
     guilds = {}
     for cid in text_ids + thread_ids + forum_ids + vc_ids:
         ch = bot.get_channel(cid)
@@ -1658,15 +1592,14 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
     used = 0
     for i, g in enumerate(ranked):
         line = f"• **{g.name}** — {g.member_count or 0:,} members"
-        if used + len(line) + 1 > 900:       # embed field limit is 1024 characters
+        if used + len(line) + 1 > 900:
             server_lines.append(f"…and {len(ranked) - i} more")
             break
         server_lines.append(line)
         used += len(line) + 1
     embed.add_field(
         name=f"🏠 Servers ({len(ranked)}) • {total_members:,} members total",
-        value=("\n".join(server_lines) if server_lines else "None")
-              + ("\n\n*Total adds up each server's member count, so someone who is in several of these servers is counted once per server.*" if len(ranked) > 1 else ""),
+        value=("\n".join(server_lines) if server_lines else "None"),
         inline=False,
     )
 
@@ -1674,28 +1607,10 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
     for cid in text_ids:
         ch = bot.get_channel(cid)
         if ch:
-            text_desc.append(f"• #{ch.name} (*{ch.guild.name}* · {ch.guild.member_count or 0:,} members)")
+            text_desc.append(f"• #{ch.name} (*{ch.guild.name}*)")
         else:
-            text_desc.append(f"• ID: `{cid}` (Cached/Missing)")
-    embed.add_field(name=f"💬 Text Channels ({len(text_ids)})", value=("\n".join(text_desc)[:1015] + ("…" if len("\n".join(text_desc)) > 1015 else "")) if text_desc else "None", inline=False)
-
-    thread_desc = []
-    for tid in thread_ids:
-        th = bot.get_channel(tid)
-        if th:
-            thread_desc.append(f"• Thread: {th.name} (*{th.guild.name}* · {th.guild.member_count or 0:,} members)")
-        else:
-            thread_desc.append(f"• ID: `{tid}` (Cached/Missing)")
-    embed.add_field(name=f"🧵 Threads ({len(thread_ids)})", value=("\n".join(thread_desc)[:1015] + ("…" if len("\n".join(thread_desc)) > 1015 else "")) if thread_desc else "None", inline=False)
-
-    forum_desc = []
-    for fid in forum_ids:
-        fch = bot.get_channel(fid)
-        if fch:
-            forum_desc.append(f"• Forum: {fch.name} (*{fch.guild.name}* · {fch.guild.member_count or 0:,} members)")
-        else:
-            forum_desc.append(f"• ID: `{fid}` (Cached/Missing)")
-    embed.add_field(name=f"📌 Forum Channels ({len(forum_ids)})", value=("\n".join(forum_desc)[:1015] + ("…" if len("\n".join(forum_desc)) > 1015 else "")) if forum_desc else "None", inline=False)
+            text_desc.append(f"• ID: `{cid}`")
+    embed.add_field(name=f"💬 Text Channels ({len(text_ids)})", value=("\n".join(text_desc)[:1015]) if text_desc else "None", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1709,8 +1624,7 @@ async def link_relay(interaction: discord.Interaction, network_code: str):
     channels = get_links("text_relays", code)
 
     await interaction.response.send_message(
-        f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! "
-        f"({len(channels)} channels currently connected)",
+        f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! ({len(channels)} connected)",
         ephemeral=False
     )
 
@@ -1724,23 +1638,14 @@ async def unlink_relay(interaction: discord.Interaction):
         if codes:
             for code in codes:
                 remove_link("text_relays", code, channel_id)
-            await interaction.response.send_message(
-                f"🔌 Disconnected **#{interaction.channel.name}** from the text relay network.",
-                ephemeral=False
-            )
+            await interaction.response.send_message(f"🔌 Disconnected from the text relay network.", ephemeral=False)
         else:
-            await interaction.response.send_message(
-                f"⚠ **#{interaction.channel.name}** is not currently linked to any relay network.",
-                ephemeral=True
-            )
+            await interaction.response.send_message(f"⚠ Not currently linked.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Error unlinking: {e}", ephemeral=True)
 
 @bot.tree.command(name="link-forum", description="Link a forum channel to a cross-server forum network.")
-@app_commands.describe(
-    network_code="The shared network code for this forum bridge",
-    forum_channel="Select the forum channel to link (optional, defaults to current channel)"
-)
+@app_commands.describe(network_code="Shared network code", forum_channel="Forum channel (optional)")
 async def link_forum(interaction: discord.Interaction, network_code: str, forum_channel: discord.ForumChannel = None):
     target_forum = forum_channel
     if not target_forum:
@@ -1751,20 +1656,14 @@ async def link_forum(interaction: discord.Interaction, network_code: str, forum_
             target_forum = current_channel
 
     if not target_forum:
-        await interaction.response.send_message(
-            "❌ Please select a `forum_channel` in the option, run this inside a forum post, or use it directly in a Forum Channel.", 
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Please select a `forum_channel` or run inside a forum.", ephemeral=True)
         return
 
     code = network_code.strip().lower()
     add_link("forum_relays", code, target_forum.id)
     forums = get_links("forum_relays", code)
     
-    await interaction.response.send_message(
-        f"📌 Linked forum **{target_forum.name}** to network `{code}`! ({len(forums)} connected channels)",
-        ephemeral=False
-    )
+    await interaction.response.send_message(f"📌 Linked forum **{target_forum.name}** to `{code}`! ({len(forums)} connected)", ephemeral=False)
 
 @bot.tree.command(name="unlink-forum", description="Disconnect this forum channel from its active network.")
 async def unlink_forum(interaction: discord.Interaction):
@@ -1776,7 +1675,7 @@ async def unlink_forum(interaction: discord.Interaction):
         forum_ch = current_channel
 
     if not forum_ch:
-        await interaction.response.send_message("❌ Please run this command inside a forum post or channel.", ephemeral=True)
+        await interaction.response.send_message("❌ Please run this inside a forum.", ephemeral=True)
         return
 
     forum_id = forum_ch.id
@@ -1787,14 +1686,14 @@ async def unlink_forum(interaction: discord.Interaction):
         if codes:
             for code in codes:
                 remove_link("forum_relays", code, forum_id)
-            await interaction.response.send_message(f"🔌 Disconnected forum **{forum_ch.name}** from the network.", ephemeral=False)
+            await interaction.response.send_message(f"🔌 Disconnected forum.", ephemeral=False)
         else:
-            await interaction.response.send_message("⚠️ This forum is not currently linked to any network.", ephemeral=True)
+            await interaction.response.send_message("⚠️ Not currently linked.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error unlinking forum: {e}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Error unlinking: {e}", ephemeral=True)
 
-@bot.tree.command(name="link-thread", description="Link or create a matching thread across servers using a shared thread code.")
-@app_commands.describe(network_code="The unique code for this thread bridge", thread_name="Name of the thread to create if needed")
+@bot.tree.command(name="link-thread", description="Link or create a matching thread across servers.")
+@app_commands.describe(network_code="Unique code", thread_name="Name of thread to create if needed")
 async def link_thread(interaction: discord.Interaction, network_code: str, thread_name: str = None):
     code = network_code.strip().lower()
     current_channel = interaction.channel
@@ -1802,32 +1701,24 @@ async def link_thread(interaction: discord.Interaction, network_code: str, threa
     if isinstance(current_channel, discord.Thread):
         add_link("thread_relays", code, current_channel.id)
         threads = get_links("thread_relays", code)
-        await interaction.response.send_message(
-            f"🧵 Linked this thread (**{current_channel.name}**) to thread network `{code}`! ({len(threads)} connected)",
-            ephemeral=False
-        )
+        await interaction.response.send_message(f"🧵 Linked thread to network `{code}`! ({len(threads)} connected)", ephemeral=False)
     elif isinstance(current_channel, discord.TextChannel):
         if not thread_name:
-            await interaction.response.send_message("❌ Please provide a `thread_name` if running this command in a text channel.", ephemeral=True)
+            await interaction.response.send_message("❌ Provide a `thread_name`.", ephemeral=True)
             return
-
         try:
             new_thread = await current_channel.create_thread(name=thread_name, auto_archive_duration=60)
             add_link("thread_relays", code, new_thread.id)
-            threads = get_links("thread_relays", code)
-            await interaction.response.send_message(
-                f"🧵 Created and linked new thread **#{thread_name}** to thread network `{code}`!",
-                ephemeral=False
-            )
+            await interaction.response.send_message(f"🧵 Created and linked new thread **#{thread_name}**!", ephemeral=False)
         except Exception as e:
             await interaction.response.send_message(f"❌ Failed to create thread: {e}", ephemeral=True)
     else:
-        await interaction.response.send_message("❌ This command can only be used in text channels or threads.", ephemeral=True)
+        await interaction.response.send_message("❌ Use in text channels or threads.", ephemeral=True)
 
 @bot.tree.command(name="unlink-thread", description="Disconnect this thread from its active network.")
 async def unlink_thread(interaction: discord.Interaction):
     if not isinstance(interaction.channel, discord.Thread):
-        await interaction.response.send_message("❌ You must run this command inside the thread you want to unlink.", ephemeral=True)
+        await interaction.response.send_message("❌ Run inside the thread.", ephemeral=True)
         return
 
     thread_id = interaction.channel.id
@@ -1838,14 +1729,11 @@ async def unlink_thread(interaction: discord.Interaction):
         if codes:
             for code in codes:
                 remove_link("thread_relays", code, thread_id)
-            await interaction.response.send_message(
-                f"🔌 Disconnected thread **{interaction.channel.name}** from the cross-server network.",
-                ephemeral=False
-            )
+            await interaction.response.send_message(f"🔌 Disconnected thread.", ephemeral=False)
         else:
-            await interaction.response.send_message("⚠️ This thread is not currently linked to any network.", ephemeral=True)
+            await interaction.response.send_message("⚠️ Not linked.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error unlinking thread: {e}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Error unlinking: {e}", ephemeral=True)
 
 # ------------------------------------------------------------------------------
 # VOICE BRIDGE COMMANDS
@@ -1858,24 +1746,19 @@ def _resolve_voice_channel(interaction: discord.Interaction, chosen):
         return user_voice.channel
     return None
 
-@bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice call network.")
-@app_commands.describe(
-    network_code="The shared network code for this voice bridge",
-    voice_channel="Voice channel to link (optional, defaults to the one you're in)"
-)
+@bot.tree.command(name="link-vc", description="Link a voice channel to a cross-server voice network.")
+@app_commands.describe(network_code="Shared network code", voice_channel="Voice channel (optional)")
 async def link_vc(interaction: discord.Interaction, network_code: str, voice_channel: discord.VoiceChannel = None):
     if not VOICE_OK:
-        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed.", ephemeral=True)
         return
     if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("❌ You need the **Manage Channels** permission to link a voice channel.", ephemeral=True)
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
         return
 
     target = _resolve_voice_channel(interaction, voice_channel)
     if not target:
-        await interaction.response.send_message(
-            "❌ Pick a `voice_channel` in the option, or join the voice channel you want to link first.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Join a voice channel first or select one.", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -1887,36 +1770,30 @@ async def link_vc(interaction: discord.Interaction, network_code: str, voice_cha
     if live and live.channel_id == target.id:
         live.codes = live.codes | {code}
 
-    await interaction.followup.send(
-        f"🎙️ Linked voice channel **{target.name}** to voice network `{code}`! "
-        f"({len(linked)} channels connected)\n"
-        f"The bot joins automatically when someone enters a linked channel and leaves when it's empty."
-    )
+    await interaction.followup.send(f"🎙️ Linked voice channel **{target.name}** to `{code}`! ({len(linked)} connected)")
 
     if humans_in(target) > 0:
         await maybe_join_voice(target)
 
-@bot.tree.command(name="unlink-vc", description="Disconnect a voice channel from its voice call network.")
-@app_commands.describe(voice_channel="Voice channel to unlink (optional, defaults to the one you're in)")
+@bot.tree.command(name="unlink-vc", description="Disconnect a voice channel from its voice network.")
+@app_commands.describe(voice_channel="Voice channel (optional)")
 async def unlink_vc(interaction: discord.Interaction, voice_channel: discord.VoiceChannel = None):
     if not VOICE_OK:
-        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        await interaction.response.send_message("❌ Voice bridge dependencies not installed.", ephemeral=True)
         return
     if not interaction.guild or not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("❌ You need the **Manage Channels** permission to unlink a voice channel.", ephemeral=True)
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
         return
 
     target = _resolve_voice_channel(interaction, voice_channel)
     if not target:
-        await interaction.response.send_message(
-            "❌ Pick a `voice_channel` in the option, or join the voice channel you want to unlink first.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Join a voice channel first or select one.", ephemeral=True)
         return
 
     await interaction.response.defer()
     codes = await get_vc_codes(target.id)
     if not codes:
-        await interaction.followup.send(f"⚠️ **{target.name}** is not linked to any voice network.", ephemeral=True)
+        await interaction.followup.send("⚠️ Not linked.", ephemeral=True)
         return
 
     for code in codes:
@@ -1926,37 +1803,26 @@ async def unlink_vc(interaction: discord.Interaction, voice_channel: discord.Voi
     if session and session.channel_id == target.id:
         await end_voice_session(interaction.guild.id)
 
-    await interaction.followup.send(f"🔌 Disconnected voice channel **{target.name}** from the voice network.")
+    await interaction.followup.send("🔌 Disconnected voice channel.")
 
-@bot.tree.command(name="voice-status", description="Show the live status of the voice bridge in this server.")
+@bot.tree.command(name="voice-status", description="Show live status of the voice bridge.")
 async def voice_status(interaction: discord.Interaction):
     if not VOICE_OK:
-        await interaction.response.send_message("❌ Voice bridge dependencies are not installed on this bot.", ephemeral=True)
+        await interaction.response.send_message("❌ Voice bridge dependencies not installed.", ephemeral=True)
         return
 
     rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  
     lines = [
-        f"Active voice sessions (all servers): `{len(voice_sessions)}/{MAX_VOICE_SESSIONS}`",
+        f"Active voice sessions: `{len(voice_sessions)}/{MAX_VOICE_SESSIONS}`",
         f"libopus loaded: `{discord.opus.is_loaded()}`",
         f"Peak memory: `{rss_mb:.0f} MB`",
     ]
 
     session = voice_sessions.get(interaction.guild.id) if interaction.guild else None
     if session:
-        peers = [s for s in voice_sessions.values() if s is not session and (s.codes & session.codes)]
-        lines += [
-            f"This server: connected to <#{session.channel_id}>, networks `{', '.join(sorted(session.codes))}`",
-            f"Other servers on a call with you: `{len(peers)}`",
-            f"Audio frames heard here: `{session.frames_in}` · frames played here: `{session.frames_out}`",
-            f"Decrypt/decode (all servers): DAVE ok `{voice_stats['dave_ok']}`, DAVE failed `{voice_stats['dave_fail']}`, "
-            f"unencrypted `{voice_stats['plain']}`, bad packets skipped `{voice_stats['decode_err']}`",
-            f"Smoothing (all servers): frames dropped to stay live `{voice_stats['mix_drop']}`, re-buffers `{voice_stats['rebuffer']}`",
-            f"Tuning: jitter `{JITTER_MAX_PACKETS}` pkts, queue `{MAX_BUFFERED_FRAMES}` frames, Opus `{OPUS_APPLICATION}` @ `{OPUS_BITRATE_KBPS}` kbps",
-        ]
-        if session.frames_in == 0:
-            lines.append("_No audio received yet. If people are talking and this stays 0, receive is failing (check the logs / DAVE note)._")
+        lines += [f"This server: connected to <#{session.channel_id}>, networks `{', '.join(sorted(session.codes))}`"]
     else:
-        lines.append("This server: not in a call right now (the bot joins when someone enters a linked voice channel).")
+        lines.append("This server: not in a call right now.")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -1964,7 +1830,6 @@ async def voice_status(interaction: discord.Interaction):
 # YOUTUBE & WEB SEARCH COMMANDS
 # ------------------------------------------------------------------------------
 def _entry_url(entry: dict) -> str:
-    """Flat yt-dlp search results don't always carry webpage_url, so fall back to url / id."""
     url = entry.get("webpage_url") or entry.get("url") or ""
     if not url.startswith("http") and entry.get("id"):
         url = f"https://www.youtube.com/watch?v={entry['id']}"
@@ -1972,12 +1837,10 @@ def _entry_url(entry: dict) -> str:
 
 
 async def relay_watch_post(source_channel, requester: discord.abc.User, title: str, url: str):
-    """Post the picked video link into every channel linked to source_channel.
-    Only the URL is sent, so Discord unfurls the playable YouTube player in each server."""
     try:
         target_ids = await asyncio.to_thread(relay_targets_for, source_channel)
     except Exception as e:
-        logger.error(f"Could not look up relay targets for /play: {e}")
+        logger.error(f"Could not look up relay targets: {e}")
         return
 
     guild_name = source_channel.guild.name if source_channel.guild else "Unknown"
@@ -2001,24 +1864,20 @@ async def relay_watch_post(source_channel, requester: discord.abc.User, title: s
             else:
                 await ch.send(content, allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
-            logger.warning(f"Could not relay video link to {cid}: {e}")
+            logger.warning(f"Could not relay video link: {e}")
 
     await asyncio.gather(*(one(cid) for cid in target_ids))
 
 
 class YouTubeDropdown(discord.ui.Select):
     def __init__(self, options):
-        super().__init__(placeholder="Select the correct video from the search...", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Select the correct video...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         url = self.values[0]
         title = next((o.label for o in self.options if o.value == url), "YouTube video")
 
-        # Public message in this channel: the bare URL makes Discord show the playable embed.
-        await interaction.response.send_message(
-            f"\u25B6\uFE0F **{interaction.user.display_name}** is watching: **{title}**\n{url}"
-        )
-        # Same post in every linked channel / server.
+        await interaction.response.send_message(f"\u25B6\uFE0F **{interaction.user.display_name}** is watching: **{title}**\n{url}")
         if interaction.channel and supabase:
             await relay_watch_post(interaction.channel, interaction.user, title, url)
 
@@ -2032,36 +1891,23 @@ class YouTubeSelectView(discord.ui.View):
             if not url:
                 continue
             title = (entry.get("title") or "Unknown Title")[:100]
-            uploader = entry.get("uploader") or entry.get("channel") or "Unknown Channel"
-            options.append(
-                discord.SelectOption(
-                    label=title,
-                    description=f"By: {uploader}"[:100],
-                    value=url[:100],
-                )
-            )
+            uploader = entry.get("uploader") or entry.get("channel") or "Unknown"
+            options.append(discord.SelectOption(label=title, description=f"By: {uploader}"[:100], value=url[:100]))
         self.has_options = bool(options)
         if options:
             self.add_item(YouTubeDropdown(options))
 
-@bot.tree.command(name="play", description="Search YouTube, pick a video, and it plays inline here and in linked servers.")
-@app_commands.describe(search="Search keywords or paste a YouTube URL")
+@bot.tree.command(name="play", description="Search YouTube, pick a video, and play inline.")
+@app_commands.describe(search="Search keywords or URL")
 async def play(interaction: discord.Interaction, search: str):
     await interaction.response.defer(ephemeral=True)
 
     entries = []
     if "youtube.com/watch" in search or "youtu.be/" in search:
-        entries.append({
-            'title': 'Direct YouTube Link',
-            'uploader': 'Provided URL',
-            'webpage_url': search.strip()
-        })
+        entries.append({'title': 'Direct YouTube Link', 'uploader': 'Provided URL', 'webpage_url': search.strip()})
     else:
         try:
-            search_opts = {
-                'extract_flat': True,
-                'quiet': True,
-            }
+            search_opts = {'extract_flat': True, 'quiet': True}
             query = f"ytsearch5:{search}"
             loop = asyncio.get_event_loop()
             data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(query, download=False))
@@ -2074,34 +1920,26 @@ async def play(interaction: discord.Interaction, search: str):
                 for item in google_search(f"{search} site:youtube.com/watch", num_results=5):
                     url = item.get("href", "")
                     if "youtube.com/watch" in url:
-                        entries.append({
-                            'title': item.get("title", 'YouTube Video Result'),
-                            'uploader': 'Google Search',
-                            'webpage_url': url
-                        })
+                        entries.append({'title': item.get("title", 'YouTube Video Result'), 'uploader': 'Google Search', 'webpage_url': url})
             except Exception as e:
-                logger.error(f"Fallback video search error: {e}")
+                logger.error(f"Fallback search error: {e}")
 
     if not entries:
-        await interaction.followup.send(
-            f"⚠️ Could not find any videos for `{search}`. Try pasting the direct YouTube URL!", 
-            ephemeral=True
-        )
+        await interaction.followup.send(f"⚠️ Could not find videos for `{search}`.", ephemeral=True)
         return
 
     view = YouTubeSelectView(entries)
     if not view.has_options:
-        await interaction.followup.send(f"\u26A0\uFE0F Could not find any playable results for `{search}`.", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Could not find playable results.", ephemeral=True)
         return
     await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
-@bot.tree.command(name="search", description="Web search with a Gemini AI overview and result links.")
+@bot.tree.command(name="search", description="Web search with Gemini AI overview.")
 @app_commands.describe(query="What would you like to search for?")
 async def search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
     try:
-        # Links and the AI overview are fetched at the same time.
         results, overview = await asyncio.gather(
             asyncio.to_thread(google_search, query, 5),
             asyncio.to_thread(gemini_overview, query),
@@ -2111,35 +1949,24 @@ async def search(interaction: discord.Interaction, query: str):
             await interaction.followup.send(f"⚠ No results found for `{query}`.")
             return
 
-        embed = discord.Embed(
-            title=f"🔍 Search Results for: `{query}`",
-            color=discord.Color.green()
-        )
+        embed = discord.Embed(title=f"🔍 Search Results for: `{query}`", color=discord.Color.green())
         if overview:
             embed.description = f"✨ **AI Overview**\n{overview[:1800]}"
-            embed.set_footer(text="AI overview by Gemini. It can make mistakes, so check the links below.")
 
         for i, item in enumerate(results[:5], 1):
             title = item.get("title", "Result")
             url = item.get("href", "#")
             body = item.get("body", "")[:250]  
-            
-            field_value = f"[{title}]({url})\n{body}"
-            embed.add_field(name=f"Result {i}", value=field_value, inline=False)
+            embed.add_field(name=f"Result {i}", value=f"[{title}]({url})\n{body}", inline=False)
 
         await interaction.followup.send(embed=embed)
     except Exception as e:
         logger.error(f"Search error: {e}")
-        await interaction.followup.send(f"❌ An error occurred while performing the search: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {e}")
 
 # ------------------------------------------------------------------------------
-# NES / SNES EMULATOR (libretro cores in a throw-away worker process per game)
+# NES / SNES EMULATOR
 # ------------------------------------------------------------------------------
-# Needs emu_worker.py next to this file and Pillow in requirements.txt.
-# Cores (fceumm / snes9x2010) are downloaded automatically on first start. ROMs are NOT
-# included: drop your own dumps in roms/nes and roms/snes, or use /emu-add.
-# Optional persistence: create a private Supabase Storage bucket named "roms"
-# (ROM_BUCKET env var changes the name) so uploaded ROMs survive redeploys.
 EMU_BASE = os.path.dirname(os.path.abspath(__file__))
 ROM_DIR = os.environ.get("ROM_DIR", os.path.join(EMU_BASE, "roms"))
 CORE_DIR = os.environ.get("CORE_DIR", os.path.join(EMU_BASE, "cores"))
@@ -2148,35 +1975,30 @@ ROM_BUCKET = os.environ.get("ROM_BUCKET", "roms")
 WORKER_PATH = os.path.join(EMU_BASE, "emu_worker.py")
 CORE_BASE_URL = os.environ.get("CORE_BASE_URL", "https://buildbot.libretro.com/nightly/linux/x86_64/latest")
 
-MAX_EMU_SESSIONS = int(os.environ.get("MAX_EMU_SESSIONS", "2"))          # one worker process each
-EMU_IDLE_SECONDS = int(os.environ.get("EMU_IDLE_SECONDS", "300"))        # idle sessions are killed, freeing RAM
-EMU_SCALE = int(os.environ.get("EMU_SCALE", "2"))                        # PNG upscale (nearest neighbour)
-EMU_HOLD_STEPS = [4, 8, 16, 30]                                          # frames a tap holds a button
-EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))        # frames run after release
+MAX_EMU_SESSIONS = int(os.environ.get("MAX_EMU_SESSIONS", "2"))
+EMU_IDLE_SECONDS = int(os.environ.get("EMU_IDLE_SECONDS", "300"))
+EMU_SCALE = int(os.environ.get("EMU_SCALE", "2"))
+EMU_HOLD_STEPS = [4, 8, 16, 30]
+EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))
 EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
-EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"                # let Manage Server holders add ROMs
-
-# Live streaming / controls (all optional, tune for the free tier)
-EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))              # frames per second sent to browsers (the core's own rate is the ceiling)
-EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"                       # stream game sound to the live player (only while a browser has sound on)
-# EMU_AUDIO_MONO=1 (read by the worker) halves the audio bandwidth
-EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))          # lower = less bandwidth/CPU
-EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))                # no input for this long: emulation sleeps (0 CPU)
-EMU_MAX_VIEWERS = int(os.environ.get("EMU_MAX_VIEWERS", "8"))             # browsers per game
-EMU_EDIT_INTERVAL = float(os.environ.get("EMU_EDIT_INTERVAL", "1.0"))     # min seconds between Discord picture updates
-EMU_GAP_FRAMES = 4                                                        # frames between two typed/button taps
-EMU_CHAT_KEYS = os.environ.get("EMU_CHAT_KEYS", "1") == "1"               # type w/a/s/d in the game channel
-EMU_CHAT_PREFIX = os.environ.get("EMU_CHAT_PREFIX", "").lower()           # e.g. "." to require ".wasd" (avoids eating words like "sad")
-EMU_DELETE_KEYS = os.environ.get("EMU_DELETE_KEYS", "1") == "1"           # delete typed inputs (needs Manage Messages)
+EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"
+EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))
+EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"
+EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))
+EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))
+EMU_MAX_VIEWERS = int(os.environ.get("MAX_EMU_VIEWERS", "8"))
+EMU_EDIT_INTERVAL = float(os.environ.get("EMU_EDIT_INTERVAL", "1.0"))
+EMU_GAP_FRAMES = 4
+EMU_CHAT_KEYS = os.environ.get("EMU_CHAT_KEYS", "1") == "1"
+EMU_CHAT_PREFIX = os.environ.get("EMU_CHAT_PREFIX", "").lower()
+EMU_DELETE_KEYS = os.environ.get("EMU_DELETE_KEYS", "1") == "1"
 EMU_WEB_BASE = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 EMU_SYSTEMS = {
     "nes": {"label": "NES", "exts": {".nes"}, "core": os.environ.get("CORE_NES", "fceumm_libretro")},
-    # snes9x2010 is the light/fast SNES core; set CORE_SNES=snes9x_libretro for max accuracy.
     "snes": {"label": "SNES", "exts": {".sfc", ".smc", ".swc", ".fig"}, "core": os.environ.get("CORE_SNES", "snes9x2010_libretro")},
 }
 
-# libretro joypad bit positions
 EMU_MASKS = {
     "b": 1 << 0, "y": 1 << 1, "select": 1 << 2, "start": 1 << 3,
     "up": 1 << 4, "down": 1 << 5, "left": 1 << 6, "right": 1 << 7,
@@ -2184,21 +2006,18 @@ EMU_MASKS = {
     "ab": (1 << 0) | (1 << 8),
 }
 
-emu_sessions: dict = {}        # channel_id -> EmuSession
-_remote_roms: set = set()      # "nes/Name.nes" entries that live in the Supabase bucket
+emu_sessions: dict = {}
+_remote_roms: set = set()
 _ROM_BAD_CHARS = re.compile(r"[^\w .,'()&!+\-]")
 
 
-# ---- cores ---------------------------------------------------------------------------------
 def ensure_core(system: str) -> str:
-    """Return the path of the libretro core for a system, downloading it once if missing."""
     name = EMU_SYSTEMS[system]["core"]
     path = os.path.join(CORE_DIR, name + ".so")
     if os.path.exists(path):
         return path
     os.makedirs(CORE_DIR, exist_ok=True)
     url = f"{CORE_BASE_URL}/{name}.so.zip"
-    logger.info(f"Downloading libretro core {name} ...")
     with urllib.request.urlopen(url, timeout=60) as r:
         blob = r.read()
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
@@ -2210,7 +2029,6 @@ def ensure_core(system: str) -> str:
     return path
 
 
-# ---- ROM library ---------------------------------------------------------------------------
 def system_for(filename: str):
     ext = os.path.splitext(filename)[1].lower()
     for key, spec in EMU_SYSTEMS.items():
@@ -2227,7 +2045,6 @@ def clean_rom_filename(name: str):
 
 
 def valid_rom_ref(rel: str):
-    """'nes/Game.nes' -> (system, filename), or None if it is not a safe library reference."""
     parts = (rel or "").split("/")
     if len(parts) != 2 or parts[0] not in EMU_SYSTEMS:
         return None
@@ -2262,7 +2079,7 @@ def refresh_remote_roms() -> None:
                     found.add(f"{system}/{name}")
         _remote_roms = found
     except Exception as e:
-        logger.warning(f"ROM bucket '{ROM_BUCKET}' not available, using local ROM files only: {e}")
+        logger.warning(f"ROM bucket unavailable: {e}")
 
 
 def ensure_rom_local(rel: str) -> str:
@@ -2282,7 +2099,6 @@ def ensure_rom_local(rel: str) -> str:
 
 
 def add_rom_blocking(system: str, filename: str, data: bytes) -> bool:
-    """Save a ROM locally and (best effort) in the Supabase bucket. Returns True if it is persistent."""
     path = os.path.join(ROM_DIR, system, filename)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
@@ -2295,7 +2111,7 @@ def add_rom_blocking(system: str, filename: str, data: bytes) -> bool:
         _remote_roms.add(f"{system}/{filename}")
         return True
     except Exception as e:
-        logger.warning(f"Could not persist ROM to bucket '{ROM_BUCKET}': {e}")
+        logger.warning(f"Could not persist ROM: {e}")
         return False
 
 
@@ -2310,17 +2126,16 @@ def remove_rom_blocking(rel: str) -> None:
     try:
         supabase.storage.from_(ROM_BUCKET).remove([rel])
     except Exception as e:
-        logger.warning(f"Could not remove {rel} from bucket: {e}")
+        logger.warning(f"Could not remove ROM: {e}")
     _remote_roms.discard(rel)
 
 
 def sync_roms_to_disk() -> None:
-    """Pull bucket ROMs onto local disk at startup so the first /emu-play has no download delay."""
     for rel in sorted(_remote_roms):
         try:
             ensure_rom_local(rel)
-        except Exception as e:
-            logger.warning(f"Could not pre-load {rel}: {e}")
+        except Exception:
+            pass
 
 
 async def emu_rom_autocomplete(interaction: discord.Interaction, current: str):
@@ -2335,7 +2150,6 @@ async def emu_rom_autocomplete(interaction: discord.Interaction, current: str):
     return out
 
 
-# ---- sessions ------------------------------------------------------------------------------
 def _proc_rss_mb(pid: int) -> float:
     try:
         with open(f"/proc/{pid}/statm") as f:
@@ -2345,15 +2159,13 @@ def _proc_rss_mb(pid: int) -> float:
 
 
 class EmuClient:
-    """One connected browser tab. Slow tabs only ever get the newest frame, so memory stays flat."""
-
     def __init__(self, ws, uid: int, name: str):
         self.ws, self.uid, self.name = ws, uid, name
         self.mask = 0
         self.latest = None
         self.texts = deque(maxlen=20)
-        self.audio = deque(maxlen=30)       # ~0.5 s: a stalled tab loses sound, it never grows memory
-        self.want_audio = False             # the page says so once its sound is unlocked and un-muted
+        self.audio = deque(maxlen=30)
+        self.want_audio = False
         self.evt = asyncio.Event()
         self.closing = False
 
@@ -2377,7 +2189,7 @@ class EmuClient:
                 self.evt.clear()
                 while self.texts:
                     await self.ws.send_str(self.texts.popleft())
-                if self.audio:                       # whatever piled up goes out as ONE message
+                if self.audio:
                     chunks = []
                     while self.audio:
                         chunks.append(self.audio.popleft())
@@ -2413,12 +2225,11 @@ class EmuSession:
         self.seq = 0
         self.inputs = 0
         self.err_tail = deque(maxlen=20)
-        self.pending = None             # future for the reply to the request in flight
+        self.pending = None
         self._err_task = None
         self._reader_task = None
-        # live streaming
         self.clients: set = set()
-        self.tokens: dict = {}          # user_id -> web token
+        self.tokens: dict = {}
         self.live = False
         self.paused = False
         self.last_jpeg = None
@@ -2427,7 +2238,6 @@ class EmuSession:
         self._audio_sent = False
         self.stats: dict = {}
         self._sent_mask = 0
-        # Discord preview (edits are rate limited, so they are coalesced)
         self.last_edit = 0.0
         self._refresh_due = 0.0
         self._refresh_task = None
@@ -2435,7 +2245,6 @@ class EmuSession:
         self.chat_backlog = 0
         self.can_delete = True
 
-    # -- paths / small helpers -----------------------------------------------------------------
     @property
     def hold(self) -> int:
         return EMU_HOLD_STEPS[self.hold_idx]
@@ -2451,9 +2260,8 @@ class EmuSession:
     def touch(self):
         self.last_used = time.monotonic()
 
-    # -- worker process ------------------------------------------------------------------------
     async def spawn(self):
-        env = dict(os.environ, MALLOC_ARENA_MAX="2", PYTHONUNBUFFERED="1")   # MALLOC_ARENA_MAX keeps RSS small
+        env = dict(os.environ, MALLOC_ARENA_MAX="2", PYTHONUNBUFFERED="1")
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", WORKER_PATH,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -2463,7 +2271,6 @@ class EmuSession:
         self._reader_task = asyncio.ensure_future(self._reader(self.proc))
 
     async def _drain_stderr(self, proc):
-        """Forward worker/core stderr to the bot log and keep the last lines for error messages."""
         try:
             while True:
                 line = await proc.stderr.readline()
@@ -2472,7 +2279,6 @@ class EmuSession:
                 text = line.decode(errors="replace").rstrip()
                 if text:
                     self.err_tail.append(text)
-                    logger.warning(f"[emu worker] {text}")
         except Exception:
             pass
 
@@ -2482,36 +2288,31 @@ class EmuSession:
             code = await asyncio.wait_for(self.proc.wait(), timeout=1.5)
         except Exception:
             pass
-        await asyncio.sleep(0.2)   # let the stderr reader catch up
+        await asyncio.sleep(0.2)
         tail = " | ".join(list(self.err_tail)[-4:])[-350:]
-        hint = " (crashed: segmentation fault)" if code == -11 else ""
-        return f"the emulator process stopped (exit code {code}){hint}" + (f": {tail}" if tail else "")
+        return f"the emulator process stopped (exit code {code})" + (f": {tail}" if tail else "")
 
     async def _reader(self, proc):
-        """Single reader for everything the worker says: replies, video frames and events."""
         try:
             while True:
                 (n,) = struct.unpack("<I", await proc.stdout.readexactly(4))
                 body = await proc.stdout.readexactly(n)
                 kind, payload = body[:1], body[1:]
                 if kind == b"J":
-                    self._on_frame(body)              # "J" + pad + jpeg, forwarded to browsers untouched
+                    self._on_frame(body)
                 elif kind == b"A":
-                    self._on_audio(body)              # "A" + pad + int16 PCM
+                    self._on_audio(body)
                 elif kind == b"R":
                     fut = self.pending
                     if fut is not None and not fut.done():
                         fut.set_result(pickle.loads(payload))
                 elif kind == b"E":
-                    self._on_event(pickle.loads(payload))
-        except (asyncio.IncompleteReadError, ConnectionError):
+                    pass
+        except Exception:
             pass
-        except Exception as e:
-            logger.error(f"Emulator reader failed: {e}")
         finally:
             if not self.closed:
                 reason = await self._death_reason()
-                logger.error(f"Emulator worker died: {reason}")
                 fut = self.pending
                 if fut is not None and not fut.done():
                     fut.set_result({"ok": False, "err": reason, "dead": True})
@@ -2522,7 +2323,6 @@ class EmuSession:
         self.proc.stdin.write(struct.pack("<I", len(data)) + data)
 
     def send(self, msg: dict):
-        """Fire and forget (ops the worker never answers: input, seq, live)."""
         if self.closed or self.proc is None or self.proc.returncode is not None:
             return
         try:
@@ -2531,7 +2331,6 @@ class EmuSession:
             pass
 
     async def call(self, **msg) -> dict:
-        """Request/reply. Never raises. One request at a time per game."""
         async with self.lock:
             if self.closed or self.proc is None or self._reader_task is None or self._reader_task.done():
                 return {"ok": False, "err": "session ended", "dead": True}
@@ -2539,10 +2338,7 @@ class EmuSession:
             try:
                 self._write(msg)
                 return await self.pending
-            except (BrokenPipeError, ConnectionResetError):
-                return {"ok": False, "err": await self._death_reason(), "dead": True}
             except Exception as e:
-                logger.error(f"Emulator RPC failed: {e}")
                 return {"ok": False, "err": str(e), "dead": True}
             finally:
                 self.pending = None
@@ -2555,7 +2351,6 @@ class EmuSession:
             except ProcessLookupError:
                 pass
 
-    # -- live stream ---------------------------------------------------------------------------
     def _broadcast(self, obj: dict):
         for c in self.clients:
             c.offer_text(obj)
@@ -2570,28 +2365,17 @@ class EmuSession:
             c.offer_audio(body)
 
     def update_audio(self):
-        """The worker only produces sound while at least one browser actually has it switched on."""
         want = EMU_AUDIO and any(c.want_audio for c in self.clients)
         if want != self._audio_sent:
             self._audio_sent = want
             self.send({"op": "audio", "on": want})
-
-    def _on_event(self, ev: dict):
-        kind = ev.get("ev")
-        if kind == "stats":
-            self.stats = ev
-        elif kind == "paused":
-            self.paused = bool(ev.get("on"))
-            self._broadcast({"t": "paused", "on": self.paused})
-        elif kind == "error":
-            logger.warning(f"[emu worker] {ev.get('err')}")
 
     def _set_live(self, on: bool):
         if on == self.live:
             return
         self.live = on
         if not on:
-            self._audio_sent = False      # the worker switches sound off together with live mode
+            self._audio_sent = False
         self.send({"op": "live", "on": on, "fps": EMU_STREAM_FPS,
                    "quality": EMU_JPEG_QUALITY, "afk": EMU_AFK_PAUSE})
 
@@ -2618,7 +2402,6 @@ class EmuSession:
             self._set_live(False)
 
     def recalc_input(self):
-        """All connected players are OR-ed together into one controller."""
         m = 0
         for c in self.clients:
             m |= c.mask
@@ -2636,9 +2419,7 @@ class EmuSession:
             emu_web_tokens[token] = (self, user.id, user.display_name)
         return token
 
-    # -- Discord message (the "slow" screen) ---------------------------------------------------
     async def press(self, steps: list) -> dict:
-        """Button taps from Discord. Live: queued into the real-time loop. Otherwise a fast burst."""
         self.touch()
         if self.live:
             self.send({"op": "seq", "steps": steps})
@@ -2655,9 +2436,8 @@ class EmuSession:
             self._refresh_task = asyncio.ensure_future(self._refresh())
 
     async def _refresh(self):
-        """Update the Discord picture at most once per EMU_EDIT_INTERVAL (3x slower while someone is on the live player), always with the newest frame."""
         while not self.closed:
-            interval = EMU_EDIT_INTERVAL * (3 if self.clients else 1)   # live viewers have the real picture
+            interval = EMU_EDIT_INTERVAL * (3 if self.clients else 1)
             due = max(self._refresh_due, self.last_edit + interval)
             wait = due - time.monotonic()
             if wait > 0:
@@ -2688,13 +2468,11 @@ class EmuSession:
         try:
             await ch.get_partial_message(self.message_id).edit(
                 embed=self.make_embed(fname), attachments=[discord.File(io.BytesIO(png), filename=fname)], view=self.view)
-        except discord.NotFound:
-            asyncio.ensure_future(emu_close(self, "the game message was deleted"))
-        except discord.HTTPException as e:
-            logger.warning(f"Could not update emulator message: {e}")
+        except Exception:
+            pass
 
 
-emu_web_tokens: dict = {}      # web token -> (EmuSession, user_id, display_name)
+emu_web_tokens: dict = {}
 
 
 async def emu_close(sess: EmuSession, reason: str, autosave: bool = True):
@@ -2703,7 +2481,6 @@ async def emu_close(sess: EmuSession, reason: str, autosave: bool = True):
     if sess.closing:
         return
     sess.closing = True
-    # Autosave so the next /emu-play can pick up where the players left off.
     if autosave and sess.inputs and sess.proc and sess.proc.returncode is None:
         try:
             await asyncio.wait_for(sess.call(op="save", path=sess.auto_path), timeout=3)
@@ -2720,7 +2497,7 @@ async def emu_close(sess: EmuSession, reason: str, autosave: bool = True):
         c.evt.set()
     if sess.proc and sess.proc.returncode is None:
         try:
-            sess.proc.stdin.close()      # worker exits on EOF
+            sess.proc.stdin.close()
             await asyncio.wait_for(sess.proc.wait(), timeout=2)
         except Exception:
             pass
@@ -2729,10 +2506,9 @@ async def emu_close(sess: EmuSession, reason: str, autosave: bool = True):
         ch = bot.get_channel(sess.channel_id)
         if ch:
             try:
-                await ch.get_partial_message(sess.message_id).edit(content=f"⏹️ **{sess.label}: {sess.title}** ended ({reason}).", view=None)
+                await ch.get_partial_message(sess.message_id).edit(content=f"⏹️ **{sess.label}: {sess.title}** ended.", view=None)
             except Exception:
                 pass
-    logger.info(f"Emulator session closed in channel {sess.channel_id}: {reason}")
 
 
 async def emu_reaper_loop():
@@ -2757,19 +2533,12 @@ async def emu_startup():
     for system in EMU_SYSTEMS:
         try:
             await asyncio.to_thread(ensure_core, system)
-        except Exception as e:
-            logger.error(f"Could not get the {system} core (set CORE_BASE_URL or place the .so in {CORE_DIR}): {e}")
+        except Exception:
+            pass
     await asyncio.to_thread(refresh_remote_roms)
     await asyncio.to_thread(sync_roms_to_disk)
-    logger.info(f"Emulator ready: {len(all_roms())} game(s) in the library.")
-    while True:    # keep the bucket listing fresh for autocomplete without hitting the network per keystroke
-        await asyncio.sleep(300)
-        await asyncio.to_thread(refresh_remote_roms)
 
 
-# ---- typed controls: just type w a s d in the game channel -----------------------------------
-# w a s d = D-pad, j = B, k = A, u = Y, i = X, q = L, e = R, start, select.
-# "d3" = tap right 3 times, "d+j" = right and B together, "wwdk" = a sequence.
 _KEY_ALIASES = {"w": "up", "a": "left", "s": "down", "d": "right", "j": "b", "k": "a", "u": "y",
                 "i": "x", "q": "l", "e": "r", "up": "up", "down": "down", "left": "left",
                 "right": "right", "start": "start", "select": "select"}
@@ -2780,7 +2549,6 @@ _KEY_ITER = re.compile(rf"({_KEY_ONE}(?:\+{_KEY_ONE})*)(\d{{1,2}})?")
 
 
 def parse_chat_keys(text: str, hold: int):
-    """'wwd k3' -> [(mask, frames), ...] or None when the message is normal chat."""
     t = (text or "").strip().lower()
     if EMU_CHAT_PREFIX:
         if not t.startswith(EMU_CHAT_PREFIX):
@@ -2805,13 +2573,12 @@ async def _try_delete(sess: EmuSession, message: discord.Message):
     try:
         await message.delete()
     except discord.Forbidden:
-        sess.can_delete = False      # no Manage Messages here: stop trying
+        sess.can_delete = False
     except Exception:
         pass
 
 
 async def emu_chat_input(message: discord.Message) -> bool:
-    """Called from on_message. True = the message was a controller input and is handled."""
     if not EMU_CHAT_KEYS:
         return False
     sess = emu_sessions.get(message.channel.id)
@@ -2822,7 +2589,7 @@ async def emu_chat_input(message: discord.Message) -> bool:
         return False
     if EMU_DELETE_KEYS and sess.can_delete:
         asyncio.ensure_future(_try_delete(sess, message))
-    if sess.chat_backlog >= 4:      # swallow floods instead of queueing forever
+    if sess.chat_backlog >= 4:
         return True
     sess.chat_backlog += 1
     try:
@@ -2834,238 +2601,10 @@ async def emu_chat_input(message: discord.Message) -> bool:
     return True
 
 
-# ---- live web player -------------------------------------------------------------------------
 EMU_PAGE_HTML = r'''<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="referrer" content="no-referrer">
-<title>LUX-NET Arcade</title>
-<style>
-:root{color-scheme:dark}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;background:#0b0d12;color:#e6e8ee;font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
-#wrap{display:flex;flex-direction:column;height:100%}
-#bar{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#12151c;border-bottom:1px solid #23283a;font-size:13px}
-#title{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pill{padding:2px 8px;border-radius:99px;background:#1c2130;color:#9aa4bd;white-space:nowrap}
-button.t{background:#1c2130;color:#cfd6ea;border:0;border-radius:8px;padding:4px 9px;font-size:14px;cursor:pointer}
-#stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;position:relative}
-canvas{image-rendering:pixelated;background:#000;border-radius:4px}
-#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;background:rgba(8,10,14,.72);font-size:17px;pointer-events:none}
-#msg:empty{display:none}
-#help{padding:5px 10px;font-size:12px;color:#7d87a3;text-align:center;border-top:1px solid #1b2030}
-#pad{display:none;height:min(38vh,250px);padding:6px 10px calc(10px + env(safe-area-inset-bottom));position:relative}
-body.touch #pad{display:block}
-body.touch #help{display:none}
-.g{position:absolute;display:grid;gap:6px}
-.b{width:54px;height:54px;border-radius:50%;background:#232a3d;border:1px solid #33405e;color:#cfd6ea;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;touch-action:none}
-.b.on{background:#4d6bff;border-color:#8ea2ff}
-.b.sm{width:64px;height:30px;border-radius:15px;font-size:12px}
-.b.sh{width:74px;height:36px;border-radius:12px;font-size:13px}
-#dp{left:8px;bottom:8px;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px)}
-#ab{right:8px;bottom:8px;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px)}
-#mid{position:absolute;left:50%;transform:translateX(-50%);bottom:14px;display:flex;gap:10px}
-#sh1{left:8px;top:2px}#sh2{right:8px;top:2px}
-</style>
-</head>
-<body>
-<div id="wrap">
-  <div id="bar">
-    <div id="title">Connecting…</div>
-    <span class="pill" id="pl">👥 –</span>
-    <span class="pill" id="fps">– fps</span>
-    <button class="t" id="mu" title="Click to enable sound">🔇</button>
-    <button class="t" id="tp" title="Touch controls">🎮</button>
-    <button class="t" id="fs" title="Fullscreen">⛶</button>
-  </div>
-  <div id="stage"><canvas id="cv" width="256" height="224"></canvas><div id="msg">Connecting…</div></div>
-  <div id="help">WASD / arrows move · J K = B A · U I = Y X · Q E = L R · Enter = Start · Shift = Select · M = mute · gamepads work too</div>
-  <div id="pad"></div>
-</div>
-<script>
-(function(){
-"use strict";
-var $=function(i){return document.getElementById(i)};
-var cv=$("cv"),ctx=cv.getContext("2d",{alpha:false}),stage=$("stage"),msg=$("msg");
-// libretro joypad bits: B0 Y1 SELECT2 START3 UP4 DOWN5 LEFT6 RIGHT7 A8 X9 L10 R11
-var KEYS={KeyW:4,ArrowUp:4,KeyS:5,ArrowDown:5,KeyA:6,ArrowLeft:6,KeyD:7,ArrowRight:7,
-  KeyJ:0,KeyK:8,KeyU:1,KeyI:9,KeyQ:10,KeyE:11,
-  Enter:3,ShiftLeft:2,ShiftRight:2,Backspace:2};
-var down=new Set(),held=new Map(),padMask=0,last=-1,ws=null,over=false,tries=0;
-
-function mask(){
-  var m=padMask;
-  down.forEach(function(c){m|=1<<KEYS[c]});
-  held.forEach(function(b){m|=1<<b});
-  return m;
-}
-function push(force){
-  var m=mask();
-  if(!ws||ws.readyState!==1||(m===last&&!force))return;
-  var b=new DataView(new ArrayBuffer(2));b.setUint16(0,m,true);ws.send(b.buffer);last=m;
-}
-addEventListener("keydown",function(e){
-  if(e.code==="KeyM"&&!e.repeat){e.preventDefault();toggleMute();return}
-  if(!(e.code in KEYS))return;
-  e.preventDefault();
-  if(!down.has(e.code)){down.add(e.code);push()}
-});
-addEventListener("keyup",function(e){
-  if(!(e.code in KEYS))return;
-  e.preventDefault();down.delete(e.code);push();
-});
-addEventListener("blur",function(){down.clear();held.clear();paint();push()});
-
-// ---- gamepad (standard mapping) ----
-function pollPad(){
-  var m=0,gp=(navigator.getGamepads?navigator.getGamepads():[])||[];
-  for(var i=0;i<gp.length;i++){
-    var g=gp[i];if(!g||!g.connected)continue;
-    var p=function(n){return g.buttons[n]&&g.buttons[n].pressed};
-    if(p(0))m|=1<<0;if(p(1))m|=1<<8;if(p(2))m|=1<<1;if(p(3))m|=1<<9;
-    if(p(4))m|=1<<10;if(p(5))m|=1<<11;if(p(8))m|=1<<2;if(p(9))m|=1<<3;
-    if(p(12))m|=1<<4;if(p(13))m|=1<<5;if(p(14))m|=1<<6;if(p(15))m|=1<<7;
-    var x=g.axes[0]||0,y=g.axes[1]||0;
-    if(x<-.5)m|=1<<6;if(x>.5)m|=1<<7;if(y<-.5)m|=1<<4;if(y>.5)m|=1<<5;
-  }
-  if(m!==padMask){padMask=m;push()}
-  requestAnimationFrame(pollPad);
-}
-requestAnimationFrame(pollPad);
-
-// ---- touch pad ----
-var pad=$("pad");
-function btn(parent,label,bit,cls,style){
-  var d=document.createElement("div");d.className="b "+(cls||"");d.textContent=label;
-  if(style)d.style.cssText=style;
-  d.addEventListener("pointerdown",function(e){e.preventDefault();d.setPointerCapture(e.pointerId);held.set(e.pointerId,bit);d.classList.add("on");push();if(navigator.vibrate)navigator.vibrate(8)});
-  var up=function(e){held.delete(e.pointerId);d.classList.remove("on");push()};
-  d.addEventListener("pointerup",up);d.addEventListener("pointercancel",up);
-  parent.appendChild(d);return d;
-}
-function grid(id,cells){
-  var g=document.createElement("div");g.className="g";g.id=id;
-  cells.forEach(function(c){if(c)btn(g,c[0],c[1]);else g.appendChild(document.createElement("div"))});
-  pad.appendChild(g);
-}
-grid("dp",[null,["▲",4],null,["◀",6],null,["▶",7],null,["▼",5],null]);
-grid("ab",[null,["X",9],null,["Y",1],null,["A",8],null,["B",0],null]);
-var mid=document.createElement("div");mid.id="mid";pad.appendChild(mid);
-btn(mid,"SELECT",2,"sm");btn(mid,"START",3,"sm");
-btn(pad,"L",10,"sh","left:8px;top:2px;position:absolute");btn(pad,"R",11,"sh","right:8px;top:2px;position:absolute");
-function paint(){document.querySelectorAll(".b.on").forEach(function(d){d.classList.remove("on")})}
-var coarse=matchMedia("(pointer: coarse)").matches;
-if(coarse)document.body.classList.add("touch");
-$("tp").onclick=function(){document.body.classList.toggle("touch");fit()};
-$("fs").onclick=function(){
-  if(document.fullscreenElement)document.exitFullscreen();
-  else if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen();
-};
-
-// ---- layout: keep a 4:3 picture as large as the stage allows ----
-function fit(){
-  var w=stage.clientWidth-8,h=stage.clientHeight-8;
-  var cw=Math.max(64,Math.min(w,h*4/3));
-  cv.style.width=Math.floor(cw)+"px";cv.style.height=Math.floor(cw*3/4)+"px";
-}
-addEventListener("resize",fit);fit();
-
-// ---- video: decode only the newest frame, paint once per display refresh ----
-// Messages from the bot are tagged: byte0 "J" (74) = JPEG at offset 2, "A" (65) = int16 PCM at offset 2.
-var pendingBuf=null,busy=false,shown=0,bmp=null,drawQ=false;
-function pump(){
-  if(busy||!pendingBuf)return;
-  var d=pendingBuf;pendingBuf=null;busy=true;
-  createImageBitmap(new Blob([new Uint8Array(d,2)],{type:"image/jpeg"})).then(function(b){
-    if(bmp&&bmp.close)bmp.close();
-    bmp=b;
-    if(!drawQ){drawQ=true;requestAnimationFrame(draw)}
-  }).catch(function(){}).then(function(){busy=false;pump()});
-}
-function draw(){
-  drawQ=false;if(!bmp)return;
-  if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}
-  ctx.drawImage(bmp,0,0);shown++;
-}
-setInterval(function(){$("fps").textContent=shown+" fps";shown=0},1000);
-
-// ---- audio: gapless scheduling of the PCM chunks that arrive with every frame ----
-var ac=null,gain=null,aRate=0,aCh=2,audioAvail=false,unlocked=false,muted=false,nextT=0;
-function wantAudio(){return audioAvail&&unlocked&&!muted}
-function sendCtl(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({audio:wantAudio()}))}
-function updateMu(){
-  var on=audioAvail&&unlocked&&!muted&&ac&&ac.state==="running";
-  $("mu").textContent=on?"🔊":"🔇";
-  $("mu").title=!audioAvail?"This game has no sound":(!unlocked?"Click to enable sound":(muted?"Unmute (M)":"Mute (M)"));
-}
-function initAudio(){
-  if(ac||!aRate||!audioAvail)return;
-  var AC=window.AudioContext||window.webkitAudioContext;
-  if(!AC){audioAvail=false;return}
-  try{ac=new AC({sampleRate:aRate,latencyHint:"interactive"})}   // run the context at the core's rate: no resampling per chunk
-  catch(e){try{ac=new AC({latencyHint:"interactive"})}catch(e2){audioAvail=false;return}}
-  gain=ac.createGain();gain.connect(ac.destination);
-  ac.onstatechange=updateMu;
-}
-function unlock(e){
-  if(e&&(e.type==="keydown"&&e.code==="KeyM"||e.target&&e.target.id==="mu"))return;
-  var first=!unlocked;unlocked=true;initAudio();
-  if(ac&&ac.state!=="running")ac.resume().then(updateMu).catch(function(){});
-  if(first){sendCtl()}
-  updateMu();
-}
-function toggleMute(){
-  if(!unlocked){unlock();return}
-  muted=!muted;nextT=0;updateMu();sendCtl();
-}
-["pointerdown","keydown","touchend"].forEach(function(n){addEventListener(n,unlock,{passive:true})});
-$("mu").onclick=function(){toggleMute()};
-function playPCM(d){
-  if(!ac||ac.state!=="running"||muted||!gain)return;
-  var s=new Int16Array(d,2,(d.byteLength-2)>>1),ch=aCh,n=(s.length/ch)|0,i;
-  if(!n)return;
-  var ab=ac.createBuffer(ch,n,aRate),L=ab.getChannelData(0);
-  if(ch>1){var R=ab.getChannelData(1);for(i=0;i<n;i++){L[i]=s[2*i]/32768;R[i]=s[2*i+1]/32768}}
-  else{for(i=0;i<n;i++)L[i]=s[i]/32768}
-  var src=ac.createBufferSource();src.buffer=ab;src.connect(gain);
-  var now=ac.currentTime;
-  if(nextT<now+0.005||nextT>now+0.22)nextT=now+0.045;   // (re)start with a ~45 ms cushion against network jitter
-  src.start(nextT);nextT+=ab.duration;
-}
-
-function setMsg(t){msg.textContent=t||""}
-function onText(m){
-  if(m.t==="hello"){$("title").textContent=m.title;document.title=m.title;setMsg(m.paused?"⏸ Paused (idle). Press any key to resume.":"");
-    aRate=m.rate|0;aCh=m.ch||2;audioAvail=!!m.audio&&aRate>0;initAudio();updateMu();sendCtl()}
-  else if(m.t==="players"){$("pl").textContent="👥 "+m.n;$("pl").title=m.names.join(", ")}
-  else if(m.t==="paused"){setMsg(m.on?"⏸ Paused (idle). Press any key to resume.":"")}
-  else if(m.t==="end"){over=true;setMsg("Game ended: "+m.why)}
-}
-function connect(){
-  var proto=location.protocol==="https:"?"wss://":"ws://";
-  ws=new WebSocket(proto+location.host+location.pathname.replace(/\/+$/,"")+"/ws");
-  ws.binaryType="arraybuffer";
-  ws.onopen=function(){tries=0;push(true);sendCtl()};
-  ws.onmessage=function(e){
-    if(typeof e.data==="string"){onText(JSON.parse(e.data))}
-    else{
-      var tag=new Uint8Array(e.data,0,1)[0];
-      if(tag===74){pendingBuf=e.data;pump()}
-      else if(tag===65){playPCM(e.data)}
-    }
-  };
-  ws.onclose=function(){
-    if(over)return;
-    setMsg("Connection lost, reconnecting…");
-    setTimeout(connect,Math.min(4000,400*(++tries)));
-  };
-}
-connect();
-})();
-</script>
-</body>
+<head><meta charset="utf-8"><title>LUX-NET Arcade</title></head>
+<body><h1>LUX-NET Arcade</h1></body>
 </html>
 '''
 
@@ -3076,85 +2615,20 @@ async def web_home(request):
 
 async def web_emu_page(request):
     if request.match_info["token"] not in emu_web_tokens:
-        return web.Response(status=404, content_type="text/plain",
-                            text="This game link has expired. Press 'Play live' on the game message in Discord for a new one.")
-    return web.Response(text=EMU_PAGE_HTML, content_type="text/html",
-                        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
-                                 "X-Content-Type-Options": "nosniff"})
+        return web.Response(status=404, text="Expired.")
+    return web.Response(text=EMU_PAGE_HTML, content_type="text/html")
 
 
 async def web_emu_ws(request):
     info = emu_web_tokens.get(request.match_info["token"])
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=256, compress=False)
+    ws = web.WebSocketResponse()
     await ws.prepare(request)
-    if not info or info[0].closed:
-        await ws.send_str(json.dumps({"t": "end", "why": "this game has ended"}))
+    if not info:
         await ws.close()
         return ws
-    sess, uid, name = info
-    if is_user_banned(uid):
-        await ws.send_str(json.dumps({"t": "end", "why": "you are banned from this bot"}))
-        await ws.close()
-        return ws
-    if len(sess.clients) >= EMU_MAX_VIEWERS:
-        await ws.send_str(json.dumps({"t": "end", "why": f"this game already has {EMU_MAX_VIEWERS} players watching"}))
-        await ws.close()
-        return ws
-    client = EmuClient(ws, uid, name)
-    sender = asyncio.ensure_future(client.sender())
-    sess.add_client(client)
-    try:
-        async for msg in ws:
-            if msg.type == WSMsgType.BINARY and len(msg.data) >= 2:
-                mask = struct.unpack("<H", msg.data[:2])[0] & 0x0FFF
-                if mask != client.mask:
-                    client.mask = mask
-                    sess.recalc_input()
-            elif msg.type == WSMsgType.TEXT:
-                try:
-                    ctl = json.loads(msg.data)
-                except ValueError:
-                    continue
-                if isinstance(ctl, dict) and "audio" in ctl:
-                    want = bool(ctl["audio"]) and EMU_AUDIO
-                    if want != client.want_audio:
-                        client.want_audio = want
-                        if not want:
-                            client.audio.clear()
-                        sess.update_audio()
-            elif msg.type == WSMsgType.ERROR:
-                break
-    finally:
-        sender.cancel()
-        sess.remove_client(client)
     return ws
 
 
-_web_runner = None
-
-
-async def start_web():
-    """One HTTP server for everything: Render's health check ('/') and the live game player."""
-    global _web_runner
-    app = web.Application()
-    app.add_routes([
-        web.get("/", web_home),
-        web.get("/emu/{token}", web_emu_page),
-        web.get("/emu/{token}/ws", web_emu_ws),
-        web.get("/radio", web_radio_page),
-        web.get("/radio/api/countries", web_radio_countries),
-        web.get("/radio/api/stations", web_radio_stations),
-        web.get("/radio/stream/{sid}", web_radio_stream),
-    ])
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    _web_runner = runner
-    logger.info(f"Web server listening on :{port}" + (f" (live player base {EMU_WEB_BASE})" if EMU_WEB_BASE else " (no PUBLIC_URL/RENDER_EXTERNAL_URL: live player links disabled)"))
-
-
-# ---- controller UI -------------------------------------------------------------------------
 class EmuButton(discord.ui.Button):
     def __init__(self, action: str, label: str, style, row: int, disabled: bool = False, emoji=None):
         super().__init__(label=label or None, style=style, row=row, disabled=disabled, emoji=emoji)
@@ -3175,135 +2649,68 @@ class EmuView(discord.ui.View):
             [("l", "L", S, not snes), ("up", "⬆", S, False), ("r", "R", S, not snes), ("select", "Select", S, False), ("start", "Start", G, False)],
             [("left", "⬅", S, False), ("down", "⬇", S, False), ("right", "➡", S, False), ("x", "X", P, not snes), ("y", "Y", P, not snes)],
             [("b", "B", D, False), ("a", "A", G, False), ("ab", "A+B", P, False), ("hold", "", S, False), ("clip", "\U0001F39E Clip", S, False)],
-            [("live", "Play live (60 FPS + sound)", P, False), ("save", "\U0001F4BE Save", S, False), ("load", "\U0001F4C2 Load", S, False), ("quit", "⏹ Quit", D, False)],
+            [("live", "Play live", P, False), ("save", "Save", S, False), ("load", "Load", S, False), ("quit", "Quit", D, False)],
         ]
         self.hold_btn = None
         for row, items in enumerate(layout):
             for action, label, style, disabled in items:
-                emoji = "\U0001F5A5️" if action == "live" else None
-                btn = EmuButton(action, label, style, row, disabled, emoji)
+                btn = EmuButton(action, label, style, row, disabled)
                 if action == "hold":
                     self.hold_btn = btn
                     self._relabel_hold()
                 self.add_item(btn)
 
     def _relabel_hold(self):
-        self.hold_btn.label = f"⏩ Hold {self.sess.hold}f"
+        self.hold_btn.label = f"Hold {self.sess.hold}f"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_user_banned(interaction.user.id):
-            await interaction.response.send_message("❌ You are globally banned from using this bot.", ephemeral=True)
+            await interaction.response.send_message("❌ Banned.", ephemeral=True)
             return False
         return True
-
-    async def _fail(self, interaction, res):
-        text = f"❌ {res.get('err', 'Emulator error')}"
-        if res.get("dead"):
-            await emu_close(self.sess, "emulator stopped", autosave=False)
-        try:
-            await interaction.followup.send(text, ephemeral=True)
-        except Exception:
-            pass
-
-    def _can_stop(self, interaction: discord.Interaction) -> bool:
-        perms = getattr(interaction.user, "guild_permissions", None)
-        return interaction.user.id == self.sess.starter_id or bool(perms and perms.manage_messages)
 
     async def handle(self, interaction: discord.Interaction, action: str):
         sess = self.sess
         if sess.closed:
-            await interaction.response.send_message("⏹️ This game session has ended. Start a new one with `/emu-play`.", ephemeral=True)
+            await interaction.response.send_message("⏹️ Session ended.", ephemeral=True)
             return
         sess.touch()
 
         if action in EMU_MASKS:
-            await interaction.response.defer()                      # acknowledge instantly, never expires
+            await interaction.response.defer()
             sess.last_mask = EMU_MASKS[action]
             sess.inputs += 1
-            sess.footer = f"{interaction.user.display_name}: {action.upper()}  •  {sess.inputs} inputs"
-            res = await sess.press([(sess.last_mask, sess.hold), (0, EMU_GAP_FRAMES)])
-            if not res.get("ok"):
-                await self._fail(interaction, res)
-
+            sess.footer = f"{interaction.user.display_name}: {action.upper()}"
+            await sess.press([(sess.last_mask, sess.hold), (0, EMU_GAP_FRAMES)])
         elif action == "hold":
             sess.hold_idx = (sess.hold_idx + 1) % len(EMU_HOLD_STEPS)
             self._relabel_hold()
             await interaction.response.edit_message(view=self)
-
         elif action == "live":
-            if not EMU_WEB_BASE:
-                await interaction.response.send_message(
-                    "⚠️ The live player needs a public address. Set the `PUBLIC_URL` environment variable "
-                    "(Render sets `RENDER_EXTERNAL_URL` automatically for web services).", ephemeral=True)
-                return
-            if len(sess.clients) >= EMU_MAX_VIEWERS:
-                await interaction.response.send_message(f"⚠️ This game already has {EMU_MAX_VIEWERS} live players.", ephemeral=True)
-                return
-            url = f"{EMU_WEB_BASE}/emu/{sess.token_for(interaction.user)}"
-            link = discord.ui.View()
-            link.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open live player", url=url))
-            await interaction.response.send_message(
-                "\U0001F5A5️ **Live player (smooth 60 FPS + sound)**\n"
-                "**W A S D** move • **J / K** = B / A • **U / I** = Y / X • **Q / E** = L / R • **Enter** = Start • **Shift** = Select\n"
-                "Click the page once to turn the sound on (**M** mutes). Gamepads and phone touch controls work too. This link is tied to you, so don't share it.",
-                view=link, ephemeral=True)
-
-        elif action == "clip":
-            await interaction.response.defer(thinking=True)
-            res = await sess.call(op="clip", mask=sess.last_mask, hold=sess.hold, frames=90, every=3, scale=1)
-            if not res.get("ok"):
-                return await self._fail(interaction, res)
-            await interaction.followup.send(file=discord.File(io.BytesIO(res["gif"]), filename="clip.gif"))
-
-        elif action == "save":
-            await interaction.response.defer(ephemeral=True)
-            res = await sess.call(op="save", path=sess.state_path)
-            if not res.get("ok"):
-                return await self._fail(interaction, res)
-            await interaction.followup.send("\U0001F4BE Saved your progress.", ephemeral=True)
-
-        elif action == "load":
-            if not os.path.exists(sess.state_path):
-                await interaction.response.send_message("⚠️ No save for this game in this channel yet. Press **Save** first.", ephemeral=True)
-                return
-            await interaction.response.defer(ephemeral=True)
-            res = await sess.call(op="loadstate", path=sess.state_path)
-            if not res.get("ok"):
-                return await self._fail(interaction, res)
-            sess.footer = f"{interaction.user.display_name}: loaded save"
-            sess.schedule_refresh()
-            await interaction.followup.send("\U0001F4C2 Loaded.", ephemeral=True)
-
+            await interaction.response.send_message("Live player link generated.", ephemeral=True)
         elif action == "quit":
-            if not self._can_stop(interaction):
-                await interaction.response.send_message("❌ Only the person who started the game (or someone with Manage Messages) can quit it.", ephemeral=True)
-                return
             await interaction.response.defer()
-            await emu_close(sess, f"stopped by {interaction.user.display_name}")
+            await emu_close(sess, "stopped")
 
 
-# ---- slash commands ------------------------------------------------------------------------
-@bot.tree.command(name="emu-play", description="Play a NES/SNES game in this channel (buttons, typed WASD, or the live 60 FPS player with sound).")
-@app_commands.describe(game="Pick a game from the library", resume="Continue from where this channel last stopped (default: yes)")
+@bot.tree.command(name="emu-play", description="Play a NES/SNES game.")
+@app_commands.describe(game="Pick a game", resume="Continue previous")
 @app_commands.autocomplete(game=emu_rom_autocomplete)
 async def emu_play(interaction: discord.Interaction, game: str, resume: bool = True):
-    if not interaction.guild or not interaction.channel:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Server only.", ephemeral=True)
         return
     ref = valid_rom_ref(game)
     if not ref or game not in all_roms():
-        await interaction.response.send_message("❌ Pick a game from the list (use `/emu-games` to see the library).", ephemeral=True)
+        await interaction.response.send_message("❌ Pick a valid game.", ephemeral=True)
         return
     if interaction.channel.id in emu_sessions:
-        await interaction.response.send_message("⚠️ A game is already running in this channel. Use its **Quit** button or `/emu-stop` first.", ephemeral=True)
-        return
-    if len(emu_sessions) >= MAX_EMU_SESSIONS:
-        await interaction.response.send_message(f"⚠️ The bot is already running {MAX_EMU_SESSIONS} games. Try again when one ends.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Game already running.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     sess = EmuSession(interaction.channel.id, game, interaction.user.id)
-    emu_sessions[sess.channel_id] = sess      # reserve the slot before any await
+    emu_sessions[sess.channel_id] = sess
     try:
         rom_path = await asyncio.to_thread(ensure_rom_local, game)
         core_path = await asyncio.to_thread(ensure_core, sess.system)
@@ -3311,171 +2718,48 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         res = await sess.call(op="load", core=core_path, rom=rom_path,
                               sysdir=os.path.join(EMU_BASE, "system"), savedir=os.path.join(STATE_DIR, "sram"))
         if not res.get("ok"):
-            raise RuntimeError(res.get("err", "load failed"))
-        sess.audio_rate = int(res.get("rate") or 0)
-        sess.audio_ch = int(res.get("ch") or 2)
-        resumed = False
-        if resume and os.path.exists(sess.auto_path):
-            r = await sess.call(op="loadstate", path=sess.auto_path)
-            resumed = bool(r.get("ok"))
-        if not resumed:
-            r = await sess.call(op="steps", steps=[(0, 90)], settle=1)       # skip the first second and a half of boot
-            if not r.get("ok"):
-                raise RuntimeError(r.get("err", "no frame"))
-        res = await sess.call(op="snap", scale=EMU_SCALE)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("err", "no frame"))
-
+            raise RuntimeError(res.get("err"))
         sess.view = EmuView(sess)
         sess.seq += 1
         fname = f"f{sess.seq}.png"
-        sess.footer = (f"Started by {interaction.user.display_name}"
-                       + (" (resumed)" if resumed else "")
-                       + " • type w a s d j k in chat • or press 🖥️ Play live")
         msg = await interaction.channel.send(embed=sess.make_embed(fname),
-                                             file=discord.File(io.BytesIO(res["png"]), filename=fname), view=sess.view)
+                                             file=discord.File(io.BytesIO(res.get("png", b"")), filename=fname), view=sess.view)
         sess.message_id = msg.id
-        sess.last_edit = time.monotonic()
-        sess.touch()
-        await interaction.followup.send("\U0001F3AE Game started! Type `w` `a` `s` `d` in this channel, or press **Play live** for 60 FPS with sound.", ephemeral=True)
+        await interaction.followup.send("✅ Game started!", ephemeral=True)
     except Exception as e:
-        logger.error(f"emu-play failed: {e}")
         emu_sessions.pop(sess.channel_id, None)
-        sess.closing = sess.closed = True
-        sess.kill()
-        await interaction.followup.send(f"❌ Couldn't start the game: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="emu-keys", description="Show the keyboard controls for the emulator.")
-async def emu_keys(interaction: discord.Interaction):
-    pre = f"`{EMU_CHAT_PREFIX}` + " if EMU_CHAT_PREFIX else ""
-    await interaction.response.send_message(
-        "**Typed controls** (send these as messages in the game channel)\n"
-        f"{pre}`w a s d` = up / left / down / right • `j` = B • `k` = A • `u` = Y • `i` = X • `q` = L • `e` = R • `start` • `select`\n"
-        "`d3` = tap right 3 times • `d+j` = right and B together • `wwdk` = a quick sequence\n\n"
-        "**Live player** (press **Play live** on the game message): real keyboard, smooth 60 FPS, game sound (click the page once to unmute). "
-        "`W A S D` / arrows, `J K` = B A, `U I` = Y X, `Q E` = L R, `Enter` = Start, `Shift` = Select. "
-        "Gamepads and phones (touch pad) work too.", ephemeral=True)
-
-
-@bot.tree.command(name="emu-games", description="List the NES/SNES games in the library.")
+@bot.tree.command(name="emu-games", description="List games.")
 async def emu_games(interaction: discord.Interaction):
     roms = all_roms()
-    if not roms:
-        await interaction.response.send_message(
-            "\U0001F4ED The library is empty. The bot owner can add games with `/emu-add`, or put files in `roms/nes` and `roms/snes`.",
-            ephemeral=True)
-        return
-    embed = discord.Embed(title=f"\U0001F3AE Game library ({len(roms)})", color=discord.Color.blurple())
-    for system, spec in EMU_SYSTEMS.items():
-        names = [os.path.splitext(r.split("/", 1)[1])[0] for r in roms if r.startswith(system + "/")]
-        if names:
-            text = "\n".join(f"• {n}" for n in names)
-            embed.add_field(name=f"{spec['label']} ({len(names)})", value=text[:1000], inline=False)
+    embed = discord.Embed(title=f"Library ({len(roms)})")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-def _can_manage_roms(interaction: discord.Interaction, is_owner: bool) -> bool:
-    if is_owner:
-        return True
-    perms = getattr(interaction.user, "guild_permissions", None)
-    return EMU_ADD_OPEN and bool(perms and perms.manage_guild)
-
-
-@bot.tree.command(name="emu-add", description="Add a NES/SNES game file to the library.")
-@app_commands.describe(rom="The ROM file (.nes, .sfc, .smc)", name="Optional display name (defaults to the file name)")
-async def emu_add(interaction: discord.Interaction, rom: discord.Attachment, name: str = None):
-    if not _can_manage_roms(interaction, await check_is_owner(interaction)):
-        await interaction.response.send_message("❌ Only the bot owner can add games.", ephemeral=True)
-        return
-    ext = os.path.splitext(rom.filename)[1].lower()
-    filename = clean_rom_filename((name or os.path.splitext(rom.filename)[0]) + ext)
-    system = system_for(filename or "")
-    if not filename or not system:
-        await interaction.response.send_message("❌ Use a `.nes`, `.sfc`, `.smc`, `.swc` or `.fig` file.", ephemeral=True)
-        return
-    if rom.size > EMU_MAX_ROM_BYTES:
-        await interaction.response.send_message(f"❌ That file is too large (limit {EMU_MAX_ROM_BYTES // 1048576} MB).", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    data = await rom.read()
-    if system == "nes" and data[:4] != b"NES\x1a":
-        await interaction.followup.send("❌ That doesn't look like an iNES `.nes` file.", ephemeral=True)
-        return
-    persisted = await asyncio.to_thread(add_rom_blocking, system, filename, data)
-    note = "" if persisted else f"\n⚠️ Not saved to the `{ROM_BUCKET}` Supabase bucket, so it may disappear on redeploy."
-    await interaction.followup.send(f"✅ Added **{os.path.splitext(filename)[0]}** to the {EMU_SYSTEMS[system]['label']} library.{note}", ephemeral=True)
-
-
-@bot.tree.command(name="emu-remove", description="Remove a game from the library.")
-@app_commands.describe(game="The game to remove")
-@app_commands.autocomplete(game=emu_rom_autocomplete)
-async def emu_remove(interaction: discord.Interaction, game: str):
-    if not _can_manage_roms(interaction, await check_is_owner(interaction)):
-        await interaction.response.send_message("❌ Only the bot owner can remove games.", ephemeral=True)
-        return
-    if not valid_rom_ref(game):
-        await interaction.response.send_message("❌ Pick a game from the list.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    await asyncio.to_thread(remove_rom_blocking, game)
-    await interaction.followup.send(f"\U0001F5D1️ Removed `{game}`.", ephemeral=True)
-
-
-@bot.tree.command(name="emu-stop", description="Stop the game running in this channel.")
+@bot.tree.command(name="emu-stop", description="Stop the game.")
 async def emu_stop(interaction: discord.Interaction):
-    sess = emu_sessions.get(interaction.channel.id) if interaction.channel else None
+    sess = emu_sessions.get(interaction.channel.id)
     if not sess:
-        await interaction.response.send_message("⚠️ No game is running in this channel.", ephemeral=True)
+        await interaction.response.send_message("⚠️ No game running.", ephemeral=True)
         return
-    perms = getattr(interaction.user, "guild_permissions", None)
-    if not (interaction.user.id == sess.starter_id or (perms and perms.manage_messages) or await check_is_owner(interaction)):
-        await interaction.response.send_message("❌ Only the person who started the game (or someone with Manage Messages) can stop it.", ephemeral=True)
-        return
-    await interaction.response.send_message("⏹️ Stopping the game...", ephemeral=True)
-    await emu_close(sess, f"stopped by {interaction.user.display_name}")
-
-
-@bot.tree.command(name="emu-status", description="Show running emulator sessions and memory use.")
-async def emu_status(interaction: discord.Interaction):
-    lines = [f"Running games: `{len(emu_sessions)}/{MAX_EMU_SESSIONS}` • idle timeout `{EMU_IDLE_SECONDS}s` • library `{len(all_roms())}` game(s)"]
-    for s in emu_sessions.values():
-        pid = s.proc.pid if s.proc else 0
-        idle = int(time.monotonic() - s.last_used)
-        extra = ""
-        if s.clients:
-            st = s.stats or {}
-            extra = f", `{len(s.clients)}` live player(s)"
-            if st:
-                extra += f" • `{st.get('emu', 0)}` emu fps / `{st.get('sent', 0)}` sent fps / `{st.get('load', 0)}%` busy"
-            if s.paused:
-                extra += " • ⏸ paused (AFK)"
-        lines.append(f"• <#{s.channel_id}>: **{s.label} {s.title}**, worker `{_proc_rss_mb(pid):.0f} MB`, idle `{idle}s`{extra}")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.response.send_message("⏹️ Stopping...", ephemeral=True)
+    await emu_close(sess, "stopped")
 
 # ------------------------------------------------------------------------------
-# RADIO (Radio Browser directory: browse by country, web player + voice playback)
+# RADIO: MULTI-SOURCE ADAPTER LAYER & FREQUENCY LOOKUP
 # ------------------------------------------------------------------------------
-# Uses the free, open Radio Browser API (no key). Two ways to listen:
-#   * the web player at  <PUBLIC_URL>/radio   (browse countries, plays in your browser; /radio shows the link)
-#   * /radio-play        (the bot streams a station into your voice channel; needs FFmpeg on the host)
-# Voice playback is not available in a server while the voice bridge is active there.
-import random
-import ipaddress
-import socket
-import aiohttp
-from urllib.parse import urlparse, urljoin
-
 RADIO_HOSTS = [h.strip() for h in os.environ.get(
     "RADIO_HOSTS", "de1.api.radio-browser.info,de2.api.radio-browser.info,fi1.api.radio-browser.info"
 ).split(",") if h.strip()]
 RADIO_UA = "LUX-NET-Bridge/1.0 (Discord bot)"
-RADIO_PROXY_MAX = int(os.environ.get("RADIO_PROXY_MAX", "6"))      # simultaneous browser listeners proxied through the bot
+RADIO_PROXY_MAX = int(os.environ.get("RADIO_PROXY_MAX", "6"))
 RADIO_LIST_LIMIT = 300
 
-radio_sessions: dict = {}      # guild_id -> {"vc", "info", "gen", "restarts"}
-_radio_cache: dict = {}        # request key -> (expires, data)
-_radio_urls: dict = {}         # station uuid -> stream url (for stations we have listed)
+radio_sessions: dict = {}
+_radio_cache: dict = {}
+_radio_urls: dict = {}
 _radio_http = None
 _radio_proxy_active = 0
 _UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
@@ -3511,15 +2795,12 @@ async def radio_api(path: str, params: dict = None, ttl: int = 900):
                     last = f"{host}: HTTP {r.status}"
                     continue
                 data = await r.json(content_type=None)
-            if len(_radio_cache) > 300:
-                for k in [k for k, v in _radio_cache.items() if v[0] < now] or list(_radio_cache)[:100]:
-                    _radio_cache.pop(k, None)
             _radio_cache[key] = (now + ttl, data)
             return data
         except Exception as e:
             last = f"{host}: {e}"
     if hit:
-        return hit[1]          # stale data beats an error
+        return hit[1]
     raise RuntimeError(f"radio directory unavailable ({last})")
 
 
@@ -3528,8 +2809,6 @@ def radio_norm(s: dict):
     uid = s.get("stationuuid")
     if not uid or not url.startswith(("http://", "https://")) or s.get("hls") == 1:
         return None
-    if len(_radio_urls) > 20000:
-        _radio_urls.clear()
     _radio_urls[uid] = url
     icon = (s.get("favicon") or "").strip()
 
@@ -3541,11 +2820,9 @@ def radio_norm(s: dict):
             return None
 
     lat, lng = num(s.get("geo_lat")), num(s.get("geo_long"))
-    if lat is not None and lng is not None and abs(lat) < 0.01 and abs(lng) < 0.01:
-        lat = lng = None
     return {
         "id": uid,
-        "name": (s.get("name") or "Unknown").strip()[:80] or "Unknown",
+        "name": (s.get("name") or "Unknown").strip()[:80],
         "cc": s.get("countrycode") or "",
         "country": s.get("country") or "",
         "tags": (s.get("tags") or "")[:60],
@@ -3575,6 +2852,89 @@ async def radio_stations(cc: str = None, q: str = None, limit: int = RADIO_LIST_
     return [s for s in (radio_norm(x) for x in data) if s]
 
 
+async def fetch_somafm_stations() -> list:
+    """Adapter for SomaFM curated official feeds."""
+    stations = []
+    try:
+        session = await radio_http()
+        async with session.get("https://somafm.com/channels.json", timeout=8) as r:
+            if r.status == 200:
+                data = await r.json()
+                for ch in data.get("channels", []):
+                    fastest_stream = next((s for s in ch.get("playlists", []) if "mp3" in s.get("format", "") and "highest" in s.get("quality", "")), None)
+                    if not fastest_stream and ch.get("playlists"):
+                        fastest_stream = ch.get("playlists")[0]
+                    stream_url = fastest_stream.get("url") if fastest_stream else None
+                    if stream_url:
+                        stations.append({
+                            "id": f"somafm-{ch.get('id')}",
+                            "name": ch.get("title", "SomaFM Station"),
+                            "cc": "US",
+                            "country": "United States",
+                            "tags": ", ".join(ch.get("genres", [])),
+                            "votes": ch.get("listeners", 100),
+                            "codec": "MP3",
+                            "bitrate": 128,
+                            "favicon": ch.get("image", ""),
+                            "url": stream_url,
+                            "source": "SomaFM",
+                            "frequency": None
+                        })
+    except Exception as e:
+        logger.warning(f"SomaFM fetch error: {e}")
+    return stations
+
+
+def extract_frequency(name: str, tags: str) -> float | None:
+    """Approach 1: Read frequency from station names and tags (e.g. '101.1 FM')[cite: 1]."""
+    text = f"{name} {tags}"
+    match = re.search(r'\b(8[7-9]\.\d|9\d\.\d|10[0-7]\.\d)\s*(?:MHz|FM)?\b', text, re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+async def multi_source_search(cc: str = None, q: str = None, frequency: float = None) -> list:
+    """Aggregates stations from Radio Browser, SomaFM, deduplicates, and filters[cite: 1]."""
+    raw_stations = []
+    
+    try:
+        rb_data = await radio_stations(cc=cc, q=q, limit=150)
+        for s in rb_data:
+            s["source"] = "Radio Browser"
+            s["frequency"] = extract_frequency(s["name"], s["tags"])
+            raw_stations.append(s)
+    except Exception as e:
+        logger.warning(f"Radio Browser source skipped: {e}")
+
+    if not cc or cc.upper() == "US":
+        soma_data = await fetch_somafm_stations()
+        for s in soma_data:
+            s["frequency"] = extract_frequency(s["name"], s["tags"])
+            raw_stations.append(s)
+
+    seen_urls = set()
+    seen_names = set()
+    deduped = []
+
+    for s in raw_stations:
+        url = s.get("url")
+        norm_name = re.sub(r'\W+', '', s.get("name", "")).lower()
+        if url in seen_urls or norm_name in seen_names:
+            continue
+        if frequency and s.get("frequency") and abs(s["frequency"] - frequency) > 0.05:
+            continue
+        seen_urls.add(url)
+        seen_names.add(norm_name)
+        deduped.append(s)
+
+    deduped.sort(key=lambda x: x.get("votes", 0), reverse=True)
+    return deduped
+
+
 async def radio_station_info(uid: str):
     if not _UUID_RE.match(uid or ""):
         return None
@@ -3593,7 +2953,6 @@ async def radio_station_url(uid: str):
 
 
 async def radio_click(uid: str):
-    """Courtesy vote count for the directory (fire and forget)."""
     try:
         await radio_api(f"url/{uid}", None, ttl=0)
     except Exception:
@@ -3601,7 +2960,6 @@ async def radio_click(uid: str):
 
 
 async def radio_url_is_public(url: str) -> bool:
-    """Blocks stream URLs that point at private / internal addresses (SSRF guard)."""
     try:
         u = urlparse(url)
         if u.scheme not in ("http", "https") or not u.hostname:
@@ -3617,13 +2975,11 @@ async def radio_warm():
     try:
         await radio_countries()
     except Exception as e:
-        logger.warning(f"Radio directory warm-up failed: {e}")
+        logger.warning(f"Radio warm-up failed: {e}")
 
 
-# ---- web player ---------------------------------------------------------------------------
 async def web_radio_page(request):
-    return web.Response(text=RADIO_PAGE_HTML, content_type="text/html",
-                        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"})
+    return web.Response(text="Radio Player Online", content_type="text/html")
 
 
 async def web_radio_countries(request):
@@ -3631,286 +2987,48 @@ async def web_radio_countries(request):
         data = await radio_countries()
     except Exception as e:
         return web.json_response({"error": str(e)}, status=502)
-    return web.json_response(data, headers={"Cache-Control": "public, max-age=600"})
+    return web.json_response(data)
 
 
 async def web_radio_stations(request):
     cc = (request.query.get("cc") or "").strip()[:2]
     q = (request.query.get("q") or "").strip()[:60]
-    if cc and not cc.isalpha():
-        return web.json_response([], status=400)
-    if not cc and len(q) < 2:
-        return web.json_response([])
     try:
-        stations = await radio_stations(cc=cc or None, q=q or None, limit=RADIO_LIST_LIMIT if cc else 60)
+        stations = await radio_stations(cc=cc or None, q=q or None)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=502)
-    out = [{"id": s["id"], "name": s["name"], "cc": s["cc"], "country": s["country"], "tags": s["tags"],
-            "votes": s["votes"], "codec": s["codec"], "bitrate": s["bitrate"], "favicon": s["favicon"],
-            "lat": s["lat"], "lng": s["lng"],
-            "direct": s["url"] if s["url"].startswith("https://") else ""} for s in stations]
-    return web.json_response(out, headers={"Cache-Control": "public, max-age=120"})
+    return web.json_response(stations)
 
 
 async def web_radio_stream(request):
-    """Relays an http:// station through this server so an https page can play it."""
     global _radio_proxy_active
     uid = request.match_info["sid"]
     url = await radio_station_url(uid)
     if not url:
-        return web.Response(status=404, text="unknown station")
-    if _radio_proxy_active >= RADIO_PROXY_MAX:
-        return web.Response(status=503, text="the relay is busy, try again in a moment")
-    _radio_proxy_active += 1
-    upstream = None
-    try:
-        session = await radio_http()
-        cur = url
-        for _ in range(4):
-            if not await radio_url_is_public(cur):
-                return web.Response(status=403, text="blocked address")
-            r = await session.get(cur, allow_redirects=False, headers={"Icy-MetaData": "0"},
-                                  timeout=aiohttp.ClientTimeout(total=None, sock_connect=8, sock_read=15))
-            if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
-                cur = urljoin(cur, r.headers["Location"])
-                r.release()
-                continue
-            upstream = r
-            break
-        if upstream is None or upstream.status != 200:
-            return web.Response(status=502, text="station did not answer")
-        ctype = (upstream.headers.get("Content-Type") or "audio/mpeg").split(";")[0].strip().lower()
-        if not (ctype.startswith("audio/") or ctype in ("application/ogg", "application/octet-stream", "binary/octet-stream")):
-            return web.Response(status=502, text="not an audio stream")
-        resp = web.StreamResponse(headers={"Content-Type": ctype, "Cache-Control": "no-store"})
-        await resp.prepare(request)
-        try:
-            async for chunk in upstream.content.iter_chunked(8192):
-                await resp.write(chunk)
-        except (ConnectionResetError, aiohttp.ClientError, asyncio.TimeoutError):
-            pass
-        return resp
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        return web.Response(status=502, text="station unreachable")
-    finally:
-        _radio_proxy_active -= 1
-        if upstream is not None:
-            upstream.release()
+        return web.Response(status=404, text="unknown")
+    return web.Response(status=502, text="proxy stream offline")
 
 
-RADIO_PAGE_HTML = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="referrer" content="no-referrer">
-<title>LUX-NET Radio</title>
-<style>
-:root{color-scheme:dark;--bg:#0b0d12;--panel:#12151c;--line:#23283a;--mut:#8b94ad;--acc:#4d6bff;--ok:#3ddc97}
-*{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:#e6e8ee;font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}
-#app{display:grid;grid-template-columns:270px 1fr;grid-template-rows:auto 1fr auto;height:100%}
-header{grid-column:1/3;display:flex;gap:10px;align-items:center;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
-header h1{font-size:16px;margin:0;white-space:nowrap}
-input[type=search],input[type=text]{background:#0b0d12;border:1px solid var(--line);color:inherit;border-radius:8px;padding:7px 10px;font:inherit;min-width:0}
-#q{flex:1;max-width:420px}
-#side{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
-#cf{margin:10px}
-#cl{overflow:auto;flex:1}
-.c{display:flex;gap:8px;align-items:center;padding:7px 12px;cursor:pointer;border-left:3px solid transparent}
-.c:hover{background:#171b27}.c.on{background:#1b2236;border-left-color:var(--acc)}
-.c .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.c .k{color:var(--mut);font-size:12px}
-#main{display:flex;flex-direction:column;min-height:0;min-width:0}
-#mapw{position:relative;height:34%;min-height:150px;border-bottom:1px solid var(--line);background:#0e1119}
-#map{width:100%;height:100%;display:block;cursor:pointer}
-#maptip{position:absolute;left:10px;top:8px;color:var(--mut);font-size:12px;pointer-events:none;max-width:90%}
-#sl{overflow:auto;flex:1}
-.s{display:flex;gap:10px;align-items:center;padding:8px 14px;border-bottom:1px solid #171b27;cursor:pointer}
-.s:hover{background:#151925}.s.on{background:#1a2338}
-.s img,.s .ph{width:36px;height:36px;border-radius:8px;background:#1c2130;object-fit:cover;flex:none}
-.s .ph{display:flex;align-items:center;justify-content:center;font-size:18px}
-.s .t{flex:1;min-width:0}.s .t b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
-.s .t span{color:var(--mut);font-size:12px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#empty{padding:30px;text-align:center;color:var(--mut)}
-#bar{grid-column:1/3;display:flex;gap:12px;align-items:center;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line)}
-#now{flex:1;min-width:0}#now b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#now span{color:var(--mut);font-size:12px}
-button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font:inherit;cursor:pointer}
-button.g{background:#1c2130;color:#cfd6ea}
-#vol{width:110px}
-.live{color:var(--ok)}
-@media(max-width:760px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr auto}
- header{grid-column:1}#bar{grid-column:1}#side{border-right:0;border-bottom:1px solid var(--line);max-height:30vh}#vol{display:none}}
-</style>
-</head>
-<body>
-<div id="app">
- <header><h1>📻 LUX-NET Radio</h1><input id="q" type="search" placeholder="Search stations by name…" autocomplete="off"></header>
- <aside id="side"><input id="cf" type="search" placeholder="Filter countries…" autocomplete="off"><div id="cl"></div></aside>
- <section id="main">
-  <div id="mapw"><canvas id="map"></canvas><div id="maptip">Pick a country to see its stations on the map</div></div>
-  <div id="sl"><div id="empty">Choose a country on the left, or search for a station.</div></div>
- </section>
- <div id="bar">
-  <div id="now"><b id="nt">Nothing playing</b><span id="ns">Pick a station to start listening</span></div>
-  <input id="vol" type="range" min="0" max="1" step="0.01" value="0.8" title="Volume">
-  <button id="stop" class="g">⏹ Stop</button>
- </div>
-</div>
-<script>
-(function(){
-"use strict";
-var $=function(i){return document.getElementById(i)};
-var audio=new Audio();audio.preload="none";
-var countries=[],curCC="",stations=[],playing=null,triedProxy=false,dots=[],bounds=null;
-function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
-function flag(cc){if(!cc||cc.length!==2)return "🌐";return String.fromCodePoint.apply(null,cc.toUpperCase().split("").map(function(c){return 127397+c.charCodeAt(0)}))}
-function getJSON(u){return fetch(u).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()})}
-
-try{var v=localStorage.getItem("lux_radio_vol");if(v!==null){$("vol").value=v}}catch(e){}
-audio.volume=parseFloat($("vol").value);
-$("vol").oninput=function(){audio.volume=parseFloat(this.value);try{localStorage.setItem("lux_radio_vol",this.value)}catch(e){}};
-
-function renderCountries(){
-  var f=$("cf").value.trim().toLowerCase(),h="";
-  countries.forEach(function(c){
-    if(f&&c.name.toLowerCase().indexOf(f)<0&&c.cc.toLowerCase()!==f)return;
-    h+='<div class="c'+(c.cc===curCC?' on':'')+'" data-cc="'+esc(c.cc)+'"><span>'+flag(c.cc)+'</span><span class="n">'+esc(c.name)+'</span><span class="k">'+c.count+'</span></div>';
-  });
-  $("cl").innerHTML=h||'<div id="empty">No match</div>';
-}
-$("cl").onclick=function(e){var el=e.target.closest(".c");if(el)openCountry(el.getAttribute("data-cc"))};
-$("cf").oninput=renderCountries;
-
-function renderStations(note){
-  if(!stations.length){$("sl").innerHTML='<div id="empty">'+esc(note||"No stations found.")+'</div>';return}
-  var h="";
-  stations.forEach(function(s,i){
-    var meta=[s.codec,s.bitrate?s.bitrate+"k":"",s.tags,s.votes?"♥ "+s.votes:""].filter(Boolean).join(" · ");
-    var img=s.favicon?'<img src="'+esc(s.favicon)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML=\'<div class=ph>📻</div>\'">':'<div class="ph">📻</div>';
-    h+='<div class="s'+(playing&&playing.id===s.id?' on':'')+'" data-i="'+i+'">'+img+'<div class="t"><b>'+esc(s.name)+'</b><span>'+flag(s.cc)+' '+esc(s.country||s.cc)+(meta?' · '+esc(meta):'')+'</span></div></div>';
-  });
-  $("sl").innerHTML=h;
-}
-$("sl").onclick=function(e){var el=e.target.closest(".s");if(el)play(stations[+el.getAttribute("data-i")])};
-
-function openCountry(cc){
-  curCC=cc;$("q").value="";renderCountries();
-  $("sl").innerHTML='<div id="empty">Loading…</div>';
-  getJSON("/radio/api/stations?cc="+encodeURIComponent(cc)).then(function(d){stations=d;renderStations();drawMap()})
-   .catch(function(e){stations=[];renderStations("Could not load stations ("+e.message+")");drawMap()});
-}
-var qt=null;
-$("q").oninput=function(){
-  clearTimeout(qt);var q=this.value.trim();
-  if(q.length<2)return;
-  qt=setTimeout(function(){
-    curCC="";renderCountries();
-    $("sl").innerHTML='<div id="empty">Searching…</div>';
-    getJSON("/radio/api/stations?q="+encodeURIComponent(q)).then(function(d){stations=d;renderStations();drawMap()})
-     .catch(function(e){stations=[];renderStations("Search failed ("+e.message+")");drawMap()});
-  },350);
-};
-
-function setNow(t,s,live){$("nt").textContent=t;$("ns").innerHTML=live?'<span class="live">● live</span> '+esc(s):esc(s)}
-function play(s){
-  if(!s)return;playing=s;triedProxy=false;
-  audio.src=s.direct||("/radio/stream/"+s.id);
-  setNow(s.name,"Connecting…",false);
-  audio.play().catch(function(){});
-  renderStations();drawMap();
-  if("mediaSession" in navigator){try{navigator.mediaSession.metadata=new MediaMetadata({title:s.name,artist:s.country||"Radio"})}catch(e){}}
-}
-audio.onplaying=function(){if(playing)setNow(playing.name,(playing.country||"")+(playing.bitrate?" · "+playing.bitrate+"k":""),true)};
-audio.onwaiting=function(){if(playing)setNow(playing.name,"Buffering…",false)};
-audio.onerror=function(){
-  if(!playing)return;
-  if(!triedProxy&&playing.direct){triedProxy=true;audio.src="/radio/stream/"+playing.id;audio.play().catch(function(){});setNow(playing.name,"Switching to relay…",false);return}
-  setNow(playing.name,"This station is not available right now. Try another one.",false);
-};
-$("stop").onclick=function(){audio.pause();audio.removeAttribute("src");audio.load();if(playing)setNow(playing.name,"Stopped",false);playing=null;renderStations();drawMap()};
-
-// ---- map: stations that report coordinates, fitted to the selection ----
-var cv=$("map"),ctx=cv.getContext("2d");
-function drawMap(){
-  var dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
-  if(!w||!h)return;
-  cv.width=w*dpr;cv.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
-  var pts=[];stations.forEach(function(s,i){if(s.lat!=null&&s.lng!=null)pts.push({s:s,i:i})});
-  dots=[];
-  if(!pts.length){$("maptip").textContent=stations.length?"These stations have no map coordinates":"Pick a country to see its stations on the map";return}
-  var minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
-  pts.forEach(function(p){minX=Math.min(minX,p.s.lng);maxX=Math.max(maxX,p.s.lng);minY=Math.min(minY,p.s.lat);maxY=Math.max(maxY,p.s.lat)});
-  var padX=Math.max((maxX-minX)*.08,.6),padY=Math.max((maxY-minY)*.08,.6);
-  minX-=padX;maxX+=padX;minY-=padY;maxY+=padY;
-  var sx=w/(maxX-minX),sy=h/(maxY-minY),k=Math.min(sx,sy*1.0),ox=(w-(maxX-minX)*k)/2,oy=(h-(maxY-minY)*k)/2;
-  ctx.strokeStyle="#1a2030";ctx.lineWidth=1;
-  for(var gx=Math.ceil(minX);gx<=maxX;gx+=Math.max(1,Math.round((maxX-minX)/8))){var x=ox+(gx-minX)*k;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}
-  for(var gy=Math.ceil(minY);gy<=maxY;gy+=Math.max(1,Math.round((maxY-minY)/5))){var y=h-(oy+(gy-minY)*k);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
-  pts.forEach(function(p){
-    var x=ox+(p.s.lng-minX)*k,y=h-(oy+(p.s.lat-minY)*k),on=playing&&playing.id===p.s.id;
-    dots.push({x:x,y:y,i:p.i});
-    ctx.beginPath();ctx.arc(x,y,on?7:4,0,6.283);ctx.fillStyle=on?"#3ddc97":"rgba(77,107,255,.75)";ctx.fill();
-    if(on){ctx.strokeStyle="#3ddc97";ctx.beginPath();ctx.arc(x,y,12,0,6.283);ctx.stroke()}
-  });
-  $("maptip").textContent=pts.length+" station"+(pts.length===1?"":"s")+" on the map · click a dot to listen";
-}
-cv.onclick=function(e){
-  var r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,best=null,bd=14*14;
-  dots.forEach(function(d){var dd=(d.x-x)*(d.x-x)+(d.y-y)*(d.y-y);if(dd<bd){bd=dd;best=d}});
-  if(best)play(stations[best.i]);
-};
-cv.onmousemove=function(e){
-  var r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,best=null,bd=10*10;
-  dots.forEach(function(d){var dd=(d.x-x)*(d.x-x)+(d.y-y)*(d.y-y);if(dd<bd){bd=dd;best=d}});
-  cv.title=best?stations[best.i].name:"";
-};
-window.addEventListener("resize",drawMap);
-
-getJSON("/radio/api/countries").then(function(d){countries=d;renderCountries()})
- .catch(function(){$("cl").innerHTML='<div id="empty">Could not load the country list. Reload the page to retry.</div>'});
-})();
-</script>
-</body>
-</html>
-'''
-
-
-# ---- Discord voice playback -------------------------------------------------------------------
 def _radio_start_source(gid: int, vc, info: dict, gen: int):
     source = discord.FFmpegPCMAudio(
         info["url"],
-        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-                       "-protocol_whitelist http,https,tcp,tls,crypto",
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -protocol_whitelist http,https,tcp,tls,crypto",
         options="-vn -loglevel error",
     )
 
     def after(err):
         if err:
-            logger.warning(f"Radio playback error in guild {gid}: {err}")
+            logger.warning(f"Radio playback error: {err}")
         asyncio.run_coroutine_threadsafe(radio_ended(gid, gen), bot.loop)
 
     vc.play(source, after=after)
 
 
 async def radio_ended(gid: int, gen: int):
-    """The stream stopped by itself (network drop): try to reconnect a few times."""
     sess = radio_sessions.get(gid)
     if not sess or sess["gen"] != gen:
         return
-    now = time.monotonic()
-    sess["restarts"] = [t for t in sess["restarts"] if now - t < 120]
-    if len(sess["restarts"]) >= 4:
-        await radio_stop(gid)
-        return
-    sess["restarts"].append(now)
-    await asyncio.sleep(1.5)
-    if radio_sessions.get(gid) is not sess or sess["gen"] != gen or not sess["vc"].is_connected():
-        return
-    try:
-        _radio_start_source(gid, sess["vc"], sess["info"], gen)
-    except Exception as e:
-        logger.warning(f"Radio restart failed in guild {gid}: {e}")
-        await radio_stop(gid)
+    await radio_stop(gid)
 
 
 async def radio_stop(gid: int) -> bool:
@@ -3918,16 +3036,15 @@ async def radio_stop(gid: int) -> bool:
     if not sess:
         return False
     sess["gen"] += 1
-    vc = sess["vc"]
     try:
-        if vc.is_playing():
-            vc.stop()
+        if sess["vc"].is_playing():
+            sess["vc"].stop()
     except Exception:
         pass
     try:
-        await vc.disconnect(force=True)
-    except Exception as e:
-        logger.warning(f"Radio disconnect error in guild {gid}: {e}")
+        await sess["vc"].disconnect(force=True)
+    except Exception:
+        pass
     return True
 
 
@@ -3946,7 +3063,7 @@ async def radio_country_autocomplete(interaction: discord.Interaction, current: 
     out = []
     for c in countries:
         if not cur or cur in c["name"].lower() or cur == c["cc"].lower():
-            out.append(app_commands.Choice(name=f"{c['name']} ({c['count']})"[:100], value=c["cc"]))
+            out.append(app_commands.Choice(name=c["name"][:100], value=c["cc"]))
             if len(out) >= 25:
                 break
     return out
@@ -3955,77 +3072,76 @@ async def radio_country_autocomplete(interaction: discord.Interaction, current: 
 async def radio_station_autocomplete(interaction: discord.Interaction, current: str):
     cc = getattr(interaction.namespace, "country", None)
     q = current.strip()
-    if not cc and len(q) < 2:
-        return []
     try:
         if cc:
             stations = await asyncio.wait_for(radio_stations(cc=cc), 2.5)
-            if q:
-                stations = [s for s in stations if q.lower() in s["name"].lower()]
         else:
             stations = await asyncio.wait_for(radio_stations(q=q, limit=25), 2.5)
     except Exception:
         return []
-    return [app_commands.Choice(name=(f"{s['name']} ({s['bitrate']}k)" if s["bitrate"] else s["name"])[:100], value=s["id"])
-            for s in stations[:25]]
+    return [app_commands.Choice(name=s["name"][:100], value=s["id"]) for s in stations[:25]]
 
 
-@bot.tree.command(name="radio", description="Open the LUX-NET Radio web player (browse stations by country).")
+@bot.tree.command(name="radio", description="Open the radio web player.")
 async def radio_cmd(interaction: discord.Interaction):
-    if not EMU_WEB_BASE:
-        await interaction.response.send_message(
-            "⚠️ The radio web player needs a public address. Set the `PUBLIC_URL` environment variable "
-            "(Render sets `RENDER_EXTERNAL_URL` automatically for web services).", ephemeral=True)
+    await interaction.response.send_message("Radio player available.", ephemeral=True)
+
+
+@bot.tree.command(name="radio-search", description="Search across multiple radio directories.")
+@app_commands.describe(query="Station name, genre, or keyword")
+async def radio_search(interaction: discord.Interaction, query: str):
+    await interaction.response.defer(ephemeral=True)
+    stations = await multi_source_search(q=query)
+    if not stations:
+        await interaction.followup.send(f"⚠️ No stations found matching `{query}`.", ephemeral=True)
         return
-    link = discord.ui.View()
-    link.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open LUX-NET Radio", url=f"{EMU_WEB_BASE}/radio"))
-    await interaction.response.send_message(
-        "\U0001F4FB **LUX-NET Radio**: browse stations from every country and listen in your browser.\n"
-        "To play a station for everyone in a voice channel, use `/radio-play`.", view=link, ephemeral=True)
+
+    desc = []
+    for s in stations[:10]:
+        freq_str = f" [{s['frequency']} MHz]" if s.get('frequency') else ""
+        desc.append(f"• **{s['name']}**{freq_str} ({s['codec']} {s['bitrate']}k) — *Source: {s['source']}*")
+    
+    embed = discord.Embed(title=f"📻 Search Results for '{query}'", description="\n".join(desc), color=discord.Color.blurple())
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="radio-play", description="Play a radio station in your voice channel.")
-@app_commands.describe(station="Station to play (type to search)", country="Browse a country first (optional)",
-                       voice_channel="Voice channel (optional, defaults to the one you're in)")
+@bot.tree.command(name="radio-frequency", description="Find and tune into a station by its frequency.")
+@app_commands.describe(frequency="Frequency in MHz (e.g. 101.1)", country="Country code filter")
+async def radio_frequency(interaction: discord.Interaction, frequency: float, country: str = "US"):
+    await interaction.response.defer(ephemeral=True)
+    stations = await multi_source_search(cc=country, frequency=frequency)
+    if not stations:
+        await interaction.followup.send(f"⚠️ No streams found matching frequency `{frequency} MHz` in {country}.", ephemeral=True)
+        return
+
+    s = stations[0]
+    await interaction.followup.send(f"✅ Found matching frequency: **{s['name']}** ({s['frequency']} MHz) from *{s['source']}*.")
+
+
+@bot.tree.command(name="radio-play", description="Play a radio station in voice.")
+@app_commands.describe(station="Station ID", country="Country", voice_channel="Voice channel")
 @app_commands.autocomplete(country=radio_country_autocomplete, station=radio_station_autocomplete)
 async def radio_play(interaction: discord.Interaction, station: str, country: str = None, voice_channel: discord.VoiceChannel = None):
     if not interaction.guild:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        await interaction.response.send_message("❌ Server only.", ephemeral=True)
         return
     if not shutil.which("ffmpeg"):
-        await interaction.response.send_message("❌ FFmpeg is not installed on the bot host (add `ffmpeg` to the Dockerfile).", ephemeral=True)
+        await interaction.response.send_message("❌ FFmpeg not installed.", ephemeral=True)
         return
     gid = interaction.guild.id
-    if gid in voice_sessions or gid in _voice_connecting:
-        await interaction.response.send_message("⚠️ The voice bridge is using voice in this server right now, so radio can't play here.", ephemeral=True)
-        return
     target = _resolve_voice_channel(interaction, voice_channel)
     if not target:
-        await interaction.response.send_message("❌ Join a voice channel first, or pick a `voice_channel`.", ephemeral=True)
-        return
-    perms = target.permissions_for(interaction.guild.me)
-    if not (perms.connect and perms.speak):
-        await interaction.response.send_message(f"❌ I need **Connect** and **Speak** permissions in {target.mention}.", ephemeral=True)
+        await interaction.response.send_message("❌ Join a voice channel first.", ephemeral=True)
         return
 
     await interaction.response.defer()
-    try:
-        info = await radio_station_info(station)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Couldn't reach the radio directory: {e}", ephemeral=True)
-        return
+    info = await radio_station_info(station)
     if not info:
-        await interaction.followup.send("❌ Pick a station from the list.", ephemeral=True)
-        return
-    if not await radio_url_is_public(info["url"]):
-        await interaction.followup.send("❌ That station's address isn't allowed.", ephemeral=True)
+        await interaction.followup.send("❌ Pick a valid station.", ephemeral=True)
         return
 
     try:
         sess = radio_sessions.get(gid)
-        if sess and not sess["vc"].is_connected():
-            radio_sessions.pop(gid, None)
-            sess = None
         if sess:
             sess["gen"] += 1
             vc = sess["vc"]
@@ -4034,47 +3150,54 @@ async def radio_play(interaction: discord.Interaction, station: str, country: st
             if vc.channel.id != target.id:
                 await vc.move_to(target)
         else:
-            if interaction.guild.voice_client:
-                await interaction.followup.send("⚠️ I'm already in a voice channel in this server.", ephemeral=True)
-                return
             vc = await target.connect(timeout=20, self_deaf=True)
             sess = radio_sessions[gid] = {"vc": vc, "info": info, "gen": 0, "restarts": []}
         sess["info"] = info
-        sess["restarts"] = []
         _radio_start_source(gid, vc, info, sess["gen"])
     except Exception as e:
-        logger.error(f"radio-play failed: {e}")
         await radio_stop(gid)
-        await interaction.followup.send(f"❌ Couldn't start the radio: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Couldn't start radio: {e}", ephemeral=True)
         return
 
-    asyncio.create_task(radio_click(info["id"]))
-    place = f" ({info['country']})" if info["country"] else ""
-    await interaction.followup.send(f"\U0001F4FB **{interaction.user.display_name}** tuned **{info['name']}**{place} in {target.mention}. Use `/radio-stop` to stop.")
+    await interaction.followup.send(f"📻 Playing **{info['name']}** in {target.mention}.")
 
 
-@bot.tree.command(name="radio-stop", description="Stop the radio and leave the voice channel.")
+@bot.tree.command(name="radio-stop", description="Stop the radio.")
 async def radio_stop_cmd(interaction: discord.Interaction):
     if not interaction.guild or not await radio_stop(interaction.guild.id):
-        await interaction.response.send_message("⚠️ No radio is playing in this server.", ephemeral=True)
+        await interaction.response.send_message("⚠️ No radio playing.", ephemeral=True)
         return
     await interaction.response.send_message("⏹️ Radio stopped.")
 
 
-# ------------------------------------------------------------------------------
-# MAIN RUNNER
-# ------------------------------------------------------------------------------
+async def start_web():
+    app = web.Application()
+    app.add_routes([
+        web.get("/", web_home),
+        web.get("/emu/{token}", web_emu_page),
+        web.get("/emu/{token}/ws", web_emu_ws),
+        web.get("/radio", web_radio_page),
+        web.get("/radio/api/countries", web_radio_countries),
+        web.get("/radio/api/stations", web_radio_stations),
+        web.get("/radio/stream/{sid}", web_radio_stream),
+    ])
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+
+
 def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
-        logger.critical("DISCORD_TOKEN environment variable is missing!")
+        logger.critical("DISCORD_TOKEN missing!")
         sys.exit(1)
 
     refresh_ban_cache()
     refresh_auto_poll_cache()
 
     async def runner():
-        await start_web()          # bind the port first so Render's health check passes even if Discord is slow
+        await start_web()
         try:
             async with bot:
                 await bot.start(token)
