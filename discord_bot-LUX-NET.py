@@ -1623,7 +1623,7 @@ async def auto_poll(interaction: discord.Interaction, enabled: app_commands.Choi
         await interaction.followup.send(f"\U0001F6D1 Auto poll is **off** for **{target.name}**.")
 
 
-@bot.tree.command(name="list-bridges", description="List all channels, threads, and forums connected to a network code.")
+@bot.tree.command(name="list-bridges", description="List all servers (with member counts), channels, threads, and forums connected to a network code.")
 @app_commands.describe(network_code="The network code to inspect")
 async def list_bridges(interaction: discord.Interaction, network_code: str):
     code = network_code.strip().lower()
@@ -1632,35 +1632,62 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
     text_ids = get_links("text_relays", code)
     thread_ids = get_links("thread_relays", code)
     forum_ids = get_links("forum_relays", code)
+    vc_ids = get_links("vc_code_relays", code)
 
     embed = discord.Embed(title=f"🌐 Bridge Status for Network: `{code}`", color=discord.Color.blurple())
+
+    # Every server in the network, counted once no matter how many of its channels are linked.
+    # guild.member_count comes with the guild itself, so this needs no extra intent or API call.
+    guilds = {}
+    for cid in text_ids + thread_ids + forum_ids + vc_ids:
+        ch = bot.get_channel(cid)
+        if ch and getattr(ch, "guild", None):
+            guilds[ch.guild.id] = ch.guild
+    ranked = sorted(guilds.values(), key=lambda g: g.member_count or 0, reverse=True)
+    total_members = sum(g.member_count or 0 for g in ranked)
+
+    server_lines = []
+    used = 0
+    for i, g in enumerate(ranked):
+        line = f"• **{g.name}** — {g.member_count or 0:,} members"
+        if used + len(line) + 1 > 900:       # embed field limit is 1024 characters
+            server_lines.append(f"…and {len(ranked) - i} more")
+            break
+        server_lines.append(line)
+        used += len(line) + 1
+    embed.add_field(
+        name=f"🏠 Servers ({len(ranked)}) • {total_members:,} members total",
+        value=("\n".join(server_lines) if server_lines else "None")
+              + ("\n\n*Total adds up each server's member count, so someone who is in several of these servers is counted once per server.*" if len(ranked) > 1 else ""),
+        inline=False,
+    )
 
     text_desc = []
     for cid in text_ids:
         ch = bot.get_channel(cid)
         if ch:
-            text_desc.append(f"• #{ch.name} (*{ch.guild.name}*)")
+            text_desc.append(f"• #{ch.name} (*{ch.guild.name}* · {ch.guild.member_count or 0:,} members)")
         else:
             text_desc.append(f"• ID: `{cid}` (Cached/Missing)")
-    embed.add_field(name=f"💬 Text Channels ({len(text_ids)})", value="\n".join(text_desc) if text_desc else "None", inline=False)
+    embed.add_field(name=f"💬 Text Channels ({len(text_ids)})", value=("\n".join(text_desc)[:1015] + ("…" if len("\n".join(text_desc)) > 1015 else "")) if text_desc else "None", inline=False)
 
     thread_desc = []
     for tid in thread_ids:
         th = bot.get_channel(tid)
         if th:
-            thread_desc.append(f"• Thread: {th.name} (*{th.guild.name}*)")
+            thread_desc.append(f"• Thread: {th.name} (*{th.guild.name}* · {th.guild.member_count or 0:,} members)")
         else:
             thread_desc.append(f"• ID: `{tid}` (Cached/Missing)")
-    embed.add_field(name=f"🧵 Threads ({len(thread_ids)})", value="\n".join(thread_desc) if thread_desc else "None", inline=False)
+    embed.add_field(name=f"🧵 Threads ({len(thread_ids)})", value=("\n".join(thread_desc)[:1015] + ("…" if len("\n".join(thread_desc)) > 1015 else "")) if thread_desc else "None", inline=False)
 
     forum_desc = []
     for fid in forum_ids:
         fch = bot.get_channel(fid)
         if fch:
-            forum_desc.append(f"• Forum: {fch.name} (*{fch.guild.name}*)")
+            forum_desc.append(f"• Forum: {fch.name} (*{fch.guild.name}* · {fch.guild.member_count or 0:,} members)")
         else:
             forum_desc.append(f"• ID: `{fid}` (Cached/Missing)")
-    embed.add_field(name=f"📌 Forum Channels ({len(forum_ids)})", value="\n".join(forum_desc) if forum_desc else "None", inline=False)
+    embed.add_field(name=f"📌 Forum Channels ({len(forum_ids)})", value=("\n".join(forum_desc)[:1015] + ("…" if len("\n".join(forum_desc)) > 1015 else "")) if forum_desc else "None", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -2122,7 +2149,9 @@ EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
 EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"                # let Manage Server holders add ROMs
 
 # Live streaming / controls (all optional, tune for the free tier)
-EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "30"))              # frames per second sent to browsers
+EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))              # frames per second sent to browsers (the core's own rate is the ceiling)
+EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"                       # stream game sound to the live player (only while a browser has sound on)
+# EMU_AUDIO_MONO=1 (read by the worker) halves the audio bandwidth
 EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))          # lower = less bandwidth/CPU
 EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))                # no input for this long: emulation sleeps (0 CPU)
 EMU_MAX_VIEWERS = int(os.environ.get("EMU_MAX_VIEWERS", "8"))             # browsers per game
@@ -2315,12 +2344,19 @@ class EmuClient:
         self.mask = 0
         self.latest = None
         self.texts = deque(maxlen=20)
+        self.audio = deque(maxlen=30)       # ~0.5 s: a stalled tab loses sound, it never grows memory
+        self.want_audio = False             # the page says so once its sound is unlocked and un-muted
         self.evt = asyncio.Event()
         self.closing = False
 
     def offer_frame(self, jpeg: bytes):
         self.latest = jpeg
         self.evt.set()
+
+    def offer_audio(self, chunk: bytes):
+        if self.want_audio:
+            self.audio.append(chunk)
+            self.evt.set()
 
     def offer_text(self, obj: dict):
         self.texts.append(json.dumps(obj, separators=(",", ":")))
@@ -2333,6 +2369,12 @@ class EmuClient:
                 self.evt.clear()
                 while self.texts:
                     await self.ws.send_str(self.texts.popleft())
+                if self.audio:                       # whatever piled up goes out as ONE message
+                    chunks = []
+                    while self.audio:
+                        chunks.append(self.audio.popleft())
+                    await self.ws.send_bytes(chunks[0] if len(chunks) == 1
+                                             else b"A\x00" + b"".join(c[2:] for c in chunks))
                 jpeg, self.latest = self.latest, None
                 if jpeg:
                     await self.ws.send_bytes(jpeg)
@@ -2372,6 +2414,9 @@ class EmuSession:
         self.live = False
         self.paused = False
         self.last_jpeg = None
+        self.audio_rate = 0
+        self.audio_ch = 2
+        self._audio_sent = False
         self.stats: dict = {}
         self._sent_mask = 0
         # Discord preview (edits are rate limited, so they are coalesced)
@@ -2442,7 +2487,9 @@ class EmuSession:
                 body = await proc.stdout.readexactly(n)
                 kind, payload = body[:1], body[1:]
                 if kind == b"J":
-                    self._on_frame(payload)
+                    self._on_frame(body)              # "J" + pad + jpeg, forwarded to browsers untouched
+                elif kind == b"A":
+                    self._on_audio(body)              # "A" + pad + int16 PCM
                 elif kind == b"R":
                     fut = self.pending
                     if fut is not None and not fut.done():
@@ -2505,10 +2552,21 @@ class EmuSession:
         for c in self.clients:
             c.offer_text(obj)
 
-    def _on_frame(self, jpeg: bytes):
-        self.last_jpeg = jpeg
+    def _on_frame(self, body: bytes):
+        self.last_jpeg = body
         for c in self.clients:
-            c.offer_frame(jpeg)
+            c.offer_frame(body)
+
+    def _on_audio(self, body: bytes):
+        for c in self.clients:
+            c.offer_audio(body)
+
+    def update_audio(self):
+        """The worker only produces sound while at least one browser actually has it switched on."""
+        want = EMU_AUDIO and any(c.want_audio for c in self.clients)
+        if want != self._audio_sent:
+            self._audio_sent = want
+            self.send({"op": "audio", "on": want})
 
     def _on_event(self, ev: dict):
         kind = ev.get("ev")
@@ -2524,6 +2582,8 @@ class EmuSession:
         if on == self.live:
             return
         self.live = on
+        if not on:
+            self._audio_sent = False      # the worker switches sound off together with live mode
         self.send({"op": "live", "on": on, "fps": EMU_STREAM_FPS,
                    "quality": EMU_JPEG_QUALITY, "afk": EMU_AFK_PAUSE})
 
@@ -2534,7 +2594,8 @@ class EmuSession:
     def add_client(self, c: EmuClient):
         self.clients.add(c)
         self.touch()
-        c.offer_text({"t": "hello", "title": f"{self.label}: {self.title}", "paused": self.paused})
+        c.offer_text({"t": "hello", "title": f"{self.label}: {self.title}", "paused": self.paused,
+                      "audio": bool(EMU_AUDIO and self.audio_rate), "rate": self.audio_rate, "ch": self.audio_ch})
         if self.last_jpeg:
             c.offer_frame(self.last_jpeg)
         self._broadcast(self._players_msg())
@@ -2543,6 +2604,7 @@ class EmuSession:
     def remove_client(self, c: EmuClient):
         self.clients.discard(c)
         self._broadcast(self._players_msg())
+        self.update_audio()
         self.recalc_input()
         if not self.clients:
             self._set_live(False)
@@ -2806,11 +2868,12 @@ body.touch #help{display:none}
     <div id="title">Connecting…</div>
     <span class="pill" id="pl">👥 –</span>
     <span class="pill" id="fps">– fps</span>
+    <button class="t" id="mu" title="Click to enable sound">🔇</button>
     <button class="t" id="tp" title="Touch controls">🎮</button>
     <button class="t" id="fs" title="Fullscreen">⛶</button>
   </div>
   <div id="stage"><canvas id="cv" width="256" height="224"></canvas><div id="msg">Connecting…</div></div>
-  <div id="help">WASD / arrows move · J K = B A · U I = Y X · Q E = L R · Enter = Start · Shift = Select · gamepads work too</div>
+  <div id="help">WASD / arrows move · J K = B A · U I = Y X · Q E = L R · Enter = Start · Shift = Select · M = mute · gamepads work too</div>
   <div id="pad"></div>
 </div>
 <script>
@@ -2836,6 +2899,7 @@ function push(force){
   var b=new DataView(new ArrayBuffer(2));b.setUint16(0,m,true);ws.send(b.buffer);last=m;
 }
 addEventListener("keydown",function(e){
+  if(e.code==="KeyM"&&!e.repeat){e.preventDefault();toggleMute();return}
   if(!(e.code in KEYS))return;
   e.preventDefault();
   if(!down.has(e.code)){down.add(e.code);push()}
@@ -2900,21 +2964,73 @@ function fit(){
 }
 addEventListener("resize",fit);fit();
 
-// ---- video: always draw only the newest frame ----
-var pending=null,busy=false,shown=0;
+// ---- video: decode only the newest frame, paint once per display refresh ----
+// Messages from the bot are tagged: byte0 "J" (74) = JPEG at offset 2, "A" (65) = int16 PCM at offset 2.
+var pendingBuf=null,busy=false,shown=0,bmp=null,drawQ=false;
 function pump(){
-  if(busy||!pending)return;
-  var d=pending;pending=null;busy=true;
-  createImageBitmap(new Blob([d],{type:"image/jpeg"})).then(function(b){
-    if(cv.width!==b.width||cv.height!==b.height){cv.width=b.width;cv.height=b.height}
-    ctx.drawImage(b,0,0);if(b.close)b.close();shown++;
+  if(busy||!pendingBuf)return;
+  var d=pendingBuf;pendingBuf=null;busy=true;
+  createImageBitmap(new Blob([new Uint8Array(d,2)],{type:"image/jpeg"})).then(function(b){
+    if(bmp&&bmp.close)bmp.close();
+    bmp=b;
+    if(!drawQ){drawQ=true;requestAnimationFrame(draw)}
   }).catch(function(){}).then(function(){busy=false;pump()});
+}
+function draw(){
+  drawQ=false;if(!bmp)return;
+  if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}
+  ctx.drawImage(bmp,0,0);shown++;
 }
 setInterval(function(){$("fps").textContent=shown+" fps";shown=0},1000);
 
+// ---- audio: gapless scheduling of the PCM chunks that arrive with every frame ----
+var ac=null,gain=null,aRate=0,aCh=2,audioAvail=false,unlocked=false,muted=false,nextT=0;
+function wantAudio(){return audioAvail&&unlocked&&!muted}
+function sendCtl(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({audio:wantAudio()}))}
+function updateMu(){
+  var on=audioAvail&&unlocked&&!muted&&ac&&ac.state==="running";
+  $("mu").textContent=on?"🔊":"🔇";
+  $("mu").title=!audioAvail?"This game has no sound":(!unlocked?"Click to enable sound":(muted?"Unmute (M)":"Mute (M)"));
+}
+function initAudio(){
+  if(ac||!aRate||!audioAvail)return;
+  var AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC){audioAvail=false;return}
+  try{ac=new AC({sampleRate:aRate,latencyHint:"interactive"})}   // run the context at the core's rate: no resampling per chunk
+  catch(e){try{ac=new AC({latencyHint:"interactive"})}catch(e2){audioAvail=false;return}}
+  gain=ac.createGain();gain.connect(ac.destination);
+  ac.onstatechange=updateMu;
+}
+function unlock(e){
+  if(e&&(e.type==="keydown"&&e.code==="KeyM"||e.target&&e.target.id==="mu"))return;
+  var first=!unlocked;unlocked=true;initAudio();
+  if(ac&&ac.state!=="running")ac.resume().then(updateMu).catch(function(){});
+  if(first){sendCtl()}
+  updateMu();
+}
+function toggleMute(){
+  if(!unlocked){unlock();return}
+  muted=!muted;nextT=0;updateMu();sendCtl();
+}
+["pointerdown","keydown","touchend"].forEach(function(n){addEventListener(n,unlock,{passive:true})});
+$("mu").onclick=function(){toggleMute()};
+function playPCM(d){
+  if(!ac||ac.state!=="running"||muted||!gain)return;
+  var s=new Int16Array(d,2,(d.byteLength-2)>>1),ch=aCh,n=(s.length/ch)|0,i;
+  if(!n)return;
+  var ab=ac.createBuffer(ch,n,aRate),L=ab.getChannelData(0);
+  if(ch>1){var R=ab.getChannelData(1);for(i=0;i<n;i++){L[i]=s[2*i]/32768;R[i]=s[2*i+1]/32768}}
+  else{for(i=0;i<n;i++)L[i]=s[i]/32768}
+  var src=ac.createBufferSource();src.buffer=ab;src.connect(gain);
+  var now=ac.currentTime;
+  if(nextT<now+0.01||nextT>now+0.35)nextT=now+0.07;   // (re)start with a ~70 ms cushion against network jitter
+  src.start(nextT);nextT+=ab.duration;
+}
+
 function setMsg(t){msg.textContent=t||""}
 function onText(m){
-  if(m.t==="hello"){$("title").textContent=m.title;document.title=m.title;setMsg(m.paused?"⏸ Paused (idle). Press any key to resume.":"")}
+  if(m.t==="hello"){$("title").textContent=m.title;document.title=m.title;setMsg(m.paused?"⏸ Paused (idle). Press any key to resume.":"");
+    aRate=m.rate|0;aCh=m.ch||2;audioAvail=!!m.audio&&aRate>0;initAudio();updateMu();sendCtl()}
   else if(m.t==="players"){$("pl").textContent="👥 "+m.n;$("pl").title=m.names.join(", ")}
   else if(m.t==="paused"){setMsg(m.on?"⏸ Paused (idle). Press any key to resume.":"")}
   else if(m.t==="end"){over=true;setMsg("Game ended: "+m.why)}
@@ -2923,10 +3039,14 @@ function connect(){
   var proto=location.protocol==="https:"?"wss://":"ws://";
   ws=new WebSocket(proto+location.host+location.pathname.replace(/\/+$/,"")+"/ws");
   ws.binaryType="arraybuffer";
-  ws.onopen=function(){tries=0;push(true)};
+  ws.onopen=function(){tries=0;push(true);sendCtl()};
   ws.onmessage=function(e){
     if(typeof e.data==="string"){onText(JSON.parse(e.data))}
-    else{pending=e.data;pump()}
+    else{
+      var tag=new Uint8Array(e.data,0,1)[0];
+      if(tag===74){pendingBuf=e.data;pump()}
+      else if(tag===65){playPCM(e.data)}
+    }
   };
   ws.onclose=function(){
     if(over)return;
@@ -2982,6 +3102,18 @@ async def web_emu_ws(request):
                 if mask != client.mask:
                     client.mask = mask
                     sess.recalc_input()
+            elif msg.type == WSMsgType.TEXT:
+                try:
+                    ctl = json.loads(msg.data)
+                except ValueError:
+                    continue
+                if isinstance(ctl, dict) and "audio" in ctl:
+                    want = bool(ctl["audio"]) and EMU_AUDIO
+                    if want != client.want_audio:
+                        client.want_audio = want
+                        if not want:
+                            client.audio.clear()
+                        sess.update_audio()
             elif msg.type == WSMsgType.ERROR:
                 break
     finally:
@@ -3031,7 +3163,7 @@ class EmuView(discord.ui.View):
             [("l", "L", S, not snes), ("up", "⬆", S, False), ("r", "R", S, not snes), ("select", "Select", S, False), ("start", "Start", G, False)],
             [("left", "⬅", S, False), ("down", "⬇", S, False), ("right", "➡", S, False), ("x", "X", P, not snes), ("y", "Y", P, not snes)],
             [("b", "B", D, False), ("a", "A", G, False), ("ab", "A+B", P, False), ("hold", "", S, False), ("clip", "\U0001F39E Clip", S, False)],
-            [("live", "Play live (30 FPS)", P, False), ("save", "\U0001F4BE Save", S, False), ("load", "\U0001F4C2 Load", S, False), ("quit", "⏹ Quit", D, False)],
+            [("live", "Play live (60 FPS + sound)", P, False), ("save", "\U0001F4BE Save", S, False), ("load", "\U0001F4C2 Load", S, False), ("quit", "⏹ Quit", D, False)],
         ]
         self.hold_btn = None
         for row, items in enumerate(layout):
@@ -3099,9 +3231,9 @@ class EmuView(discord.ui.View):
             link = discord.ui.View()
             link.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open live player", url=url))
             await interaction.response.send_message(
-                "\U0001F5A5️ **Live player (smooth 30 FPS)**\n"
+                "\U0001F5A5️ **Live player (smooth 60 FPS + sound)**\n"
                 "**W A S D** move • **J / K** = B / A • **U / I** = Y / X • **Q / E** = L / R • **Enter** = Start • **Shift** = Select\n"
-                "Gamepads and phone touch controls work too. This link is tied to you, so don't share it.",
+                "Click the page once to turn the sound on (**M** mutes). Gamepads and phone touch controls work too. This link is tied to you, so don't share it.",
                 view=link, ephemeral=True)
 
         elif action == "clip":
@@ -3139,7 +3271,7 @@ class EmuView(discord.ui.View):
 
 
 # ---- slash commands ------------------------------------------------------------------------
-@bot.tree.command(name="emu-play", description="Play a NES/SNES game in this channel (buttons, typed WASD, or the live 30 FPS player).")
+@bot.tree.command(name="emu-play", description="Play a NES/SNES game in this channel (buttons, typed WASD, or the live 60 FPS player with sound).")
 @app_commands.describe(game="Pick a game from the library", resume="Continue from where this channel last stopped (default: yes)")
 @app_commands.autocomplete(game=emu_rom_autocomplete)
 async def emu_play(interaction: discord.Interaction, game: str, resume: bool = True):
@@ -3168,6 +3300,8 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
                               sysdir=os.path.join(EMU_BASE, "system"), savedir=os.path.join(STATE_DIR, "sram"))
         if not res.get("ok"):
             raise RuntimeError(res.get("err", "load failed"))
+        sess.audio_rate = int(res.get("rate") or 0)
+        sess.audio_ch = int(res.get("ch") or 2)
         resumed = False
         if resume and os.path.exists(sess.auto_path):
             r = await sess.call(op="loadstate", path=sess.auto_path)
@@ -3191,7 +3325,7 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         sess.message_id = msg.id
         sess.last_edit = time.monotonic()
         sess.touch()
-        await interaction.followup.send("\U0001F3AE Game started! Type `w` `a` `s` `d` in this channel, or press **Play live** for 30 FPS.", ephemeral=True)
+        await interaction.followup.send("\U0001F3AE Game started! Type `w` `a` `s` `d` in this channel, or press **Play live** for 60 FPS with sound.", ephemeral=True)
     except Exception as e:
         logger.error(f"emu-play failed: {e}")
         emu_sessions.pop(sess.channel_id, None)
@@ -3207,7 +3341,7 @@ async def emu_keys(interaction: discord.Interaction):
         "**Typed controls** (send these as messages in the game channel)\n"
         f"{pre}`w a s d` = up / left / down / right • `j` = B • `k` = A • `u` = Y • `i` = X • `q` = L • `e` = R • `start` • `select`\n"
         "`d3` = tap right 3 times • `d+j` = right and B together • `wwdk` = a quick sequence\n\n"
-        "**Live player** (press **Play live** on the game message): real keyboard, smooth 30 FPS. "
+        "**Live player** (press **Play live** on the game message): real keyboard, smooth 60 FPS, game sound (click the page once to unmute). "
         "`W A S D` / arrows, `J K` = B A, `U I` = Y X, `Q E` = L R, `Enter` = Start, `Shift` = Select. "
         "Gamepads and phones (touch pad) work too.", ephemeral=True)
 
