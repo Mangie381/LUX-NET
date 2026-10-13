@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")   # keeps memory use down on glibc hosts
 import sys
 import asyncio
 import logging
@@ -22,7 +23,7 @@ import random
 import csv
 import math
 from collections import deque, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from threading import Lock
 from datetime import datetime, timezone
@@ -49,11 +50,7 @@ try:
 except ImportError:
     davey = None
 from supabase import create_client, Client
-import yt_dlp
-try:
-    from ddgs import DDGS  # new package name
-except ImportError:
-    from duckduckgo_search import DDGS  # legacy package name
+# yt_dlp and the search client are heavy, so they are imported on first use (saves memory while idle).
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -91,9 +88,9 @@ _LINK_COLS = {
 def add_link(table: str, code: str, item_id: int):
     try:
         col = _LINK_COLS.get(table, "thread_id")
-        
+
         supabase.table(table).upsert(
-            {"network_code": code, col: item_id}, 
+            {"network_code": code, col: item_id},
             on_conflict="network_code," + col
         ).execute()
         logger.info(f"Successfully added/upserted {item_id} to {table} under {code}")
@@ -112,7 +109,7 @@ def remove_link(table: str, code: str, item_id: int):
 def get_links(table: str, code: str):
     try:
         col = _LINK_COLS.get(table, "thread_id")
-        
+
         response = supabase.table(table).select(col).eq("network_code", code).execute()
         logger.info(f"Supabase fetch response for {table} code '{code}': {response.data}")
         return [row[col] for row in response.data]
@@ -204,6 +201,10 @@ async def check_is_owner(interaction: discord.Interaction) -> bool:
 def google_search(query: str, num_results: int = 5):
     results = []
     try:
+        try:
+            from ddgs import DDGS  # new package name
+        except ImportError:
+            from duckduckgo_search import DDGS  # legacy package name
         with DDGS() as ddgs:
             res = list(ddgs.text(query, max_results=num_results))
             for r in res:
@@ -222,7 +223,7 @@ def google_search(query: str, num_results: int = 5):
             "href": f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}",
             "body": "Click to view search results directly on DuckDuckGo."
         }]
-        
+
     return results
 
 # ------------------------------------------------------------------------------
@@ -359,7 +360,7 @@ RELAY_SYNC_DELETES = os.environ.get("RELAY_SYNC_DELETES", "1") == "1"
 RELAY_CACHE_TTL = int(os.environ.get("RELAY_CACHE_TTL", "120"))
 
 _target_cache: dict = {}          # (table, id) -> (expires_at, tuple_of_ids)
-_thread_pairs: dict = {}          # forum thread id -> set of linked thread ids
+_thread_pairs: dict = {}          # forum thread id -> set of linked thread ids (trimmed when it grows)
 _chunked_sources: OrderedDict = OrderedDict()   # source ids that were split into several messages
 _reply_prefixes: OrderedDict = OrderedDict()    # source id -> reply prefix, so edits keep it
 
@@ -1238,6 +1239,9 @@ async def _relay_new_forum_post(thread: discord.Thread):
             RELAYED_THREAD_IDS.add(t.id)
             copies.append(t)
             sent.append((t, r))
+        if len(_thread_pairs) > 5000:
+            for k in list(_thread_pairs)[:2500]:
+                _thread_pairs.pop(k, None)
         group = [thread] + copies
         for x in group:
             for y in group:
@@ -1265,7 +1269,7 @@ async def on_thread_create(thread: discord.Thread):
 # ------------------------------------------------------------------------------
 # VOICE BRIDGE
 # ------------------------------------------------------------------------------
-FRAME_BYTES = 3840                 
+FRAME_BYTES = 3840
 SILENCE = b"\x00" * FRAME_BYTES
 MAX_BUFFERED_FRAMES = int(os.environ.get("VOICE_MAX_QUEUE_FRAMES", "4"))
 PRIME_FRAMES = int(os.environ.get("VOICE_PRIME_FRAMES", "2"))
@@ -1278,8 +1282,8 @@ OPUS_BITRATE_KBPS = int(os.environ.get("VOICE_BITRATE_KBPS", "96"))
 OPUS_EXPECTED_LOSS = float(os.environ.get("VOICE_EXPECTED_LOSS", "0.05"))
 MAX_VOICE_SESSIONS = int(os.environ.get("MAX_VOICE_SESSIONS", "4"))
 
-voice_sessions: dict = {}          
-_voice_connecting: set = set()     
+voice_sessions: dict = {}
+_voice_connecting: set = set()
 _opus_warned = False
 
 
@@ -1638,8 +1642,6 @@ async def on_message(message: discord.Message):
     if message.channel.id in emu_sessions and await emu_chat_input(message):
         return
 
-    await bot.process_commands(message)
-
     if not supabase:
         return
     if not (message.content or message.attachments or message.embeds or message.stickers
@@ -1908,7 +1910,7 @@ async def link_forum(interaction: discord.Interaction, network_code: str, forum_
     code = network_code.strip().lower()
     add_link("forum_relays", code, target_forum.id)
     forums = get_links("forum_relays", code)
-    
+
     await interaction.response.send_message(f"📌 Linked forum **{target_forum.name}** to `{code}`! ({len(forums)} connected)", ephemeral=False)
 
 @bot.tree.command(name="unlink-forum", description="Disconnect this forum channel from its active network.")
@@ -2057,7 +2059,7 @@ async def voice_status(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Voice bridge dependencies not installed.", ephemeral=True)
         return
 
-    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     lines = [
         f"Active voice sessions: `{len(voice_sessions)}/{MAX_VOICE_SESSIONS}`",
         f"libopus loaded: `{discord.opus.is_loaded()}`",
@@ -2153,6 +2155,7 @@ async def play(interaction: discord.Interaction, search: str):
         entries.append({'title': 'Direct YouTube Link', 'uploader': 'Provided URL', 'webpage_url': search.strip()})
     else:
         try:
+            import yt_dlp
             search_opts = {'extract_flat': True, 'quiet': True}
             query = f"ytsearch5:{search}"
             loop = asyncio.get_event_loop()
@@ -2202,7 +2205,7 @@ async def search(interaction: discord.Interaction, query: str):
         for i, item in enumerate(results[:5], 1):
             title = item.get("title", "Result")
             url = item.get("href", "#")
-            body = item.get("body", "")[:250]  
+            body = item.get("body", "")[:250]
             embed.add_field(name=f"Result {i}", value=f"[{title}]({url})\n{body}", inline=False)
 
         await interaction.followup.send(embed=embed)
@@ -2232,7 +2235,6 @@ EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))
 EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"
 EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))
 EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))
-EMU_MAX_VIEWERS = int(os.environ.get("MAX_EMU_VIEWERS", "8"))
 EMU_EDIT_INTERVAL = float(os.environ.get("EMU_EDIT_INTERVAL", "1.0"))
 EMU_GAP_FRAMES = 4
 EMU_CHAT_KEYS = os.environ.get("EMU_CHAT_KEYS", "1") == "1"
@@ -2396,12 +2398,6 @@ async def emu_rom_autocomplete(interaction: discord.Interaction, current: str):
     return out
 
 
-def _proc_rss_mb(pid: int) -> float:
-    try:
-        with open(f"/proc/{pid}/statm") as f:
-            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
-    except Exception:
-        return 0.0
 
 
 class EmuClient:
@@ -2953,6 +2949,10 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
     if interaction.channel.id in emu_sessions:
         await interaction.response.send_message("⚠️ Game already running.", ephemeral=True)
         return
+    if len(emu_sessions) >= MAX_EMU_SESSIONS:
+        await interaction.response.send_message(
+            f"⚠️ {MAX_EMU_SESSIONS} games are already running. Try again when one finishes.", ephemeral=True)
+        return
 
     await interaction.response.defer(ephemeral=True)
     sess = EmuSession(interaction.channel.id, game, interaction.user.id)
@@ -2980,8 +2980,72 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
 @bot.tree.command(name="emu-games", description="List games.")
 async def emu_games(interaction: discord.Interaction):
     roms = all_roms()
-    embed = discord.Embed(title=f"Library ({len(roms)})")
+    groups: dict = {}
+    for rel in roms:
+        system, fname = rel.split("/", 1)
+        groups.setdefault(system, []).append(os.path.splitext(fname)[0])
+    embed = discord.Embed(title=f"Library ({len(roms)})", color=discord.Color.blurple())
+    for system, names in groups.items():
+        text = "\n".join(names)
+        if len(text) > 1000:
+            text = text[:990].rsplit("\n", 1)[0] + f"\n... and more ({len(names)} total)"
+        embed.add_field(name=f"{EMU_SYSTEMS[system]['label']} ({len(names)})", value=text, inline=False)
+    if not roms:
+        embed.description = "No games yet. Upload one with `/emu-add`."
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="emu-add", description="Upload a NES/SNES ROM to the game library.")
+@app_commands.describe(rom="ROM file (.nes, .sfc, .smc, .swc or .fig)")
+async def emu_add(interaction: discord.Interaction, rom: discord.Attachment):
+    if not (EMU_ADD_OPEN or await check_is_owner(interaction)):
+        await interaction.response.send_message("\u274c Only the bot owner can add games.", ephemeral=True)
+        return
+    name = clean_rom_filename(rom.filename)
+    system = system_for(name) if name else None
+    if not system:
+        exts = ", ".join(sorted(e for spec in EMU_SYSTEMS.values() for e in spec["exts"]))
+        await interaction.response.send_message(f"\u274c Unsupported file. Supported types: {exts}", ephemeral=True)
+        return
+    if rom.size > EMU_MAX_ROM_BYTES:
+        await interaction.response.send_message(
+            f"\u274c That file is {rom.size / 1048576:.1f} MB; the limit is {EMU_MAX_ROM_BYTES // 1048576} MB "
+            "(raise it with the EMU_MAX_ROM_MB setting).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = await rom.read()
+    except Exception as e:
+        await interaction.followup.send(f"\u274c Couldn't download that file: {e}", ephemeral=True)
+        return
+    if system == "nes" and data[:4] != b"NES\x1a":
+        await interaction.followup.send("\u274c That doesn't look like a valid .nes file (bad header).", ephemeral=True)
+        return
+    rel = f"{system}/{name}"
+    replaced = rel in all_roms()
+    saved_remote = await asyncio.to_thread(add_rom_blocking, system, name, data)
+    note = "" if saved_remote else "\n\u26a0\ufe0f Saved on the host only. The cloud backup failed, so it may vanish if the host resets."
+    await interaction.followup.send(
+        f"\u2705 {'Replaced' if replaced else 'Added'} **{os.path.splitext(name)[0]}** ({EMU_SYSTEMS[system]['label']}). "
+        f"Play it with `/emu-play`.{note}", ephemeral=True)
+
+
+@bot.tree.command(name="emu-remove", description="Remove a ROM from the game library (owner only).")
+@app_commands.describe(game="Game to remove")
+@app_commands.autocomplete(game=emu_rom_autocomplete)
+async def emu_remove(interaction: discord.Interaction, game: str):
+    if not await check_is_owner(interaction):
+        await interaction.response.send_message("\u274c Only the bot owner can remove games.", ephemeral=True)
+        return
+    if not valid_rom_ref(game) or game not in all_roms():
+        await interaction.response.send_message("\u274c Pick a game from the list.", ephemeral=True)
+        return
+    if any(sess.rel == game for sess in emu_sessions.values()):
+        await interaction.response.send_message("\u26a0\ufe0f That game is running right now. Stop it first.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await asyncio.to_thread(remove_rom_blocking, game)
+    await interaction.followup.send(f"\U0001F5D1\uFE0F Removed **{os.path.splitext(game.split('/', 1)[1])[0]}**.", ephemeral=True)
 
 
 @bot.tree.command(name="emu-stop", description="Stop the game.")
@@ -3187,7 +3251,7 @@ def mk_station(*, id: str, name: str, url: str, source: str, cc: str = "", count
 def radio_register(st: dict) -> dict:
     _radio_by_id[st["id"]] = st
     _radio_by_id.move_to_end(st["id"])
-    while len(_radio_by_id) > 4000:
+    while len(_radio_by_id) > 1500:
         _radio_by_id.popitem(last=False)
     return st
 
@@ -3429,7 +3493,6 @@ async def src_garden(q: str, cc: str = None) -> list:
 
 
 # ---------------------------------------------------------------- source: Wikidata (frequency -> station name)
-_STOP = re.compile(r"[^a-z0-9]+")
 
 
 def _name_sim(a: str, b: str) -> float:
