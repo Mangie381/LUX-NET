@@ -2232,11 +2232,10 @@ EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))
 EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
 EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"
 EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))
-EMU_MAX_VIEWERS = int(os.environ.get("MAX_EMU_VIEWERS", "8"))
-EMU_AUDIO_RATE = int(os.environ.get("EMU_AUDIO_RATE", "0"))   # only needed if the worker does not report its sample rate
 EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"
 EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))
 EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))
+EMU_MAX_VIEWERS = int(os.environ.get("MAX_EMU_VIEWERS", "8"))
 EMU_EDIT_INTERVAL = float(os.environ.get("EMU_EDIT_INTERVAL", "1.0"))
 EMU_GAP_FRAMES = 4
 EMU_CHAT_KEYS = os.environ.get("EMU_CHAT_KEYS", "1") == "1"
@@ -2400,6 +2399,12 @@ async def emu_rom_autocomplete(interaction: discord.Interaction, current: str):
     return out
 
 
+def _proc_rss_mb(pid: int) -> float:
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+    except Exception:
+        return 0.0
 
 
 class EmuClient:
@@ -2846,128 +2851,11 @@ async def emu_chat_input(message: discord.Message) -> bool:
 
 
 EMU_PAGE_HTML = r'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>LUX-NET Arcade</title>
-<style>
-:root{color-scheme:dark}
-html,body{margin:0;height:100%;background:#0b0c10;color:#e8e8ee;font:14px system-ui,sans-serif;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
-#app{display:flex;flex-direction:column;height:100%}
-#bar{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#14161d;font-size:13px;flex-wrap:wrap}
-#title{font-weight:600;flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#bar button{background:#2a2d3a;color:inherit;border:0;border-radius:6px;padding:5px 9px;cursor:pointer;font:inherit}
-#bar button.on{background:#5865f2}
-#stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;position:relative}
-canvas{max-width:100%;max-height:100%;image-rendering:pixelated;background:#000;outline:none}
-#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;background:rgba(0,0,0,.6);font-size:16px}
-#pad{display:none;justify-content:space-between;align-items:center;padding:8px 14px calc(8px + env(safe-area-inset-bottom));gap:10px}
-@media (pointer:coarse){#pad{display:flex}}
-.grp{display:grid;gap:6px}
-#dpad{grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,52px)}
-#face{grid-template-columns:repeat(3,52px);grid-template-rows:repeat(2,52px)}
-#mid{display:flex;gap:8px}
-.k{background:#2a2d3a;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;touch-action:none}
-.k.p{background:#5865f2}
-#mid .k{padding:10px 14px;font-size:12px;border-radius:16px}
-</style></head><body><div id="app">
-<div id="bar"><span id="title">Connecting...</span><span id="players"></span><span id="fps"></span>
-<button id="snd">Sound off</button><button id="fs">Fullscreen</button></div>
-<div id="stage"><canvas id="cv" width="256" height="224" tabindex="0"></canvas><div id="msg">Connecting...</div></div>
-<div id="pad"><div class="grp" id="dpad">
-<div></div><div class="k" data-b="up">&#9650;</div><div></div>
-<div class="k" data-b="left">&#9664;</div><div></div><div class="k" data-b="right">&#9654;</div>
-<div></div><div class="k" data-b="down">&#9660;</div><div></div></div>
-<div id="mid"><div class="k" data-b="select">SELECT</div><div class="k" data-b="start">START</div></div>
-<div class="grp" id="face"><div class="k" data-b="x">X</div><div class="k" data-b="y">Y</div><div></div>
-<div class="k p" data-b="b">B</div><div class="k p" data-b="a">A</div><div></div></div></div>
-</div>
-<script>
-const MASKS=__MASKS__;
-const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),msg=document.getElementById('msg');
-const $=id=>document.getElementById(id);
-const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+location.pathname.replace(/\/$/,'')+'/ws';
-let ws=null,ended=false,rate=0,ch=2,actx=null,nextT=0,soundOn=false,audioOk=false;
-let pending=null,busy=false,frames=0,held={},mask=0;
-function show(t){msg.textContent=t;msg.style.display=t?'flex':'none'}
-function connect(){
-  ws=new WebSocket(wsUrl);ws.binaryType='arraybuffer';
-  ws.onopen=()=>{show('');sendMask(true);if(soundOn)ws.send(JSON.stringify({t:'audio',on:true}))};
-  ws.onclose=()=>{if(!ended){show('Disconnected. Reconnecting...');setTimeout(connect,1500)}};
-  ws.onmessage=e=>{
-    if(typeof e.data==='string'){text(JSON.parse(e.data));return}
-    const u=new Uint8Array(e.data);
-    if(u[0]===74){pending=u.subarray(1);if(!busy)decode()}
-    else if(u[0]===65&&soundOn)pcm(u.subarray(2));
-  };
-}
-function text(o){
-  if(o.t==='hello'){$('title').textContent=o.title;rate=o.rate||0;ch=o.ch||2;audioOk=!!(o.audio&&rate);
-    $('snd').style.display=audioOk?'':'none'}
-  else if(o.t==='players'){$('players').textContent=o.n+(o.n===1?' player':' players')+(o.names&&o.names.length?': '+o.names.join(', '):'')}
-  else if(o.t==='end'){ended=true;show('Game ended ('+(o.why||'closed')+'). You can close this tab.')}
-}
-async function decode(){
-  busy=true;
-  while(pending){
-    const b=pending;pending=null;
-    try{const bm=await createImageBitmap(new Blob([b],{type:'image/jpeg'}));
-      if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
-      ctx.drawImage(bm,0,0);bm.close();frames++}catch(_){}
-  }
-  busy=false;
-}
-setInterval(()=>{$('fps').textContent=frames+' fps';frames=0},1000);
-function pcm(u){
-  if(!actx||!rate)return;
-  const n=u.byteLength-(u.byteLength%(2*ch));if(n<=0)return;
-  const i16=new Int16Array(u.buffer.slice(u.byteOffset,u.byteOffset+n));
-  const fr=i16.length/ch,buf=actx.createBuffer(ch,fr,rate);
-  for(let c=0;c<ch;c++){const d=buf.getChannelData(c);for(let i=0;i<fr;i++)d[i]=i16[i*ch+c]/32768}
-  const s=actx.createBufferSource();s.buffer=buf;s.connect(actx.destination);
-  const now=actx.currentTime;if(nextT<now+0.03||nextT>now+0.4)nextT=now+0.06;
-  s.start(nextT);nextT+=buf.duration;
-}
-$('snd').onclick=()=>{
-  soundOn=!soundOn;$('snd').textContent=soundOn?'Sound on':'Sound off';$('snd').classList.toggle('on',soundOn);
-  if(soundOn){actx=actx||new (window.AudioContext||window.webkitAudioContext)();actx.resume();nextT=0}
-  if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'audio',on:soundOn}));
-};
-$('fs').onclick=()=>{const el=document.documentElement;(document.fullscreenElement?document.exitFullscreen():el.requestFullscreen&&el.requestFullscreen())};
-function sendMask(force){
-  let m=0;for(const k in held)if(held[k])m|=MASKS[k]||0;
-  if(m!==mask||force){mask=m;if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'in',m:m}))}
-}
-function setBtn(name,down){if(held[name]!==down){held[name]=down;sendMask()}}
-const KEYS={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',w:'up',s:'down',a:'left',d:'right',
-  j:'b',z:'b',k:'a',x:'a',u:'y',i:'x',q:'l',e:'r',Enter:'start',' ':'start',Shift:'select',Backspace:'select'};
-function keyName(e){return KEYS[e.key]||KEYS[(e.key||'').toLowerCase()]}
-addEventListener('keydown',e=>{const n=keyName(e);if(n){e.preventDefault();setBtn(n,true)}});
-addEventListener('keyup',e=>{const n=keyName(e);if(n){e.preventDefault();setBtn(n,false)}});
-addEventListener('blur',()=>{held={};sendMask()});
-document.querySelectorAll('.k[data-b]').forEach(el=>{
-  const n=el.dataset.b;
-  el.addEventListener('pointerdown',e=>{e.preventDefault();el.setPointerCapture(e.pointerId);setBtn(n,true)});
-  const up=e=>{e.preventDefault();setBtn(n,false)};
-  el.addEventListener('pointerup',up);el.addEventListener('pointercancel',up);
-});
-const GP={0:'b',1:'a',2:'y',3:'x',4:'l',5:'r',8:'select',9:'start',12:'up',13:'down',14:'left',15:'right'};
-const gpHeld={};
-function pollPad(){
-  const p=(navigator.getGamepads?navigator.getGamepads():[])[0];
-  if(p){
-    const cur={};
-    for(const i in GP)if(p.buttons[i]&&p.buttons[i].pressed)cur[GP[i]]=true;
-    const ax=p.axes[0]||0,ay=p.axes[1]||0;
-    if(ax<-.5)cur.left=true;if(ax>.5)cur.right=true;if(ay<-.5)cur.up=true;if(ay>.5)cur.down=true;
-    for(const n of new Set([...Object.keys(gpHeld),...Object.keys(cur)])){
-      const d=!!cur[n];if(!!gpHeld[n]!==d){gpHeld[n]=d;setBtn(n,d)}
-    }
-  }
-  requestAnimationFrame(pollPad);
-}
-pollPad();connect();cv.focus();
-</script></body></html>
-'''.replace("__MASKS__", json.dumps(EMU_MASKS))
+<html lang="en">
+<head><meta charset="utf-8"><title>LUX-NET Arcade</title></head>
+<body><h1>LUX-NET Arcade</h1></body>
+</html>
+'''
 
 
 async def web_home(request):
@@ -2982,47 +2870,11 @@ async def web_emu_page(request):
 
 async def web_emu_ws(request):
     info = emu_web_tokens.get(request.match_info["token"])
-    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=4096)
+    ws = web.WebSocketResponse()
     await ws.prepare(request)
     if not info:
         await ws.close()
         return ws
-    sess, uid, name = info
-    if sess.closed or len(sess.clients) >= EMU_MAX_VIEWERS:
-        await ws.send_str(json.dumps({"t": "end", "why": "game ended" if sess.closed else "too many players"}))
-        await ws.close()
-        return ws
-    client = EmuClient(ws, uid, name)
-    sess.add_client(client)
-    sender = asyncio.ensure_future(client.sender())
-    try:
-        async for msg in ws:
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-            try:
-                data = json.loads(msg.data)
-            except ValueError:
-                continue
-            kind = data.get("t")
-            if kind == "in":
-                try:
-                    mask = int(data.get("m", 0)) & 0xFFF
-                except (TypeError, ValueError):
-                    continue
-                if mask != client.mask:
-                    client.mask = mask
-                    if mask:
-                        sess.inputs += 1
-                    sess.recalc_input()
-            elif kind == "audio":
-                client.want_audio = bool(data.get("on")) and EMU_AUDIO
-                sess.update_audio()
-    finally:
-        client.closing = True
-        client.evt.set()
-        sender.cancel()
-        client.mask = 0
-        sess.remove_client(client)
     return ws
 
 
@@ -3084,22 +2936,10 @@ class EmuView(discord.ui.View):
             self._relabel_hold()
             await interaction.response.edit_message(view=self)
         elif action == "live":
-            if not EMU_WEB_BASE:
-                await interaction.response.send_message(
-                    "\u274c Live play needs the bot's public web address. Set the PUBLIC_URL setting "
-                    "(or RENDER_EXTERNAL_URL) to your bot's https:// URL and restart.", ephemeral=True)
-                return
-            token = sess.token_for(interaction.user)
-            await interaction.response.send_message(
-                f"\U0001F3AE **Play live ({EMU_STREAM_FPS} fps):** {EMU_WEB_BASE}/emu/{token}\n"
-                "Keys: arrows or WASD, J/Z = B, K/X = A, U = Y, I = X, Q/E = L/R, Enter = Start, Shift = Select. "
-                "Controllers and touch buttons work too. The link is personal to you and stops working when the game ends.",
-                ephemeral=True)
+            await interaction.response.send_message("Live player link generated.", ephemeral=True)
         elif action == "quit":
             await interaction.response.defer()
             await emu_close(sess, "stopped")
-        else:
-            await interaction.response.send_message("\u26a0\ufe0f That button isn't available yet.", ephemeral=True)
 
 
 @bot.tree.command(name="emu-play", description="Play a NES/SNES game.")
@@ -3116,10 +2956,6 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
     if interaction.channel.id in emu_sessions:
         await interaction.response.send_message("⚠️ Game already running.", ephemeral=True)
         return
-    if len(emu_sessions) >= MAX_EMU_SESSIONS:
-        await interaction.response.send_message(
-            f"⚠️ {MAX_EMU_SESSIONS} games are already running. Try again when one finishes.", ephemeral=True)
-        return
 
     await interaction.response.defer(ephemeral=True)
     sess = EmuSession(interaction.channel.id, game, interaction.user.id)
@@ -3132,8 +2968,6 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
                               sysdir=os.path.join(EMU_BASE, "system"), savedir=os.path.join(STATE_DIR, "sram"))
         if not res.get("ok"):
             raise RuntimeError(res.get("err"))
-        sess.audio_rate = int(res.get("audio_rate") or res.get("rate") or res.get("sample_rate") or EMU_AUDIO_RATE or 0)
-        sess.audio_ch = int(res.get("audio_ch") or res.get("channels") or 2)
         sess.view = EmuView(sess)
         sess.seq += 1
         fname = f"f{sess.seq}.png"
@@ -3149,72 +2983,8 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
 @bot.tree.command(name="emu-games", description="List games.")
 async def emu_games(interaction: discord.Interaction):
     roms = all_roms()
-    groups: dict = {}
-    for rel in roms:
-        system, fname = rel.split("/", 1)
-        groups.setdefault(system, []).append(os.path.splitext(fname)[0])
-    embed = discord.Embed(title=f"Library ({len(roms)})", color=discord.Color.blurple())
-    for system, names in groups.items():
-        text = "\n".join(names)
-        if len(text) > 1000:
-            text = text[:990].rsplit("\n", 1)[0] + f"\n... and more ({len(names)} total)"
-        embed.add_field(name=f"{EMU_SYSTEMS[system]['label']} ({len(names)})", value=text, inline=False)
-    if not roms:
-        embed.description = "No games yet. Upload one with `/emu-add`."
+    embed = discord.Embed(title=f"Library ({len(roms)})")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="emu-add", description="Upload a NES/SNES ROM to the game library.")
-@app_commands.describe(rom="ROM file (.nes, .sfc, .smc, .swc or .fig)")
-async def emu_add(interaction: discord.Interaction, rom: discord.Attachment):
-    if not (EMU_ADD_OPEN or await check_is_owner(interaction)):
-        await interaction.response.send_message("\u274c Only the bot owner can add games.", ephemeral=True)
-        return
-    name = clean_rom_filename(rom.filename)
-    system = system_for(name) if name else None
-    if not system:
-        exts = ", ".join(sorted(e for spec in EMU_SYSTEMS.values() for e in spec["exts"]))
-        await interaction.response.send_message(f"\u274c Unsupported file. Supported types: {exts}", ephemeral=True)
-        return
-    if rom.size > EMU_MAX_ROM_BYTES:
-        await interaction.response.send_message(
-            f"\u274c That file is {rom.size / 1048576:.1f} MB; the limit is {EMU_MAX_ROM_BYTES // 1048576} MB "
-            "(raise it with the EMU_MAX_ROM_MB setting).", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        data = await rom.read()
-    except Exception as e:
-        await interaction.followup.send(f"\u274c Couldn't download that file: {e}", ephemeral=True)
-        return
-    if system == "nes" and data[:4] != b"NES\x1a":
-        await interaction.followup.send("\u274c That doesn't look like a valid .nes file (bad header).", ephemeral=True)
-        return
-    rel = f"{system}/{name}"
-    replaced = rel in all_roms()
-    saved_remote = await asyncio.to_thread(add_rom_blocking, system, name, data)
-    note = "" if saved_remote else "\n\u26a0\ufe0f Saved on the host only. The cloud backup failed, so it may vanish if the host resets."
-    await interaction.followup.send(
-        f"\u2705 {'Replaced' if replaced else 'Added'} **{os.path.splitext(name)[0]}** ({EMU_SYSTEMS[system]['label']}). "
-        f"Play it with `/emu-play`.{note}", ephemeral=True)
-
-
-@bot.tree.command(name="emu-remove", description="Remove a ROM from the game library (owner only).")
-@app_commands.describe(game="Game to remove")
-@app_commands.autocomplete(game=emu_rom_autocomplete)
-async def emu_remove(interaction: discord.Interaction, game: str):
-    if not await check_is_owner(interaction):
-        await interaction.response.send_message("\u274c Only the bot owner can remove games.", ephemeral=True)
-        return
-    if not valid_rom_ref(game) or game not in all_roms():
-        await interaction.response.send_message("\u274c Pick a game from the list.", ephemeral=True)
-        return
-    if any(sess.rel == game for sess in emu_sessions.values()):
-        await interaction.response.send_message("\u26a0\ufe0f That game is running right now. Stop it first.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    await asyncio.to_thread(remove_rom_blocking, game)
-    await interaction.followup.send(f"\U0001F5D1\uFE0F Removed **{os.path.splitext(game.split('/', 1)[1])[0]}**.", ephemeral=True)
 
 
 @bot.tree.command(name="emu-stop", description="Stop the game.")
