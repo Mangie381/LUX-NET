@@ -2392,12 +2392,13 @@ _ROM_BAD_CHARS = re.compile(r"[^\w .,'()&!+\-]")
 
 N64_WORKER_SOURCE = r'''#!/usr/bin/env python3
 # AUTO-WRITTEN BY THE BOT from the copy inside the bot file. Edit that copy (or delete this line to keep your own edits).
+# AUTO-WRITTEN BY THE BOT from the copy inside the bot file. Edit that copy (or delete this line to keep your own edits).
 """LUX-NET libretro worker (N64 first, any software-rendered core works).
 
 Talks to the bot over stdin/stdout with the same framing the NES/SNES worker uses:
     bot -> worker : <u32 length LE><pickle dict>     e.g. {"op": "load", ...}
     worker -> bot : <u32 length LE><kind byte><payload>
-                    kind b"R" = pickled reply, b"J" = JPEG/PNG video frame, b"A" = audio (b"A\\x00" + int16 PCM)
+                    kind b"R" = pickled reply, b"J" = video frame (b"J\\x00" + JPEG/PNG), b"A" = audio (b"A\\x00" + int16 PCM)
 
 Design goals: keep the emulation thread free. Frames are copied out of the core and encoded on a second
 thread (latest frame wins, so a slow viewer never slows the game down), audio is forwarded as it is made,
@@ -2666,7 +2667,7 @@ class Encoder(threading.Thread):
                 continue
             try:
                 kind = "jpeg" if Image is not None else "png"
-                emit(b"J", encode_frame(frame, kind, self.quality, self.max_w))
+                emit(b"J", b"\x00" + encode_frame(frame, kind, self.quality, self.max_w))
                 self.sent += 1
             except Exception as e:                                 # never let a bad frame kill the stream
                 log("encode error:", e)
@@ -3018,7 +3019,7 @@ class Worker:
         gc.set_threshold(100000, 50, 50)
         c = self.core
         w, h = (c.frame[1], c.frame[2]) if c.frame else (320, 240)
-        return {"ok": True, "png": self.snapshot_png(1), "audio_rate": c.sample_rate, "audio_ch": 2,
+        return {"ok": True, "png": self.snapshot_png(1), "audio_rate": c.sample_rate, "audio_ch": 2, "rate": c.sample_rate, "ch": 2,
                 "fps": round(c.fps, 3), "w": w, "h": h, "core_hw_refused": c.hw_requested}
 
     def op_steps(self, m):
@@ -3033,6 +3034,31 @@ class Worker:
             c.run_frame()
         c.audio = []
         return {"ok": True}
+
+    def op_clip(self, m):
+        c = self.core
+        mask, hold = int(m.get("mask", 0)), int(m.get("hold", 8))
+        frames = max(1, min(int(m.get("frames", 90)), 360))
+        every, scale = max(1, int(m.get("every", 3))), max(1, int(m.get("scale", 1)))
+        if Image is None:
+            raise RuntimeError("clips need Pillow installed")
+        imgs = []
+        for i in range(frames):
+            c.mask = mask if i < hold else self.base_mask
+            c.run_frame()
+            if i % every == 0 and c.frame is not None:
+                im = _rgb_from_frame(*c.frame[:4], c.frame[4]).copy()
+                if scale > 1:
+                    im = im.resize((im.width * scale, im.height * scale), Image.NEAREST)
+                imgs.append(im)
+        c.mask = self.base_mask
+        c.audio = []
+        if not imgs:
+            raise RuntimeError("no picture was produced")
+        bio = io.BytesIO()
+        imgs[0].save(bio, "GIF", save_all=True, append_images=imgs[1:], loop=0,
+                     duration=max(20, int(1000 * every / c.fps)), optimize=False)
+        return {"ok": True, "gif": bio.getvalue()}
 
     def op_bench(self, m):
         c = self.core
@@ -3091,6 +3117,8 @@ class Worker:
             reply({"ok": True})
         elif op == "bench":
             reply(self.op_bench(m))
+        elif op == "clip":
+            reply(self.op_clip(m))
         elif op == "quit":
             self.stop = True
         else:
@@ -3120,7 +3148,7 @@ class Worker:
             self.handle(m)
         except Exception as e:
             log(traceback.format_exc())
-            if m.get("op") in ("load", "steps", "snap", "save", "loadstate", "bench"):
+            if m.get("op") in ("load", "steps", "snap", "save", "loadstate", "bench", "clip"):
                 reply({"ok": False, "err": f"{type(e).__name__}: {e}"[:300]})
 
     def main(self):
@@ -3982,7 +4010,7 @@ function connect(){
   ws.onmessage=e=>{
     if(typeof e.data==='string'){text(JSON.parse(e.data));return}
     const u=new Uint8Array(e.data);
-    if(u[0]===74){pending=u.subarray(1);if(!busy)decode()}
+    if(u[0]===74){pending=u.subarray(2);if(!busy)decode()}
     else if(u[0]===65&&soundOn)pcm(u.subarray(2));
   };
 }
@@ -4218,7 +4246,7 @@ class EmuView(discord.ui.View):
                 f"\U0001F3AE **Play live ({EMU_STREAM_FPS} fps):** {EMU_WEB_BASE}/emu/{token}\n"
                 f"Keys: {keys}. Controllers and touch controls work too. The link is personal to you and stops "
                 "working when the game ends.", ephemeral=True)
-        elif action in ("save", "load") and sess.system == "n64":
+        elif action in ("save", "load"):
             await interaction.response.defer(ephemeral=True)
             if action == "save":
                 res = await sess.call(op="save", path=sess.state_path)
@@ -4231,6 +4259,29 @@ class EmuView(discord.ui.View):
             else:
                 text = "\u26a0\ufe0f There's no save for this game yet. Press Save first."
             await interaction.followup.send(text, ephemeral=True)
+        elif action == "clip":
+            await interaction.response.defer()
+            limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
+            gif = None
+            # biggest picture first; shrink if the server's upload limit would reject it
+            for scale, every in ((1 if sess.system == "n64" else 2, 3), (1, 3), (1, 5)):
+                try:
+                    res = await asyncio.wait_for(sess.call(op="clip", mask=sess.last_mask, hold=sess.hold, frames=90,
+                                                           every=every, scale=scale), 180)
+                except asyncio.TimeoutError:
+                    res = {"ok": False, "err": "timed out"}
+                if not res.get("ok"):
+                    await interaction.followup.send(f"\u274c Couldn't make a clip: {res.get('err')}", ephemeral=True)
+                    return
+                gif = res["gif"]
+                if len(gif) < limit - 4096:
+                    break
+            if len(gif) >= limit - 4096:
+                await interaction.followup.send("\u274c That clip is too big for this server's upload limit.", ephemeral=True)
+                return
+            await interaction.followup.send(content=f"\U0001F39E {interaction.user.display_name}'s clip",
+                                            file=discord.File(io.BytesIO(gif), filename="clip.gif"))
+            sess.schedule_refresh()
         elif action == "quit":
             await interaction.response.defer()
             await emu_close(sess, "stopped")
@@ -4277,7 +4328,7 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         if not res.get("ok"):
             raise RuntimeError(res.get("err"))
         sess.audio_rate = int(res.get("audio_rate") or res.get("rate") or 0)
-        sess.audio_ch = int(res.get("audio_ch") or 2)
+        sess.audio_ch = int(res.get("audio_ch") or res.get("ch") or 2)
         if sess.system == "n64" and resume and os.path.exists(sess.auto_path):
             await sess.call(op="loadstate", path=sess.auto_path)
         sess.view = EmuView(sess)
