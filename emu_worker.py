@@ -618,6 +618,16 @@ def main():
             elif op == "loadstate":
                 emu.load_state(m["path"])
                 out.reply({"ok": True})
+            elif op == "bench":
+                # Used by /emu-bench: run N frames flat out (no input, no audio) and report real speed.
+                if emu.lib is None:
+                    raise RuntimeError("no game loaded")
+                n = max(10, min(int(m.get("frames", 120)), 600))
+                t0 = time.perf_counter()
+                emu.run_frames(n, 0)
+                dt = max(1e-6, time.perf_counter() - t0)
+                out.reply({"ok": True, "fps": n / dt, "frames": n, "sec": dt, "target": emu.fps})
+                next_t = 0.0
             else:
                 out.reply({"ok": False, "err": f"unknown op {op!r}"})
         except Exception as e:
