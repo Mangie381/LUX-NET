@@ -2077,111 +2077,234 @@ async def voice_status(interaction: discord.Interaction):
 # ------------------------------------------------------------------------------
 # YOUTUBE & WEB SEARCH COMMANDS
 # ------------------------------------------------------------------------------
-def _entry_url(entry: dict) -> str:
-    url = entry.get("webpage_url") or entry.get("url") or ""
-    if not url.startswith("http") and entry.get("id"):
-        url = f"https://www.youtube.com/watch?v={entry['id']}"
-    return url
+_YT_ID = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|embed/|live/)"
+                    r"|music\.youtube\.com/watch\?(?:[^#\s]*&)?v=)([\w-]{11})")
 
 
-async def relay_watch_post(source_channel, requester: discord.abc.User, title: str, url: str):
+def yt_video_id(text: str):
+    m = _YT_ID.search(text or "")
+    return m.group(1) if m else None
+
+
+def yt_url(video_id: str) -> str:
+    # The plain watch URL is what makes Discord expand the link into its inline YouTube player.
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def fmt_duration(sec) -> str:
+    if not sec:
+        return ""
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s_ = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
+
+
+def fmt_views(n) -> str:
+    if not n:
+        return ""
+    n = int(n)
+    for div, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if n >= div:
+            return f"{n / div:.1f}".rstrip("0").rstrip(".") + suffix + " views"
+    return f"{n} views"
+
+
+def yt_item(entry: dict):
+    vid = entry.get("id") if re.fullmatch(r"[\w-]{11}", entry.get("id") or "") else \
+        yt_video_id(entry.get("webpage_url") or entry.get("url") or "")
+    if not vid:
+        return None
+    live = entry.get("live_status") in ("is_live", "is_upcoming") or bool(entry.get("is_live"))
+    return {"id": vid, "title": (entry.get("title") or "Untitled video").strip()[:100],
+            "channel": entry.get("channel") or entry.get("uploader") or "", "duration": entry.get("duration"),
+            "views": entry.get("view_count"), "live": live}
+
+
+def yt_describe(item: dict) -> str:
+    bits = [item["channel"], "LIVE" if item["live"] else fmt_duration(item["duration"]), fmt_views(item["views"])]
+    return " \u2022 ".join(b for b in bits if b)[:100]
+
+
+async def yt_search(query: str, limit: int = 10) -> list:
+    """Search YouTube. Falls back to a web search if YouTube's own search is unavailable."""
+    def run():
+        import yt_dlp
+        opts = {"extract_flat": True, "quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 10}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    items, seen = [], set()
     try:
-        target_ids = await asyncio.to_thread(relay_targets_for, source_channel)
+        data = await asyncio.wait_for(asyncio.to_thread(run), 25)
+        for entry in (data or {}).get("entries") or []:
+            item = yt_item(entry or {})
+            if item and item["id"] not in seen:
+                seen.add(item["id"])
+                items.append(item)
+    except Exception as e:
+        logger.warning(f"yt_dlp search failed: {e}")
+    if not items:
+        try:
+            for r in await asyncio.to_thread(google_search, f"{query} site:youtube.com/watch", limit):
+                vid = yt_video_id(r.get("href", ""))
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    items.append({"id": vid, "title": (r.get("title") or "YouTube video")[:100], "channel": "",
+                                  "duration": None, "views": None, "live": False})
+        except Exception as e:
+            logger.warning(f"Fallback video search failed: {e}")
+    return items
+
+
+async def yt_lookup(video_id: str):
+    """Title/channel for a pasted link (best effort, short timeout)."""
+    def run():
+        import yt_dlp
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True, "socket_timeout": 8}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(yt_url(video_id), download=False)
+    try:
+        return yt_item(await asyncio.wait_for(asyncio.to_thread(run), 10) or {})
+    except Exception:
+        return None
+
+
+def watch_message(who: str, item) -> str:
+    # Title line, then the bare link on its own line so Discord turns it into the playable embed.
+    title = f"**{item['title']}**" if item and item.get("title") else "a video"
+    return f"\u25B6\uFE0F **{who}** is watching: {title}\n{yt_url(item['id'])}"[:2000]
+
+
+def link_button_view(video_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Open on YouTube", url=yt_url(video_id)))
+    return view
+
+
+async def relay_watch_post(source_channel, requester: discord.abc.User, item: dict):
+    try:
+        targets = await relay_channels_for(source_channel)
     except Exception as e:
         logger.error(f"Could not look up relay targets: {e}")
         return
+    if not targets:
+        return
+    guild = getattr(source_channel, "guild", None)
+    guild_name = guild.name if guild else "Unknown"
+    username = safe_webhook_name(f"{requester.display_name} [{guild_name}]")
+    content = watch_message(requester.display_name, item)
 
-    guild_name = source_channel.guild.name if source_channel.guild else "Unknown"
-    username = f"{requester.display_name} [{guild_name}]"[:80]
-    content = f"\u25B6\uFE0F **{requester.display_name}** is watching: **{title}**\n{url}"[:2000]
-
-    async def one(cid: int):
-        ch = bot.get_channel(cid)
-        if not ch:
-            return
+    async def one(ch):
         try:
-            webhook = await get_or_create_webhook(ch)
-            if webhook:
-                await webhook.send(
-                    username=username,
-                    avatar_url=requester.display_avatar.url,
-                    content=content,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                    **_thread_kw(ch),
-                )
-            else:
-                await ch.send(content, allowed_mentions=discord.AllowedMentions.none())
+            await webhook_send(ch, username=username, avatar_url=requester.display_avatar.url, content=content,
+                               allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             logger.warning(f"Could not relay video link: {e}")
 
-    await asyncio.gather(*(one(cid) for cid in target_ids))
+    await asyncio.gather(*(one(ch) for ch in targets))
 
 
-class YouTubeDropdown(discord.ui.Select):
-    def __init__(self, options):
-        super().__init__(placeholder="Select the correct video...", min_values=1, max_values=1, options=options)
+class YouTubeResultsView(discord.ui.View):
+    PAGE = 5
 
-    async def callback(self, interaction: discord.Interaction):
-        url = self.values[0]
-        title = next((o.label for o in self.options if o.value == url), "YouTube video")
+    def __init__(self, items: list, requester_id: int, query: str):
+        super().__init__(timeout=180)
+        self.videos, self.requester_id, self.query, self.page = items, requester_id, query, 0
+        self._build()
 
-        await interaction.response.send_message(f"\u25B6\uFE0F **{interaction.user.display_name}** is watching: **{title}**\n{url}")
-        if interaction.channel and supabase:
-            await relay_watch_post(interaction.channel, interaction.user, title, url)
+    def pages(self) -> int:
+        return max(1, -(-len(self.videos) // self.PAGE))
+
+    def chunk(self) -> list:
+        return self.videos[self.page * self.PAGE:(self.page + 1) * self.PAGE]
+
+    def _build(self):
+        self.clear_items()
+        select = discord.ui.Select(
+            placeholder="Pick a video to post with an inline player...",
+            options=[discord.SelectOption(label=i["title"], description=yt_describe(i) or None, value=i["id"])
+                     for i in self.chunk()])
+        select.callback = self._picked
+        self.add_item(select)
+        if self.pages() > 1:
+            prev_b = discord.ui.Button(label="\u25C0 Prev", style=discord.ButtonStyle.secondary, disabled=self.page == 0, row=1)
+            next_b = discord.ui.Button(label="Next \u25B6", style=discord.ButtonStyle.secondary,
+                                       disabled=self.page >= self.pages() - 1, row=1)
+            prev_b.callback = lambda i: self._turn(i, -1)
+            next_b.callback = lambda i: self._turn(i, 1)
+            self.add_item(prev_b)
+            self.add_item(next_b)
+        top = discord.ui.Button(label="\u25B6 Post top result", style=discord.ButtonStyle.success, row=1)
+        top.callback = lambda i: self._post(i, self.videos[0])
+        self.add_item(top)
+
+    def embed(self) -> discord.Embed:
+        lines = []
+        for n, i in enumerate(self.chunk(), self.page * self.PAGE + 1):
+            lines.append(f"**{n}.** {i['title']}\n\u2003{yt_describe(i) or 'YouTube'}")
+        e = discord.Embed(title=f"\U0001F50D YouTube: {self.query}"[:256], description="\n".join(lines)[:4000], color=0xFF0033)
+        if self.chunk():
+            e.set_thumbnail(url=f"https://i.ytimg.com/vi/{self.chunk()[0]['id']}/hqdefault.jpg")
+        e.set_footer(text=f"Page {self.page + 1}/{self.pages()} \u2022 the video appears with Discord's own player")
+        return e
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("\u274c This menu belongs to someone else. Run `/play` yourself.", ephemeral=True)
+            return False
+        return True
+
+    async def _turn(self, interaction: discord.Interaction, d: int):
+        if not await self._guard(interaction):
+            return
+        self.page = max(0, min(self.pages() - 1, self.page + d))
+        self._build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _picked(self, interaction: discord.Interaction):
+        vid = interaction.data["values"][0]
+        item = next((i for i in self.videos if i["id"] == vid), None)
+        if item:
+            await self._post(interaction, item)
+
+    async def _post(self, interaction: discord.Interaction, item: dict):
+        if not await self._guard(interaction):
+            return
+        self.stop()
+        await interaction.response.edit_message(content=f"\u2705 Posted **{item['title']}**", embed=None, view=None)
+        await post_video(interaction, item)
 
 
-class YouTubeSelectView(discord.ui.View):
-    def __init__(self, entries):
-        super().__init__(timeout=60)
-        options = []
-        for entry in entries[:5]:
-            url = _entry_url(entry)
-            if not url:
-                continue
-            title = (entry.get("title") or "Unknown Title")[:100]
-            uploader = entry.get("uploader") or entry.get("channel") or "Unknown"
-            options.append(discord.SelectOption(label=title, description=f"By: {uploader}"[:100], value=url[:100]))
-        self.has_options = bool(options)
-        if options:
-            self.add_item(YouTubeDropdown(options))
+async def post_video(interaction: discord.Interaction, item: dict):
+    content = watch_message(interaction.user.display_name, item)
+    try:
+        await interaction.followup.send(content, view=link_button_view(item["id"]))
+    except Exception:
+        if interaction.channel:
+            await interaction.channel.send(content, view=link_button_view(item["id"]))
+    if interaction.channel and supabase:
+        await relay_watch_post(interaction.channel, interaction.user, item)
 
-@bot.tree.command(name="play", description="Search YouTube, pick a video, and play inline.")
-@app_commands.describe(search="Search keywords or URL")
+
+@bot.tree.command(name="play", description="Search YouTube (or paste a link) and post the video with an inline player.")
+@app_commands.describe(search="Search keywords, or a YouTube link")
 async def play(interaction: discord.Interaction, search: str):
+    search = search.strip()
+    vid = yt_video_id(search)
+    if vid:                                              # pasted link: post straight away, no menu
+        await interaction.response.defer()
+        item = await yt_lookup(vid) or {"id": vid, "title": ""}
+        await post_video(interaction, item)
+        return
+
     await interaction.response.defer(ephemeral=True)
-
-    entries = []
-    if "youtube.com/watch" in search or "youtu.be/" in search:
-        entries.append({'title': 'Direct YouTube Link', 'uploader': 'Provided URL', 'webpage_url': search.strip()})
-    else:
-        try:
-            import yt_dlp
-            search_opts = {'extract_flat': True, 'quiet': True}
-            query = f"ytsearch5:{search}"
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(search_opts).extract_info(query, download=False))
-            entries = data.get('entries', [])
-        except Exception as e:
-            logger.error(f"yt_dlp search error: {e}")
-
-        if not entries:
-            try:
-                for item in await asyncio.to_thread(google_search, f"{search} site:youtube.com/watch", 5):
-                    url = item.get("href", "")
-                    if "youtube.com/watch" in url:
-                        entries.append({'title': item.get("title", 'YouTube Video Result'), 'uploader': 'Google Search', 'webpage_url': url})
-            except Exception as e:
-                logger.error(f"Fallback search error: {e}")
-
-    if not entries:
-        await interaction.followup.send(f"⚠️ Could not find videos for `{search}`.", ephemeral=True)
+    items = await yt_search(search, 10)
+    if not items:
+        await interaction.followup.send(f"\u26a0\ufe0f Couldn't find videos for `{search}`. Try different keywords.", ephemeral=True)
         return
+    view = YouTubeResultsView(items, interaction.user.id, search)
+    await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
 
-    view = YouTubeSelectView(entries)
-    if not view.has_options:
-        await interaction.followup.send(f"⚠️ Could not find playable results.", ephemeral=True)
-        return
-    await interaction.followup.send("🔍 **Select the correct video below:**", view=view, ephemeral=True)
 
 @bot.tree.command(name="search", description="Web search with Gemini AI overview.")
 @app_commands.describe(query="What would you like to search for?")
@@ -2222,6 +2345,7 @@ CORE_DIR = os.environ.get("CORE_DIR", os.path.join(EMU_BASE, "cores"))
 STATE_DIR = os.environ.get("STATE_DIR", os.path.join(EMU_BASE, "states"))
 ROM_BUCKET = os.environ.get("ROM_BUCKET", "roms")
 WORKER_PATH = os.path.join(EMU_BASE, "emu_worker.py")
+WORKER_PATH_N64 = os.path.join(EMU_BASE, "emu_worker_n64.py")   # N64 runs in its own worker (analog stick, frame skipping)
 CORE_BASE_URL = os.environ.get("CORE_BASE_URL", "https://buildbot.libretro.com/nightly/linux/x86_64/latest")
 
 MAX_EMU_SESSIONS = int(os.environ.get("MAX_EMU_SESSIONS", "2"))
@@ -2230,6 +2354,7 @@ EMU_SCALE = int(os.environ.get("EMU_SCALE", "2"))
 EMU_HOLD_STEPS = [4, 8, 16, 30]
 EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))
 EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
+EMU_MAX_N64 = int(os.environ.get("EMU_MAX_N64", "1"))        # N64 is heavy: one game at a time by default
 EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"
 EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))
 EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"
@@ -2246,6 +2371,8 @@ EMU_WEB_BASE = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_
 EMU_SYSTEMS = {
     "nes": {"label": "NES", "exts": {".nes"}, "core": os.environ.get("CORE_NES", "fceumm_libretro")},
     "snes": {"label": "SNES", "exts": {".sfc", ".smc", ".swc", ".fig"}, "core": os.environ.get("CORE_SNES", "snes9x2010_libretro")},
+    "n64": {"label": "N64", "exts": {".z64", ".n64", ".v64"}, "core": os.environ.get("CORE_N64", "mupen64plus_next_libretro"),
+            "worker": WORKER_PATH_N64, "max_mb": int(os.environ.get("EMU_MAX_ROM_MB_N64", "64")), "lazy_core": True},
 }
 
 EMU_MASKS = {
@@ -2253,11 +2380,845 @@ EMU_MASKS = {
     "up": 1 << 4, "down": 1 << 5, "left": 1 << 6, "right": 1 << 7,
     "a": 1 << 8, "x": 1 << 9, "l": 1 << 10, "r": 1 << 11,
     "ab": (1 << 0) | (1 << 8),
+    # N64 extras: Z trigger, C buttons, and the analog stick as four full-tilt directions
+    "z": 1 << 12, "cu": 1 << 13, "cd": 1 << 14, "cl": 1 << 15, "cr": 1 << 16,
+    "su": 1 << 17, "sd": 1 << 18, "sl": 1 << 19, "sr": 1 << 20,
 }
 
 emu_sessions: dict = {}
 _remote_roms: set = set()
 _ROM_BAD_CHARS = re.compile(r"[^\w .,'()&!+\-]")
+
+
+N64_WORKER_SOURCE = r'''#!/usr/bin/env python3
+# AUTO-WRITTEN BY THE BOT from the copy inside the bot file. Edit that copy (or delete this line to keep your own edits).
+"""LUX-NET libretro worker (N64 first, any software-rendered core works).
+
+Talks to the bot over stdin/stdout with the same framing the NES/SNES worker uses:
+    bot -> worker : <u32 length LE><pickle dict>     e.g. {"op": "load", ...}
+    worker -> bot : <u32 length LE><kind byte><payload>
+                    kind b"R" = pickled reply, b"J" = JPEG/PNG video frame, b"A" = audio (b"A\\x00" + int16 PCM)
+
+Design goals: keep the emulation thread free. Frames are copied out of the core and encoded on a second
+thread (latest frame wins, so a slow viewer never slows the game down), audio is forwarded as it is made,
+and when the machine falls behind real time the worker keeps the game speed and drops *video* frames
+instead of letting the game run in slow motion.
+
+Run `python emu_worker_n64.py --bench CORE.so ROM.z64` on the host to see what speed it really achieves.
+"""
+from __future__ import annotations
+
+import collections
+import ctypes
+import gc
+import hashlib
+import io
+import os
+import pickle
+import queue
+import struct
+import sys
+import threading
+import time
+import traceback
+import zlib
+
+# ----------------------------------------------------------------------------- protocol plumbing
+# Cores sometimes print to stdout. Keep the real stdout private for the protocol and point fd 1 at stderr.
+_PROTO_OUT = None
+_PROTO_IN = None
+
+
+def _setup_pipes():
+    global _PROTO_OUT, _PROTO_IN
+    out_fd = os.dup(1)
+    os.dup2(2, 1)
+    _PROTO_OUT = os.fdopen(out_fd, "wb", buffering=0)
+    _PROTO_IN = sys.stdin.buffer
+
+
+_out_lock = threading.Lock()
+
+
+def emit(kind: bytes, payload: bytes):
+    body = kind + payload
+    with _out_lock:
+        _PROTO_OUT.write(struct.pack("<I", len(body)) + body)
+
+
+def reply(obj: dict):
+    emit(b"R", pickle.dumps(obj, protocol=4))
+
+
+def log(*a):
+    print("[n64-worker]", *a, file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------------------- optional imports
+try:
+    from PIL import Image
+except Exception:                                   # pragma: no cover
+    Image = None
+try:
+    import numpy as np
+except Exception:                                   # pragma: no cover
+    np = None
+
+# ----------------------------------------------------------------------------- libretro constants
+ENV_GET_OVERSCAN, ENV_GET_CAN_DUPE, ENV_SET_MESSAGE, ENV_SHUTDOWN = 2, 3, 6, 7
+ENV_SET_PERFORMANCE_LEVEL, ENV_GET_SYSTEM_DIRECTORY, ENV_SET_PIXEL_FORMAT = 8, 9, 10
+ENV_SET_INPUT_DESCRIPTORS, ENV_SET_KEYBOARD_CALLBACK, ENV_SET_HW_RENDER = 11, 12, 14
+ENV_GET_VARIABLE, ENV_SET_VARIABLES, ENV_GET_VARIABLE_UPDATE, ENV_SET_SUPPORT_NO_GAME = 15, 16, 17, 18
+ENV_GET_INPUT_DEVICE_CAPABILITIES = 24
+ENV_GET_CORE_ASSETS_DIRECTORY, ENV_GET_SAVE_DIRECTORY = 30, 31
+ENV_SET_SYSTEM_AV_INFO, ENV_SET_CONTROLLER_INFO, ENV_SET_GEOMETRY = 32, 35, 37
+ENV_GET_LANGUAGE, ENV_SET_SERIALIZATION_QUIRKS = 39, 44
+ENV_GET_AUDIO_VIDEO_ENABLE = 47
+ENV_GET_CORE_OPTIONS_VERSION, ENV_GET_MESSAGE_INTERFACE_VERSION = 52, 59
+ENV_SET_MINIMUM_AUDIO_LATENCY, ENV_SET_CONTENT_INFO_OVERRIDE = 63, 65
+ENV_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK = 69
+
+DEV_JOYPAD, DEV_ANALOG = 1, 5
+JOY_MASK_QUERY = 256
+MEM_SAVE_RAM = 0
+
+# Bit layout shared with the bot (bits 0-11 equal the libretro joypad ids; 12+ are N64 extras)
+B_B, B_Y, B_SELECT, B_START, B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_X, B_L, B_R = (1 << i for i in range(12))
+B_Z, B_CU, B_CD, B_CL, B_CR = (1 << 12), (1 << 13), (1 << 14), (1 << 15), (1 << 16)
+B_SU, B_SD, B_SL, B_SR = (1 << 17), (1 << 18), (1 << 19), (1 << 20)
+STICK_MAX = 32767
+
+# N64 option defaults tuned for a CPU-only host. Unknown keys are ignored by the core, and any of them can be
+# overridden with the N64_CORE_OPTIONS environment variable ("key=value;key=value").
+N64_DEFAULT_OPTIONS = {
+    "mupen64plus-cpucore": "dynamic_recompiler",
+    "mupen64plus-rdp-plugin": os.environ.get("N64_RDP", "angrylion"),
+    "mupen64plus-rsp-plugin": os.environ.get("N64_RSP", "cxd4"),
+    "mupen64plus-angrylion-multithread": "all threads",
+    "mupen64plus-angrylion-sync": "Low",
+    "mupen64plus-angrylion-vioverlay": "Filtered",
+    "mupen64plus-angrylion-overscan": "disabled",
+    "mupen64plus-43screensize": "320x240",
+    "mupen64plus-EnableLODEmulation": "False",
+    "mupen64plus-pak1": "memory",
+    "mupen64plus-virefresh": "Auto",
+    "mupen64plus-audio-buffer-size": "2048",
+}
+
+
+def parse_option_overrides(text: str) -> dict:
+    out = {}
+    for part in (text or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
+class RetroVariable(ctypes.Structure):
+    _fields_ = [("key", ctypes.c_char_p), ("value", ctypes.c_char_p)]
+
+
+class RetroSystemInfo(ctypes.Structure):
+    _fields_ = [("library_name", ctypes.c_char_p), ("library_version", ctypes.c_char_p),
+                ("valid_extensions", ctypes.c_char_p), ("need_fullpath", ctypes.c_bool),
+                ("block_extract", ctypes.c_bool)]
+
+
+class RetroGameGeometry(ctypes.Structure):
+    _fields_ = [("base_width", ctypes.c_uint), ("base_height", ctypes.c_uint),
+                ("max_width", ctypes.c_uint), ("max_height", ctypes.c_uint), ("aspect_ratio", ctypes.c_float)]
+
+
+class RetroSystemTiming(ctypes.Structure):
+    _fields_ = [("fps", ctypes.c_double), ("sample_rate", ctypes.c_double)]
+
+
+class RetroSystemAvInfo(ctypes.Structure):
+    _fields_ = [("geometry", RetroGameGeometry), ("timing", RetroSystemTiming)]
+
+
+class RetroGameInfo(ctypes.Structure):
+    _fields_ = [("path", ctypes.c_char_p), ("data", ctypes.c_void_p), ("size", ctypes.c_size_t),
+                ("meta", ctypes.c_char_p)]
+
+
+ENV_T = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_uint, ctypes.c_void_p)
+VIDEO_T = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_size_t)
+AUDIO_T = ctypes.CFUNCTYPE(None, ctypes.c_int16, ctypes.c_int16)
+AUDIO_BATCH_T = ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t)
+POLL_T = ctypes.CFUNCTYPE(None)
+STATE_T = ctypes.CFUNCTYPE(ctypes.c_int16, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
+
+
+def to_pad(mask: int, n64: bool):
+    """Our shared bitmask -> (libretro joypad bitmask, lx, ly, rx, ry)."""
+    if not n64:
+        return mask & 0xFFFF, 0, 0, 0, 0
+    pad = 0
+    if mask & B_A:
+        pad |= 1 << 0           # N64 A  <- RetroPad B
+    if mask & B_B:
+        pad |= 1 << 1           # N64 B  <- RetroPad Y
+    if mask & B_START:
+        pad |= 1 << 3
+    if mask & B_UP:
+        pad |= 1 << 4
+    if mask & B_DOWN:
+        pad |= 1 << 5
+    if mask & B_LEFT:
+        pad |= 1 << 6
+    if mask & B_RIGHT:
+        pad |= 1 << 7
+    if mask & B_L:
+        pad |= 1 << 10
+    if mask & B_R:
+        pad |= 1 << 11
+    if mask & B_Z:
+        pad |= 1 << 12          # N64 Z  <- RetroPad L2
+    lx = (STICK_MAX if mask & B_SR else 0) - (STICK_MAX if mask & B_SL else 0)
+    ly = (STICK_MAX if mask & B_SD else 0) - (STICK_MAX if mask & B_SU else 0)
+    rx = (STICK_MAX if mask & B_CR else 0) - (STICK_MAX if mask & B_CL else 0)   # C buttons = right stick
+    ry = (STICK_MAX if mask & B_CD else 0) - (STICK_MAX if mask & B_CU else 0)
+    return pad, lx, ly, rx, ry
+
+
+# ----------------------------------------------------------------------------- image encoding
+def _rgb_from_frame(buf: bytes, w: int, h: int, pitch: int, fmt: int):
+    """Return a PIL RGB image (or raw RGB bytes if PIL is missing) for a libretro frame."""
+    if fmt == 1:                                                   # XRGB8888
+        if Image is not None:
+            return Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", pitch, 1)
+        rows = []
+        for y in range(h):
+            row = buf[y * pitch:y * pitch + w * 4]
+            ba = bytearray(w * 3)
+            ba[0::3], ba[1::3], ba[2::3] = row[2::4], row[1::4], row[0::4]
+            rows.append(bytes(ba))
+        return b"".join(rows)
+    if np is None:
+        raise RuntimeError("16-bit video needs numpy installed")
+    arr = np.frombuffer(buf, dtype="<u2", count=(pitch // 2) * h).reshape(h, pitch // 2)[:, :w]
+    if fmt == 2:                                                   # RGB565
+        r, g, b = (arr >> 11) & 31, (arr >> 5) & 63, arr & 31
+        r, g, b = (r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)
+    else:                                                          # 0RGB1555
+        r, g, b = (arr >> 10) & 31, (arr >> 5) & 31, arr & 31
+        r, g, b = (r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)
+    rgb = np.stack([r, g, b], axis=-1).astype(np.uint8)
+    if Image is not None:
+        return Image.fromarray(rgb, "RGB")
+    return rgb.tobytes()
+
+
+def _png_from_rgb_bytes(rgb: bytes, w: int, h: int) -> bytes:
+    raw = b"".join(b"\x00" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
+
+
+def encode_frame(frame, kind: str, quality: int, max_w: int = 0, scale: int = 1) -> bytes:
+    buf, w, h, pitch, fmt = frame
+    img = _rgb_from_frame(buf, w, h, pitch, fmt)
+    if Image is None:                                              # no Pillow: PNG only, no scaling
+        return _png_from_rgb_bytes(img, w, h)
+    if scale > 1:
+        img = img.resize((w * scale, h * scale), Image.NEAREST)
+    elif max_w and w > max_w:
+        img = img.resize((max_w, max(1, h * max_w // w)), Image.BILINEAR)
+    bio = io.BytesIO()
+    if kind == "jpeg":
+        img.save(bio, "JPEG", quality=quality, subsampling=2)
+    else:
+        img.save(bio, "PNG", compress_level=1)
+    return bio.getvalue()
+
+
+class Encoder(threading.Thread):
+    """Encodes the newest frame on its own thread; older frames are dropped, never queued."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.cond = threading.Condition()
+        self.pending = None
+        self.quality = 72
+        self.max_w = int(os.environ.get("EMU_N64_MAX_W", "640"))
+        self.enabled = False
+        self.sent = 0
+
+    def submit(self, frame):
+        with self.cond:
+            self.pending = frame
+            self.cond.notify()
+
+    def run(self):
+        while True:
+            with self.cond:
+                while self.pending is None:
+                    self.cond.wait()
+                frame, self.pending = self.pending, None
+            if not self.enabled:
+                continue
+            try:
+                kind = "jpeg" if Image is not None else "png"
+                emit(b"J", encode_frame(frame, kind, self.quality, self.max_w))
+                self.sent += 1
+            except Exception as e:                                 # never let a bad frame kill the stream
+                log("encode error:", e)
+
+
+# ----------------------------------------------------------------------------- the core wrapper
+class Core:
+    def __init__(self, core_path: str, sysdir: str, savedir: str, options: dict, n64: bool):
+        self.lib = ctypes.CDLL(core_path, mode=ctypes.RTLD_LOCAL)
+        self.sysdir = os.fsencode(sysdir)
+        self.savedir = os.fsencode(savedir)
+        self.options = dict(options)
+        self.defaults = {}
+        self.n64 = n64
+        self.pixfmt = 0
+        self.hw_requested = False
+        self.shutdown = False
+        self.vars_dirty = False
+        self.av_enable = 3                       # bit0 = draw video, bit1 = make audio
+        self._vals = {}
+        self.mask = 0
+        self.ax = self.ay = 0.0
+        self.frame = None
+        self.new_frame = False
+        self.audio = []
+        self.av = None
+        self.rom_buf = None
+        self.loaded = False
+        self.srm_path = None
+        self._srm_hash = None
+
+        L = self.lib
+        L.retro_get_system_info.argtypes = [ctypes.POINTER(RetroSystemInfo)]
+        L.retro_get_system_av_info.argtypes = [ctypes.POINTER(RetroSystemAvInfo)]
+        L.retro_load_game.argtypes = [ctypes.POINTER(RetroGameInfo)]
+        L.retro_load_game.restype = ctypes.c_bool
+        L.retro_serialize_size.restype = ctypes.c_size_t
+        L.retro_serialize.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        L.retro_serialize.restype = ctypes.c_bool
+        L.retro_unserialize.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        L.retro_unserialize.restype = ctypes.c_bool
+        L.retro_get_memory_data.argtypes = [ctypes.c_uint]
+        L.retro_get_memory_data.restype = ctypes.c_void_p
+        L.retro_get_memory_size.argtypes = [ctypes.c_uint]
+        L.retro_get_memory_size.restype = ctypes.c_size_t
+        L.retro_set_controller_port_device.argtypes = [ctypes.c_uint, ctypes.c_uint]
+
+        # callbacks must stay referenced for the life of the core
+        self._cb_env = ENV_T(self._environment)
+        self._cb_video = VIDEO_T(self._video)
+        self._cb_audio = AUDIO_T(self._audio_sample)
+        self._cb_batch = AUDIO_BATCH_T(self._audio_batch)
+        self._cb_poll = POLL_T(lambda: None)
+        self._cb_state = STATE_T(self._input_state)
+        L.retro_set_environment(self._cb_env)
+        L.retro_set_video_refresh(self._cb_video)
+        L.retro_set_audio_sample(self._cb_audio)
+        L.retro_set_audio_sample_batch(self._cb_batch)
+        L.retro_set_input_poll(self._cb_poll)
+        L.retro_set_input_state(self._cb_state)
+        L.retro_init()
+
+    # ---- libretro callbacks (they must never raise)
+    def _environment(self, cmd, data):
+        try:
+            cmd &= 0xFFFF
+            if cmd == ENV_GET_OVERSCAN:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_bool))[0] = False
+                return True
+            if cmd == ENV_GET_CAN_DUPE:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_bool))[0] = True
+                return True
+            if cmd in (ENV_SET_MESSAGE, ENV_SET_PERFORMANCE_LEVEL, ENV_SET_INPUT_DESCRIPTORS,
+                       ENV_SET_KEYBOARD_CALLBACK, ENV_SET_SUPPORT_NO_GAME, ENV_SET_CONTROLLER_INFO,
+                       ENV_SET_SERIALIZATION_QUIRKS, ENV_SET_MINIMUM_AUDIO_LATENCY,
+                       ENV_SET_CONTENT_INFO_OVERRIDE, ENV_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK):
+                return True
+            if cmd == ENV_SHUTDOWN:
+                self.shutdown = True
+                return True
+            if cmd in (ENV_GET_SYSTEM_DIRECTORY, ENV_GET_CORE_ASSETS_DIRECTORY):
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_char_p))[0] = self.sysdir
+                return True
+            if cmd == ENV_GET_SAVE_DIRECTORY:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_char_p))[0] = self.savedir
+                return True
+            if cmd == ENV_SET_PIXEL_FORMAT:
+                fmt = ctypes.cast(data, ctypes.POINTER(ctypes.c_uint))[0]
+                if fmt in (0, 1, 2):
+                    self.pixfmt = fmt
+                    return True
+                return False
+            if cmd == ENV_SET_HW_RENDER:
+                self.hw_requested = True          # no GPU context here: refuse, the core should fall back
+                return False
+            if cmd == ENV_SET_VARIABLES:
+                arr = ctypes.cast(data, ctypes.POINTER(RetroVariable))
+                i = 0
+                while arr[i].key:
+                    desc = (arr[i].value or b"").decode("utf-8", "replace")
+                    first = desc.split(";", 1)[-1].strip().split("|")[0].strip()
+                    self.defaults[arr[i].key.decode()] = first
+                    i += 1
+                return True
+            if cmd == ENV_GET_VARIABLE:
+                var = ctypes.cast(data, ctypes.POINTER(RetroVariable))[0]
+                key = (var.key or b"").decode()
+                val = self.options.get(key, self.defaults.get(key))
+                if val is None:
+                    return False
+                self._vals[key] = val.encode()
+                ctypes.cast(data, ctypes.POINTER(RetroVariable))[0].value = self._vals[key]
+                return True
+            if cmd == ENV_GET_VARIABLE_UPDATE:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_bool))[0] = self.vars_dirty
+                self.vars_dirty = False
+                return True
+            if cmd == ENV_GET_INPUT_DEVICE_CAPABILITIES:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_uint64))[0] = (1 << DEV_JOYPAD) | (1 << DEV_ANALOG)
+                return True
+            if cmd in (ENV_SET_SYSTEM_AV_INFO, ENV_SET_GEOMETRY):
+                return True
+            if cmd == ENV_GET_AUDIO_VIDEO_ENABLE:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_int))[0] = self.av_enable
+                return True
+            if cmd == ENV_GET_LANGUAGE:
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_uint))[0] = 0
+                return True
+            if cmd in (ENV_GET_CORE_OPTIONS_VERSION, ENV_GET_MESSAGE_INTERFACE_VERSION):
+                ctypes.cast(data, ctypes.POINTER(ctypes.c_uint))[0] = 0      # legacy variables API
+                return True
+        except Exception as e:                                               # pragma: no cover
+            log("environment error:", cmd, e)
+        return False
+
+    def _video(self, data, w, h, pitch):
+        if not data or data > (1 << 60):          # NULL = duplicate frame, -1 = hardware frame
+            return
+        try:
+            self.frame = (ctypes.string_at(data, pitch * h), w, h, pitch, self.pixfmt)
+            self.new_frame = True
+        except Exception as e:                                               # pragma: no cover
+            log("video error:", e)
+
+    def _audio_sample(self, left, right):
+        self.audio.append(struct.pack("<hh", left, right))
+
+    def _audio_batch(self, data, frames):
+        if data and frames:
+            self.audio.append(ctypes.string_at(data, frames * 4))
+        return frames
+
+    def _input_state(self, port, device, index, id_):
+        if port != 0:
+            return 0
+        pad, lx, ly, rx, ry = to_pad(self.mask, self.n64)
+        if device == DEV_JOYPAD:
+            if id_ == JOY_MASK_QUERY:
+                return ctypes.c_int16(pad).value
+            return 1 if (pad >> id_) & 1 and id_ < 16 else 0
+        if device == DEV_ANALOG:
+            if index == 0:
+                v = lx if id_ == 0 else ly
+                if id_ == 0 and self.ax:
+                    v = int(max(-1.0, min(1.0, self.ax)) * STICK_MAX)
+                elif id_ == 1 and self.ay:
+                    v = int(max(-1.0, min(1.0, self.ay)) * STICK_MAX)
+                return v
+            if index == 1:
+                return rx if id_ == 0 else ry
+        return 0
+
+    # ---- lifecycle
+    def load(self, rom_path: str, system_label: str):
+        info = RetroSystemInfo()
+        self.lib.retro_get_system_info(ctypes.byref(info))
+        game = RetroGameInfo()
+        game.path = os.fsencode(rom_path)
+        if info.need_fullpath:
+            game.data, game.size = None, 0
+        else:
+            with open(rom_path, "rb") as f:
+                self.rom_buf = f.read()
+            game.data = ctypes.cast(ctypes.c_char_p(self.rom_buf), ctypes.c_void_p)
+            game.size = len(self.rom_buf)
+        if not self.lib.retro_load_game(ctypes.byref(game)):
+            hint = ""
+            if self.hw_requested:
+                hint = (" The core asked for GPU rendering, which this host can't provide. "
+                        "Use the software renderer: N64_RDP=angrylion and N64_RSP=cxd4.")
+            raise RuntimeError("the core refused to load this game." + hint)
+        self.loaded = True
+        av = RetroSystemAvInfo()
+        self.lib.retro_get_system_av_info(ctypes.byref(av))
+        self.av = av
+        self.lib.retro_set_controller_port_device(0, DEV_JOYPAD)
+        stem = os.path.splitext(os.path.basename(rom_path))[0]
+        os.makedirs(self.savedir, exist_ok=True)
+        self.srm_path = os.path.join(os.fsdecode(self.savedir), stem + ".srm")
+        self._load_srm()
+
+    @property
+    def fps(self) -> float:
+        f = self.av.timing.fps if self.av else 60.0
+        return f if 20.0 < f < 130.0 else 60.0
+
+    @property
+    def sample_rate(self) -> int:
+        r = int(self.av.timing.sample_rate) if self.av else 44100
+        return r if 8000 <= r <= 96000 else 44100
+
+    def run_frame(self):
+        self.lib.retro_run()
+
+    def take_audio(self) -> bytes:
+        if not self.audio:
+            return b""
+        data, self.audio = b"".join(self.audio), []
+        return data
+
+    # ---- save RAM (battery saves)
+    def _srm_region(self):
+        size = self.lib.retro_get_memory_size(MEM_SAVE_RAM)
+        ptr = self.lib.retro_get_memory_data(MEM_SAVE_RAM)
+        return (ptr, size) if ptr and size else (None, 0)
+
+    def _load_srm(self):
+        ptr, size = self._srm_region()
+        if not ptr or not os.path.exists(self.srm_path):
+            return
+        try:
+            with open(self.srm_path, "rb") as f:
+                data = f.read(size)
+            ctypes.memmove(ptr, data, len(data))
+            self._srm_hash = hashlib.md5(data).digest()
+        except Exception as e:
+            log("could not load save file:", e)
+
+    def flush_srm(self, force: bool = False):
+        ptr, size = self._srm_region()
+        if not ptr:
+            return
+        data = ctypes.string_at(ptr, size)
+        h = hashlib.md5(data).digest()
+        if h == self._srm_hash and not force:
+            return
+        tmp = self.srm_path + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, self.srm_path)
+        self._srm_hash = h
+
+    # ---- save states
+    def save_state(self, path: str):
+        size = self.lib.retro_serialize_size()
+        if not size:
+            raise RuntimeError("this core can't make save states")
+        buf = ctypes.create_string_buffer(size)
+        if not self.lib.retro_serialize(buf, size):
+            raise RuntimeError("save state failed")
+        tmp = path + ".part"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(zlib.compress(buf.raw, 1))
+        os.replace(tmp, path)
+
+    def load_state(self, path: str):
+        with open(path, "rb") as f:
+            raw = zlib.decompress(f.read())
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        if not self.lib.retro_unserialize(buf, len(raw)):
+            raise RuntimeError("could not load that save state")
+
+
+# ----------------------------------------------------------------------------- the worker
+class Worker:
+    def __init__(self):
+        self.q = queue.Queue()
+        self.core = None
+        self.n64 = False
+        self.encoder = Encoder()
+        self.encoder.start()
+        self.live = False
+        self.audio_on = False
+        self.send_every = 1
+        self.seq = collections.deque()          # (mask, frames_left)
+        self.base_mask = 0
+        self.next_t = 0.0
+        self.frame_counter = 0
+        self.last_srm = time.monotonic()
+        self.stop = False
+
+    # ---- helpers
+    def effective_mask(self) -> int:
+        m = self.base_mask
+        if self.seq:
+            m |= self.seq[0][0]
+        return m
+
+    def step_seq(self):
+        if self.seq:
+            self.seq[0][1] -= 1
+            if self.seq[0][1] <= 0:
+                self.seq.popleft()
+
+    def run_once(self, render: bool):
+        c = self.core
+        c.mask = self.effective_mask()
+        c.new_frame = False
+        c.av_enable = 3 if render else 2          # behind schedule: ask the core to skip drawing this frame
+        c.run_frame()
+        c.av_enable = 3
+        self.step_seq()
+        if self.audio_on and self.live:
+            pcm = c.take_audio()
+            if pcm:
+                emit(b"A", b"\x00" + pcm)
+        else:
+            c.audio = []
+        if c.new_frame and c.frame is not None:
+            self.frame_counter += 1
+            if self.encoder.enabled and self.frame_counter % self.send_every == 0:
+                self.encoder.submit(c.frame)
+
+    def snapshot_png(self, scale: int) -> bytes:
+        c = self.core
+        if c.frame is None:
+            return _png_from_rgb_bytes(bytes(320 * 240 * 3), 320, 240)
+        return encode_frame(c.frame, "png", 0, 0, max(1, scale))
+
+    # ---- ops
+    def op_load(self, m):
+        n64 = "mupen64plus" in os.path.basename(m["core"]).lower() or m.get("system") == "n64"
+        self.n64 = n64
+        options = dict(N64_DEFAULT_OPTIONS) if n64 else {}
+        options.update(parse_option_overrides(os.environ.get("N64_CORE_OPTIONS", "")))
+        options.update(m.get("options") or {})
+        savedir = m.get("savedir") or "saves"
+        self.core = Core(m["core"], m.get("sysdir") or "system", savedir, options, n64)
+        self.core.load(m["rom"], "N64" if n64 else "")
+        t0 = time.perf_counter()
+        for _ in range(int(m.get("warmup", 6))):
+            self.core.run_frame()
+            self.core.audio = []
+            if self.core.frame is not None and time.perf_counter() - t0 > 20:
+                break
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100000, 50, 50)
+        c = self.core
+        w, h = (c.frame[1], c.frame[2]) if c.frame else (320, 240)
+        return {"ok": True, "png": self.snapshot_png(1), "audio_rate": c.sample_rate, "audio_ch": 2,
+                "fps": round(c.fps, 3), "w": w, "h": h, "core_hw_refused": c.hw_requested}
+
+    def op_steps(self, m):
+        steps = m.get("steps") or []
+        c = self.core
+        for mask, frames in steps:
+            c.mask = int(mask)
+            for _ in range(max(0, int(frames))):
+                c.run_frame()
+        c.mask = self.base_mask
+        for _ in range(int(m.get("settle", 4))):
+            c.run_frame()
+        c.audio = []
+        return {"ok": True}
+
+    def op_bench(self, m):
+        c = self.core
+        n = max(10, min(int(m.get("frames", 120)), 600))
+        c.mask = 0
+        t0 = time.perf_counter()
+        for _ in range(n):
+            c.run_frame()
+        dt = max(1e-6, time.perf_counter() - t0)
+        c.audio = []
+        return {"ok": True, "fps": n / dt, "frames": n, "sec": dt, "target": c.fps,
+                "rdp": (self.core.options.get("mupen64plus-rdp-plugin") if self.n64 else None),
+                "rsp": (self.core.options.get("mupen64plus-rsp-plugin") if self.n64 else None)}
+
+    def handle(self, m):
+        op = m.get("op")
+        if op == "load":
+            reply(self.op_load(m))
+            return
+        if self.core is None or not self.core.loaded:
+            reply({"ok": False, "err": "no game loaded"})
+            return
+        if op == "input":
+            self.base_mask = int(m.get("mask", 0))
+            self.core.ax = float(m.get("ax", 0.0) or 0.0)
+            self.core.ay = float(m.get("ay", 0.0) or 0.0)
+        elif op == "seq":
+            for mask, frames in m.get("steps") or []:
+                self.seq.append([int(mask), max(1, int(frames))])
+        elif op == "live":
+            on = bool(m.get("on"))
+            if on and not self.live:
+                self.next_t = time.perf_counter()
+            self.live = on
+            self.encoder.enabled = on
+            self.encoder.quality = max(30, min(int(m.get("quality", 72)), 95))
+            want = max(1, int(m.get("fps", 60)))
+            self.send_every = max(1, round(self.core.fps / want))
+            if not on:
+                self.core.audio = []
+        elif op == "audio":
+            self.audio_on = bool(m.get("on"))
+        elif op == "steps":
+            reply(self.op_steps(m))
+        elif op == "snap":
+            reply({"ok": True, "png": self.snapshot_png(int(m.get("scale", 2)))})
+        elif op == "save":
+            self.core.flush_srm(force=True)
+            try:
+                self.core.save_state(m["path"])
+            except Exception as e:                      # SRAM was still saved
+                log("state save skipped:", e)
+            reply({"ok": True})
+        elif op == "loadstate":
+            self.core.load_state(m["path"])
+            reply({"ok": True})
+        elif op == "bench":
+            reply(self.op_bench(m))
+        elif op == "quit":
+            self.stop = True
+        else:
+            reply({"ok": False, "err": f"unknown op {op}"})
+
+    # ---- main loop
+    def reader(self):
+        try:
+            while True:
+                head = _PROTO_IN.read(4)
+                if len(head) < 4:
+                    break
+                (n,) = struct.unpack("<I", head)
+                data = b""
+                while len(data) < n:
+                    part = _PROTO_IN.read(n - len(data))
+                    if not part:
+                        raise EOFError
+                    data += part
+                self.q.put(pickle.loads(data))
+        except Exception:
+            pass
+        self.q.put({"op": "quit"})
+
+    def safe_handle(self, m):
+        try:
+            self.handle(m)
+        except Exception as e:
+            log(traceback.format_exc())
+            if m.get("op") in ("load", "steps", "snap", "save", "loadstate", "bench"):
+                reply({"ok": False, "err": f"{type(e).__name__}: {e}"[:300]})
+
+    def main(self):
+        threading.Thread(target=self.reader, daemon=True).start()
+        while not self.stop:
+            if self.live and self.core and self.core.loaded:
+                try:
+                    m = self.q.get_nowait()
+                    self.safe_handle(m)
+                    continue
+                except queue.Empty:
+                    pass
+                now = time.perf_counter()
+                dt = 1.0 / self.core.fps
+                if now < self.next_t:
+                    time.sleep(max(0.0, min(self.next_t - now - 0.0005, 0.004)))
+                    continue
+                behind = now - self.next_t
+                try:
+                    # Behind by more than a frame: skip drawing so the game catches up to real time instead of
+                    # slowing down. Cores that ignore the hint just run as fast as they can.
+                    self.run_once(render=behind < dt)
+                except Exception as e:
+                    log("run error:", e)
+                    self.live = False
+                    continue
+                self.next_t += dt
+                if now - self.next_t > 0.25:                    # fell badly behind: resync instead of sprinting
+                    self.next_t = now
+                if self.core.shutdown:
+                    self.stop = True
+            else:
+                try:
+                    m = self.q.get(timeout=1.0)
+                except queue.Empty:
+                    m = None
+                if m:
+                    self.safe_handle(m)
+            if self.core and self.core.loaded and time.monotonic() - self.last_srm > 30:
+                self.last_srm = time.monotonic()
+                try:
+                    self.core.flush_srm()
+                except Exception as e:
+                    log("save flush failed:", e)
+        try:
+            if self.core and self.core.loaded:
+                self.core.flush_srm()
+        except Exception:
+            pass
+        os._exit(0)
+
+
+def bench_cli(core_path: str, rom_path: str):
+    n64 = "mupen64plus" in os.path.basename(core_path).lower()
+    opts = dict(N64_DEFAULT_OPTIONS) if n64 else {}
+    opts.update(parse_option_overrides(os.environ.get("N64_CORE_OPTIONS", "")))
+    core = Core(core_path, os.path.join(os.path.dirname(core_path), "system"),
+                os.path.join(os.path.dirname(core_path), "saves"), opts, n64)
+    core.load(rom_path, "")
+    for _ in range(30):
+        core.run_frame()
+    n = 180
+    t0 = time.perf_counter()
+    for _ in range(n):
+        core.run_frame()
+        core.audio = []
+    dt = time.perf_counter() - t0
+    print(f"{n / dt:.1f} fps achieved (game wants {core.fps:.1f}); "
+          f"rdp={opts.get('mupen64plus-rdp-plugin')} rsp={opts.get('mupen64plus-rsp-plugin')}; "
+          f"hw_render_requested={core.hw_requested}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--bench":
+        bench_cli(sys.argv[2], sys.argv[3])
+        sys.exit(0)
+    _setup_pipes()
+    Worker().main()
+'''
+
+
+def ensure_n64_worker() -> None:
+    """Write the built-in N64 worker next to the bot if it's missing or outdated. A copy you edited yourself
+    (one without the AUTO-WRITTEN line) is never overwritten."""
+    path = WORKER_PATH_N64
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                current = f.read()
+            if b"AUTO-WRITTEN BY THE BOT" not in current[:400] or current == N64_WORKER_SOURCE.encode("utf-8"):
+                return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
+            f.write(N64_WORKER_SOURCE.encode("utf-8"))
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"Could not write the N64 worker file: {e}")
 
 
 def ensure_core(system: str) -> str:
@@ -2387,6 +3348,97 @@ def sync_roms_to_disk() -> None:
             pass
 
 
+def rom_limit(system: str) -> int:
+    return int(EMU_SYSTEMS[system].get("max_mb", EMU_MAX_ROM_BYTES // 1048576)) * 1048576
+
+
+_N64_MAGIC = (b"\x80\x37\x12\x40", b"\x37\x80\x40\x12", b"\x40\x12\x37\x80")   # .z64 / .v64 / .n64 byte orders
+
+
+def check_rom_header(system: str, data: bytes):
+    if len(data) < 1024:
+        return "That file is too small to be a game."
+    if system == "nes" and data[:4] != b"NES\x1a":
+        return "That doesn't look like a valid .nes file (bad header)."
+    if system == "n64" and data[:4] not in _N64_MAGIC:
+        return "That doesn't look like a valid N64 ROM (.z64, .n64 or .v64)."
+    return None
+
+
+def rom_from_zip(blob: bytes):
+    """First supported ROM inside a zip -> (filename, bytes). Reads with a hard cap so a zip bomb can't fill memory."""
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        for info in z.infolist():
+            if info.is_dir() or info.flag_bits & 0x1:
+                continue
+            name = clean_rom_filename(info.filename)
+            system = system_for(name) if name else None
+            if not system:
+                continue
+            cap = rom_limit(system)
+            with z.open(info) as f:
+                data = f.read(cap + 1)
+            if len(data) > cap:
+                raise ValueError(f"The ROM inside the zip is bigger than the {cap // 1048576} MB limit.")
+            return name, data
+    raise ValueError("No supported ROM was found inside that zip.")
+
+
+async def download_rom_url(url: str, max_bytes: int):
+    """Download a public http(s) file with a size cap. Returns (filename_or_None, bytes)."""
+    session = await radio_http()
+    for _ in range(5):
+        if not await radio_url_is_public(url):
+            raise ValueError("That isn't a public web address.")
+        async with session.get(url, allow_redirects=False,
+                               timeout=aiohttp.ClientTimeout(total=240, sock_connect=10, sock_read=30)) as r:
+            if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                url = urljoin(url, r.headers["Location"])
+                continue
+            if r.status != 200:
+                raise ValueError(f"The server answered HTTP {r.status}.")
+            if int(r.headers.get("Content-Length") or 0) > max_bytes:
+                raise ValueError(f"That file is bigger than the {max_bytes // 1048576} MB limit.")
+            buf = bytearray()
+            async for chunk in r.content.iter_chunked(1 << 16):
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise ValueError(f"That file is bigger than the {max_bytes // 1048576} MB limit.")
+            disp = r.headers.get("Content-Disposition", "")
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', disp)
+            from urllib.parse import unquote
+            name = unquote(m.group(1)) if m else unquote(os.path.basename(urlparse(url).path))
+            return name or None, bytes(buf)
+    raise ValueError("Too many redirects.")
+
+
+async def ingest_rom(raw_name: str, data: bytes):
+    """Validate, unzip if needed, and store a ROM. Returns (ok, message)."""
+    name = clean_rom_filename(raw_name)
+    if name and name.endswith(".zip"):
+        try:
+            name, data = await asyncio.to_thread(rom_from_zip, data)
+        except Exception as e:
+            return False, f"\u274c {e}"
+    system = system_for(name) if name else None
+    if not system:
+        exts = ", ".join(sorted(e for spec in EMU_SYSTEMS.values() for e in spec["exts"]))
+        return False, f"\u274c Unsupported file. Supported: {exts} (or a .zip containing one)."
+    if len(data) > rom_limit(system):
+        return False, (f"\u274c That {EMU_SYSTEMS[system]['label']} ROM is {len(data) / 1048576:.1f} MB; "
+                       f"the limit is {rom_limit(system) // 1048576} MB.")
+    problem = check_rom_header(system, data)
+    if problem:
+        return False, f"\u274c {problem}"
+    rel = f"{system}/{name}"
+    replaced = rel in all_roms()
+    saved_remote = await asyncio.to_thread(add_rom_blocking, system, name, data)
+    note = "" if saved_remote else ("\n\u26a0\ufe0f Saved on the host only. The cloud backup failed (storage limit or "
+                                    "connection), so it may vanish if the host resets.")
+    return True, (f"\u2705 {'Replaced' if replaced else 'Added'} **{os.path.splitext(name)[0]}** "
+                  f"({EMU_SYSTEMS[system]['label']}, {len(data) / 1048576:.1f} MB). Play it with `/emu-play`.{note}")
+
+
 async def emu_rom_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
     out = []
@@ -2411,6 +3463,8 @@ class EmuClient:
     def __init__(self, ws, uid: int, name: str):
         self.ws, self.uid, self.name = ws, uid, name
         self.mask = 0
+        self.ax = 0.0           # analog stick (N64), -1..1
+        self.ay = 0.0
         self.latest = None
         self.texts = deque(maxlen=20)
         self.audio = deque(maxlen=30)
@@ -2511,8 +3565,13 @@ class EmuSession:
 
     async def spawn(self):
         env = dict(os.environ, MALLOC_ARENA_MAX="2", PYTHONUNBUFFERED="1")
+        worker = EMU_SYSTEMS[self.system].get("worker", WORKER_PATH)
+        if worker == WORKER_PATH_N64:
+            await asyncio.to_thread(ensure_n64_worker)
+        if not os.path.exists(worker):
+            raise RuntimeError(f"{os.path.basename(worker)} is missing. Put it in the same folder as the bot file.")
         self.proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-u", WORKER_PATH,
+            sys.executable, "-u", worker,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env=env,
         )
@@ -2636,7 +3695,8 @@ class EmuSession:
         self.clients.add(c)
         self.touch()
         c.offer_text({"t": "hello", "title": f"{self.label}: {self.title}", "paused": self.paused,
-                      "audio": bool(EMU_AUDIO and self.audio_rate), "rate": self.audio_rate, "ch": self.audio_ch})
+                      "audio": bool(EMU_AUDIO and self.audio_rate), "rate": self.audio_rate, "ch": self.audio_ch,
+                      "sys": self.system})
         if self.last_jpeg:
             c.offer_frame(self.last_jpeg)
         self._broadcast(self._players_msg())
@@ -2651,12 +3711,20 @@ class EmuSession:
             self._set_live(False)
 
     def recalc_input(self):
-        m = 0
+        m, ax, ay = 0, 0.0, 0.0
         for c in self.clients:
             m |= c.mask
-        if m != self._sent_mask:
-            self._sent_mask = m
-            self.send({"op": "input", "mask": m})
+            if abs(c.ax) > abs(ax):
+                ax = c.ax
+            if abs(c.ay) > abs(ay):
+                ay = c.ay
+        key = (m, round(ax, 2), round(ay, 2))
+        if key != self._sent_mask:
+            self._sent_mask = key
+            msg = {"op": "input", "mask": m}
+            if ax or ay:
+                msg["ax"], msg["ay"] = ax, ay
+            self.send(msg)
             self.touch()
             self.schedule_refresh(0.6)
 
@@ -2779,7 +3847,10 @@ atexit.register(_kill_all_emulators)
 async def emu_startup():
     for d in (ROM_DIR, CORE_DIR, STATE_DIR):
         os.makedirs(d, exist_ok=True)
-    for system in EMU_SYSTEMS:
+    await asyncio.to_thread(ensure_n64_worker)
+    for system, spec in EMU_SYSTEMS.items():
+        if spec.get("lazy_core"):
+            continue
         try:
             await asyncio.to_thread(ensure_core, system)
         except Exception:
@@ -2851,11 +3922,163 @@ async def emu_chat_input(message: discord.Message) -> bool:
 
 
 EMU_PAGE_HTML = r'''<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>LUX-NET Arcade</title></head>
-<body><h1>LUX-NET Arcade</h1></body>
-</html>
-'''
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>LUX-NET Arcade</title>
+<style>
+:root{color-scheme:dark}
+html,body{margin:0;height:100%;background:#0b0c10;color:#e8e8ee;font:14px system-ui,sans-serif;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+#app{display:flex;flex-direction:column;height:100%}
+#bar{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#14161d;font-size:13px;flex-wrap:wrap}
+#title{font-weight:600;flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#bar button{background:#2a2d3a;color:inherit;border:0;border-radius:6px;padding:5px 9px;cursor:pointer;font:inherit}
+#bar button.on{background:#5865f2}
+#stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;position:relative}
+canvas{max-width:100%;max-height:100%;image-rendering:pixelated;background:#000;outline:none}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;background:rgba(0,0,0,.6);font-size:16px}
+.pad{display:none;justify-content:space-between;align-items:center;padding:8px 14px calc(8px + env(safe-area-inset-bottom));gap:10px}
+@media (pointer:coarse){body.classic #pad-classic{display:flex}body.n64 #pad-n64{display:flex}}
+.grp{display:grid;gap:6px}
+.k{background:#2a2d3a;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;touch-action:none;min-width:44px;min-height:44px}
+.k.p{background:#5865f2}.k.g{background:#2f8f4e}.k.r{background:#b3403a}.k.y{background:#b8962e;color:#111}
+#dpad{grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,52px)}
+#face{grid-template-columns:repeat(3,52px);grid-template-rows:repeat(2,52px)}
+#mid{display:flex;gap:8px}#mid .k{padding:10px 14px;font-size:12px;border-radius:16px}
+#stick{width:120px;height:120px;border-radius:50%;background:#1d2030;border:2px solid #343850;position:relative;touch-action:none}
+#knob{position:absolute;width:52px;height:52px;border-radius:50%;background:#5865f2;left:34px;top:34px;pointer-events:none}
+#n64r{display:grid;grid-template-columns:repeat(3,44px);grid-template-rows:repeat(3,44px);gap:5px}
+#n64mid{display:flex;flex-direction:column;gap:8px;align-items:center}
+#n64btn{display:grid;grid-template-columns:repeat(2,56px);gap:8px}
+</style></head><body class="classic"><div id="app">
+<div id="bar"><span id="title">Connecting...</span><span id="players"></span><span id="fps"></span>
+<button id="snd">Sound off</button><button id="fs">Fullscreen</button></div>
+<div id="stage"><canvas id="cv" width="320" height="240" tabindex="0"></canvas><div id="msg">Connecting...</div></div>
+<div class="pad" id="pad-classic"><div class="grp" id="dpad">
+<div></div><div class="k" data-b="up">&#9650;</div><div></div>
+<div class="k" data-b="left">&#9664;</div><div></div><div class="k" data-b="right">&#9654;</div>
+<div></div><div class="k" data-b="down">&#9660;</div><div></div></div>
+<div id="mid"><div class="k" data-b="select">SELECT</div><div class="k" data-b="start">START</div></div>
+<div class="grp" id="face"><div class="k" data-b="x">X</div><div class="k" data-b="y">Y</div><div></div>
+<div class="k p" data-b="b">B</div><div class="k p" data-b="a">A</div><div></div></div></div>
+<div class="pad" id="pad-n64"><div id="stick"><div id="knob"></div></div>
+<div id="n64mid"><div class="k" data-b="z">Z</div><div class="k" data-b="start">START</div><div style="display:flex;gap:8px"><div class="k" data-b="l">L</div><div class="k" data-b="r">R</div></div></div>
+<div id="n64r"><div></div><div class="k y" data-b="cu">C&#9650;</div><div></div>
+<div class="k y" data-b="cl">C&#9664;</div><div></div><div class="k y" data-b="cr">C&#9654;</div>
+<div></div><div class="k y" data-b="cd">C&#9660;</div><div></div></div>
+<div id="n64btn"><div class="k r" data-b="b">B</div><div class="k g" data-b="a">A</div></div></div>
+</div>
+<script>
+const MASKS=__MASKS__;
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),msg=document.getElementById('msg');
+const $=id=>document.getElementById(id);
+const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+location.pathname.replace(/\/$/,'')+'/ws';
+let ws=null,ended=false,rate=0,ch=2,actx=null,nextT=0,soundOn=false,audioOk=false,sys='';
+let pending=null,busy=false,frames=0,held={},mask=0,ax=0,ay=0,sentKey='',dirty=true;
+function show(t){msg.textContent=t;msg.style.display=t?'flex':'none'}
+function connect(){
+  ws=new WebSocket(wsUrl);ws.binaryType='arraybuffer';
+  ws.onopen=()=>{show('');sentKey='';dirty=true;if(soundOn)ws.send(JSON.stringify({t:'audio',on:true}))};
+  ws.onclose=()=>{if(!ended){show('Disconnected. Reconnecting...');setTimeout(connect,1500)}};
+  ws.onmessage=e=>{
+    if(typeof e.data==='string'){text(JSON.parse(e.data));return}
+    const u=new Uint8Array(e.data);
+    if(u[0]===74){pending=u.subarray(1);if(!busy)decode()}
+    else if(u[0]===65&&soundOn)pcm(u.subarray(2));
+  };
+}
+function text(o){
+  if(o.t==='hello'){$('title').textContent=o.title;rate=o.rate||0;ch=o.ch||2;audioOk=!!(o.audio&&rate);
+    $('snd').style.display=audioOk?'':'none';sys=o.sys||'';
+    document.body.className=sys==='n64'?'n64':'classic'}
+  else if(o.t==='players'){$('players').textContent=o.n+(o.n===1?' player':' players')+(o.names&&o.names.length?': '+o.names.join(', '):'')}
+  else if(o.t==='end'){ended=true;show('Game ended ('+(o.why||'closed')+'). You can close this tab.')}
+}
+async function decode(){
+  busy=true;
+  while(pending){
+    const b=pending;pending=null;
+    try{const bm=await createImageBitmap(new Blob([b]));
+      if(cv.width!==bm.width||cv.height!==bm.height){cv.width=bm.width;cv.height=bm.height}
+      ctx.drawImage(bm,0,0);bm.close();frames++}catch(_){}
+  }
+  busy=false;
+}
+setInterval(()=>{$('fps').textContent=frames+' fps';frames=0},1000);
+function pcm(u){
+  if(!actx||!rate)return;
+  const n=u.byteLength-(u.byteLength%(2*ch));if(n<=0)return;
+  const i16=new Int16Array(u.buffer.slice(u.byteOffset,u.byteOffset+n));
+  const fr=i16.length/ch,buf=actx.createBuffer(ch,fr,rate);
+  for(let c=0;c<ch;c++){const d=buf.getChannelData(c);for(let i=0;i<fr;i++)d[i]=i16[i*ch+c]/32768}
+  const s=actx.createBufferSource();s.buffer=buf;s.connect(actx.destination);
+  const now=actx.currentTime;if(nextT<now+0.03||nextT>now+0.4)nextT=now+0.06;
+  s.start(nextT);nextT+=buf.duration;
+}
+$('snd').onclick=()=>{
+  soundOn=!soundOn;$('snd').textContent=soundOn?'Sound on':'Sound off';$('snd').classList.toggle('on',soundOn);
+  if(soundOn){actx=actx||new (window.AudioContext||window.webkitAudioContext)();actx.resume();nextT=0}
+  if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'audio',on:soundOn}));
+};
+$('fs').onclick=()=>{const el=document.documentElement;(document.fullscreenElement?document.exitFullscreen():el.requestFullscreen&&el.requestFullscreen())};
+// ---- input: everything funnels into held{} (buttons) and ax/ay (analog stick); one send per animation frame, only on change
+function flush(){
+  if(!dirty)return;dirty=false;
+  let m=0;for(const k in held)if(held[k])m|=MASKS[k]||0;
+  const rx=Math.round(ax*100)/100,ry=Math.round(ay*100)/100,key=m+'|'+rx+'|'+ry;
+  if(key!==sentKey&&ws&&ws.readyState===1){sentKey=key;mask=m;ws.send(JSON.stringify({t:'in',m:m,ax:rx,ay:ry}))}
+}
+function setBtn(n,d){if(!!held[n]!==d){held[n]=d;dirty=true}}
+function setStick(x,y){x=Math.max(-1,Math.min(1,x));y=Math.max(-1,Math.min(1,y));if(x!==ax||y!==ay){ax=x;ay=y;dirty=true}}
+const KEYS_CLASSIC={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',w:'up',s:'down',a:'left',d:'right',
+  j:'b',z:'b',k:'a',x:'a',u:'y',i:'x',q:'l',e:'r',Enter:'start',' ':'start',Shift:'select',Backspace:'select'};
+// N64: WASD = analog stick, arrows = C buttons, K = A, J = B, Space/Z = Z trigger
+const KEYS_N64={w:'su',s:'sd',a:'sl',d:'sr',ArrowUp:'cu',ArrowDown:'cd',ArrowLeft:'cl',ArrowRight:'cr',
+  k:'a',j:'b',' ':'z',z:'z',q:'l',e:'r',Enter:'start',t:'up',g:'down',f:'left',h:'right'};
+function keyName(e){const m=sys==='n64'?KEYS_N64:KEYS_CLASSIC;return m[e.key]||m[(e.key||'').toLowerCase()]}
+addEventListener('keydown',e=>{const n=keyName(e);if(n){e.preventDefault();setBtn(n,true)}});
+addEventListener('keyup',e=>{const n=keyName(e);if(n){e.preventDefault();setBtn(n,false)}});
+addEventListener('blur',()=>{held={};setStick(0,0);dirty=true});
+document.querySelectorAll('.k[data-b]').forEach(el=>{
+  const n=el.dataset.b;
+  el.addEventListener('pointerdown',e=>{e.preventDefault();el.setPointerCapture(e.pointerId);setBtn(n,true)});
+  const up=e=>{e.preventDefault();setBtn(n,false)};
+  el.addEventListener('pointerup',up);el.addEventListener('pointercancel',up);
+});
+// touch analog stick
+const stick=$('stick'),knob=$('knob');let stickId=null;
+function moveStick(e){const r=stick.getBoundingClientRect(),R=r.width/2;
+  let dx=(e.clientX-(r.left+R))/R,dy=(e.clientY-(r.top+R))/R;const len=Math.hypot(dx,dy);if(len>1){dx/=len;dy/=len}
+  knob.style.left=(34+dx*34)+'px';knob.style.top=(34+dy*34)+'px';setStick(dx,dy)}
+stick.addEventListener('pointerdown',e=>{e.preventDefault();stickId=e.pointerId;stick.setPointerCapture(e.pointerId);moveStick(e)});
+stick.addEventListener('pointermove',e=>{if(e.pointerId===stickId)moveStick(e)});
+const endStick=e=>{if(e.pointerId===stickId){stickId=null;knob.style.left='34px';knob.style.top='34px';setStick(0,0)}};
+stick.addEventListener('pointerup',endStick);stick.addEventListener('pointercancel',endStick);
+// gamepad (standard mapping)
+const GP_CLASSIC={0:'b',1:'a',2:'y',3:'x',4:'l',5:'r',8:'select',9:'start',12:'up',13:'down',14:'left',15:'right'};
+const GP_N64={0:'a',2:'b',1:'cr',3:'cu',4:'l',5:'r',6:'z',7:'z',9:'start',12:'up',13:'down',14:'left',15:'right'};
+const gpHeld={};let gpActive=false;
+function dz(v){const a=Math.abs(v);return a<0.15?0:Math.sign(v)*(a-0.15)/0.85}
+function pollPad(){
+  const p=(navigator.getGamepads?navigator.getGamepads():[])[0];
+  if(!p&&gpActive){gpActive=false;for(const n in gpHeld){if(gpHeld[n]){gpHeld[n]=false;setBtn(n,false)}}setStick(0,0)}
+  if(p){
+    gpActive=true;
+    const map=sys==='n64'?GP_N64:GP_CLASSIC,cur={};
+    for(const i in map)if(p.buttons[i]&&p.buttons[i].pressed)cur[map[i]]=true;
+    const lx=p.axes[0]||0,ly=p.axes[1]||0,rx=p.axes[2]||0,ry=p.axes[3]||0;
+    if(sys==='n64'){
+      setStick(dz(lx),dz(ly));
+      if(rx<-.5)cur.cl=true;if(rx>.5)cur.cr=true;if(ry<-.5)cur.cu=true;if(ry>.5)cur.cd=true;
+    }else{if(lx<-.5)cur.left=true;if(lx>.5)cur.right=true;if(ly<-.5)cur.up=true;if(ly>.5)cur.down=true}
+    for(const n of new Set([...Object.keys(gpHeld),...Object.keys(cur)])){
+      const d=!!cur[n];if(!!gpHeld[n]!==d){gpHeld[n]=d;setBtn(n,d)}
+    }
+  }
+  flush();requestAnimationFrame(pollPad);
+}
+pollPad();connect();cv.focus();
+</script></body></html>
+'''.replace("__MASKS__", json.dumps(EMU_MASKS))
 
 
 async def web_home(request):
@@ -2870,11 +4093,49 @@ async def web_emu_page(request):
 
 async def web_emu_ws(request):
     info = emu_web_tokens.get(request.match_info["token"])
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=4096)
     await ws.prepare(request)
     if not info:
         await ws.close()
         return ws
+    sess, uid, name = info
+    if sess.closed or len(sess.clients) >= EMU_MAX_VIEWERS:
+        await ws.send_str(json.dumps({"t": "end", "why": "game ended" if sess.closed else "too many players"}))
+        await ws.close()
+        return ws
+    client = EmuClient(ws, uid, name)
+    sess.add_client(client)
+    sender = asyncio.ensure_future(client.sender())
+    try:
+        async for msg in ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            try:
+                data = json.loads(msg.data)
+            except ValueError:
+                continue
+            kind = data.get("t")
+            if kind == "in":
+                try:
+                    mask = int(data.get("m", 0)) & 0x1FFFFF
+                    ax = max(-1.0, min(1.0, float(data.get("ax", 0) or 0)))
+                    ay = max(-1.0, min(1.0, float(data.get("ay", 0) or 0)))
+                except (TypeError, ValueError):
+                    continue
+                if (mask, ax, ay) != (client.mask, client.ax, client.ay):
+                    client.mask, client.ax, client.ay = mask, ax, ay
+                    if mask or ax or ay:
+                        sess.inputs += 1
+                    sess.recalc_input()
+            elif kind == "audio":
+                client.want_audio = bool(data.get("on")) and EMU_AUDIO
+                sess.update_audio()
+    finally:
+        client.closing = True
+        client.evt.set()
+        sender.cancel()
+        client.mask, client.ax, client.ay = 0, 0.0, 0.0
+        sess.remove_client(client)
     return ws
 
 
@@ -2894,12 +4155,20 @@ class EmuView(discord.ui.View):
         snes = sess.system == "snes"
         S, P, G, D = (discord.ButtonStyle.secondary, discord.ButtonStyle.primary,
                       discord.ButtonStyle.success, discord.ButtonStyle.danger)
-        layout = [
-            [("l", "L", S, not snes), ("up", "⬆", S, False), ("r", "R", S, not snes), ("select", "Select", S, False), ("start", "Start", G, False)],
-            [("left", "⬅", S, False), ("down", "⬇", S, False), ("right", "➡", S, False), ("x", "X", P, not snes), ("y", "Y", P, not snes)],
-            [("b", "B", D, False), ("a", "A", G, False), ("ab", "A+B", P, False), ("hold", "", S, False), ("clip", "\U0001F39E Clip", S, False)],
-            [("live", "Play live", P, False), ("save", "Save", S, False), ("load", "Load", S, False), ("quit", "Quit", D, False)],
-        ]
+        if sess.system == "n64":
+            layout = [
+                [("l", "L", S, False), ("su", "⬆", S, False), ("r", "R", S, False), ("cu", "C⬆", P, False), ("z", "Z", D, False)],
+                [("sl", "⬅", S, False), ("hold", "", S, False), ("sr", "➡", S, False), ("cl", "C⬅", P, False), ("cr", "C➡", P, False)],
+                [("b", "B", D, False), ("sd", "⬇", S, False), ("a", "A", G, False), ("cd", "C⬇", P, False), ("start", "Start", G, False)],
+                [("live", "Play live", P, False), ("save", "Save", S, False), ("load", "Load", S, False), ("quit", "Quit", D, False)],
+            ]
+        else:
+            layout = [
+                [("l", "L", S, not snes), ("up", "⬆", S, False), ("r", "R", S, not snes), ("select", "Select", S, False), ("start", "Start", G, False)],
+                [("left", "⬅", S, False), ("down", "⬇", S, False), ("right", "➡", S, False), ("x", "X", P, not snes), ("y", "Y", P, not snes)],
+                [("b", "B", D, False), ("a", "A", G, False), ("ab", "A+B", P, False), ("hold", "", S, False), ("clip", "\U0001F39E Clip", S, False)],
+                [("live", "Play live", P, False), ("save", "Save", S, False), ("load", "Load", S, False), ("quit", "Quit", D, False)],
+            ]
         self.hold_btn = None
         for row, items in enumerate(layout):
             for action, label, style, disabled in items:
@@ -2936,13 +4205,40 @@ class EmuView(discord.ui.View):
             self._relabel_hold()
             await interaction.response.edit_message(view=self)
         elif action == "live":
-            await interaction.response.send_message("Live player link generated.", ephemeral=True)
+            if not EMU_WEB_BASE:
+                await interaction.response.send_message(
+                    "\u274c Live play needs the bot's public web address. Set PUBLIC_URL (or RENDER_EXTERNAL_URL) "
+                    "to your bot's https:// URL and restart.", ephemeral=True)
+                return
+            token = sess.token_for(interaction.user)
+            keys = ("WASD = stick, arrows = C buttons, K = A, J = B, Space = Z, Q/E = L/R, Enter = Start"
+                    if sess.system == "n64" else
+                    "arrows or WASD, J/Z = B, K/X = A, U = Y, I = X, Q/E = L/R, Enter = Start, Shift = Select")
+            await interaction.response.send_message(
+                f"\U0001F3AE **Play live ({EMU_STREAM_FPS} fps):** {EMU_WEB_BASE}/emu/{token}\n"
+                f"Keys: {keys}. Controllers and touch controls work too. The link is personal to you and stops "
+                "working when the game ends.", ephemeral=True)
+        elif action in ("save", "load") and sess.system == "n64":
+            await interaction.response.defer(ephemeral=True)
+            if action == "save":
+                res = await sess.call(op="save", path=sess.state_path)
+                text = "\U0001F4BE Game saved." if res.get("ok") else f"\u274c Couldn't save: {res.get('err')}"
+            elif os.path.exists(sess.state_path):
+                res = await sess.call(op="loadstate", path=sess.state_path)
+                if res.get("ok"):
+                    sess.schedule_refresh()
+                text = "\U0001F4C2 Save loaded." if res.get("ok") else f"\u274c Couldn't load: {res.get('err')}"
+            else:
+                text = "\u26a0\ufe0f There's no save for this game yet. Press Save first."
+            await interaction.followup.send(text, ephemeral=True)
         elif action == "quit":
             await interaction.response.defer()
             await emu_close(sess, "stopped")
+        else:
+            await interaction.response.send_message("\u26a0\ufe0f That button isn't available for this game.", ephemeral=True)
 
 
-@bot.tree.command(name="emu-play", description="Play a NES/SNES game.")
+@bot.tree.command(name="emu-play", description="Play a NES, SNES or N64 game.")
 @app_commands.describe(game="Pick a game", resume="Continue previous")
 @app_commands.autocomplete(game=emu_rom_autocomplete)
 async def emu_play(interaction: discord.Interaction, game: str, resume: bool = True):
@@ -2956,6 +4252,15 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
     if interaction.channel.id in emu_sessions:
         await interaction.response.send_message("⚠️ Game already running.", ephemeral=True)
         return
+    if len(emu_sessions) >= MAX_EMU_SESSIONS:
+        await interaction.response.send_message(
+            f"⚠️ {MAX_EMU_SESSIONS} games are already running. Try again when one finishes.", ephemeral=True)
+        return
+    if ref[0] == "n64" and sum(1 for x in emu_sessions.values() if x.system == "n64") >= EMU_MAX_N64:
+        await interaction.response.send_message(
+            "⚠️ An N64 game is already running. N64 is heavy, so only one runs at a time. Stop it with `/emu-stop` first.",
+            ephemeral=True)
+        return
 
     await interaction.response.defer(ephemeral=True)
     sess = EmuSession(interaction.channel.id, game, interaction.user.id)
@@ -2964,17 +4269,25 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         rom_path = await asyncio.to_thread(ensure_rom_local, game)
         core_path = await asyncio.to_thread(ensure_core, sess.system)
         await sess.spawn()
-        res = await sess.call(op="load", core=core_path, rom=rom_path,
-                              sysdir=os.path.join(EMU_BASE, "system"), savedir=os.path.join(STATE_DIR, "sram"))
+        load_args = dict(core=core_path, rom=rom_path, sysdir=os.path.join(EMU_BASE, "system"),
+                         savedir=os.path.join(STATE_DIR, "sram"))
+        if sess.system == "n64":
+            load_args["system"] = "n64"
+        res = await sess.call(op="load", **load_args)
         if not res.get("ok"):
             raise RuntimeError(res.get("err"))
+        sess.audio_rate = int(res.get("audio_rate") or res.get("rate") or 0)
+        sess.audio_ch = int(res.get("audio_ch") or 2)
+        if sess.system == "n64" and resume and os.path.exists(sess.auto_path):
+            await sess.call(op="loadstate", path=sess.auto_path)
         sess.view = EmuView(sess)
         sess.seq += 1
         fname = f"f{sess.seq}.png"
         msg = await interaction.channel.send(embed=sess.make_embed(fname),
                                              file=discord.File(io.BytesIO(res.get("png", b"")), filename=fname), view=sess.view)
         sess.message_id = msg.id
-        await interaction.followup.send("✅ Game started!", ephemeral=True)
+        tip = " N64 is best played with **Play live** on the message." if sess.system == "n64" else ""
+        await interaction.followup.send("✅ Game started!" + tip, ephemeral=True)
     except Exception as e:
         emu_sessions.pop(sess.channel_id, None)
         await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
@@ -2983,8 +4296,133 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
 @bot.tree.command(name="emu-games", description="List games.")
 async def emu_games(interaction: discord.Interaction):
     roms = all_roms()
-    embed = discord.Embed(title=f"Library ({len(roms)})")
+    groups: dict = {}
+    for rel in roms:
+        system, fname = rel.split("/", 1)
+        groups.setdefault(system, []).append(os.path.splitext(fname)[0])
+    embed = discord.Embed(title=f"Library ({len(roms)})", color=discord.Color.blurple())
+    for system, names in groups.items():
+        text = "\n".join(names)
+        if len(text) > 1000:
+            text = text[:990].rsplit("\n", 1)[0] + f"\n... and more ({len(names)} total)"
+        embed.add_field(name=f"{EMU_SYSTEMS[system]['label']} ({len(names)})", value=text, inline=False)
+    if not roms:
+        embed.description = "No games yet. Add one with `/emu-add` or `/emu-add-url`."
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def _can_add_roms(interaction: discord.Interaction) -> bool:
+    if EMU_ADD_OPEN or await check_is_owner(interaction):
+        return True
+    await interaction.response.send_message("\u274c Only the bot owner can add games.", ephemeral=True)
+    return False
+
+
+@bot.tree.command(name="emu-add", description="Upload a game file (NES, SNES or N64; zips work too).")
+@app_commands.describe(rom="The game file: .nes, .sfc/.smc, .z64/.n64/.v64, or a .zip containing one")
+async def emu_add(interaction: discord.Interaction, rom: discord.Attachment):
+    if not await _can_add_roms(interaction):
+        return
+    biggest = max(rom_limit(k) for k in EMU_SYSTEMS)
+    if rom.size > biggest + (1 << 20):
+        await interaction.response.send_message(
+            f"\u274c That file is {rom.size / 1048576:.1f} MB, over the {biggest // 1048576} MB limit.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        data = await rom.read()
+    except Exception as e:
+        await interaction.followup.send(f"\u274c Couldn't download that file: {e}", ephemeral=True)
+        return
+    _ok, text = await ingest_rom(rom.filename, data)
+    await interaction.followup.send(text, ephemeral=True)
+
+
+@bot.tree.command(name="emu-add-url", description="Add a game from a direct download link (good for big N64 files).")
+@app_commands.describe(url="A direct https:// link to the game file (.z64, .nes, .sfc, or a .zip)")
+async def emu_add_url(interaction: discord.Interaction, url: str):
+    if not await _can_add_roms(interaction):
+        return
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.I):
+        await interaction.response.send_message("\u274c That needs to start with http:// or https://", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        name, data = await download_rom_url(url, max(rom_limit(k) for k in EMU_SYSTEMS) + (1 << 20))
+    except Exception as e:
+        await interaction.followup.send(f"\u274c Download failed: {e}", ephemeral=True)
+        return
+    _ok, text = await ingest_rom(name or "", data)
+    await interaction.followup.send(text, ephemeral=True)
+
+
+@bot.tree.command(name="emu-remove", description="Remove a game from the library (owner only).")
+@app_commands.describe(game="Game to remove")
+@app_commands.autocomplete(game=emu_rom_autocomplete)
+async def emu_remove(interaction: discord.Interaction, game: str):
+    if not await check_is_owner(interaction):
+        await interaction.response.send_message("\u274c Only the bot owner can remove games.", ephemeral=True)
+        return
+    if not valid_rom_ref(game) or game not in all_roms():
+        await interaction.response.send_message("\u274c Pick a game from the list.", ephemeral=True)
+        return
+    if any(x.rel == game for x in emu_sessions.values()):
+        await interaction.response.send_message("\u26a0\ufe0f That game is running right now. Stop it first.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await asyncio.to_thread(remove_rom_blocking, game)
+    await interaction.followup.send(f"\U0001F5D1\uFE0F Removed **{os.path.splitext(game.split('/', 1)[1])[0]}**.", ephemeral=True)
+
+
+@bot.tree.command(name="emu-bench", description="Owner: measure how fast a game really runs on this host.")
+@app_commands.describe(game="Game to test (an N64 game shows whether 60 fps is realistic)")
+@app_commands.autocomplete(game=emu_rom_autocomplete)
+async def emu_bench(interaction: discord.Interaction, game: str):
+    if not await check_is_owner(interaction):
+        await interaction.response.send_message("\u274c Owner only.", ephemeral=True)
+        return
+    ref = valid_rom_ref(game)
+    if not ref or game not in all_roms():
+        await interaction.response.send_message("\u274c Pick a game from the list.", ephemeral=True)
+        return
+    if sum(1 for x in emu_sessions.values() if x.system == ref[0]) >= (EMU_MAX_N64 if ref[0] == "n64" else MAX_EMU_SESSIONS):
+        await interaction.response.send_message("\u26a0\ufe0f Stop the running game first so the test is accurate.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    sess = EmuSession(-interaction.user.id, game, interaction.user.id)       # private, never shown in a channel
+    try:
+        rom_path = await asyncio.to_thread(ensure_rom_local, game)
+        core_path = await asyncio.to_thread(ensure_core, sess.system)
+        await sess.spawn()
+        load_args = dict(core=core_path, rom=rom_path, sysdir=os.path.join(EMU_BASE, "system"),
+                         savedir=os.path.join(STATE_DIR, "sram"))
+        if sess.system == "n64":
+            load_args["system"] = "n64"
+        res = await asyncio.wait_for(sess.call(op="load", **load_args), 240)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("err"))
+        res = await asyncio.wait_for(sess.call(op="bench", frames=120), 300)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("err"))
+        fps, target = float(res["fps"]), float(res.get("target") or 60)
+        pct = fps / target * 100
+        if pct >= 98:
+            verdict = f"\u2705 Full speed ({target:.0f} fps) with room to spare."
+        elif pct >= 60:
+            verdict = ("\U0001F7E1 Playable but below full speed. The live player keeps the game at the right speed by "
+                       "skipping drawn frames, so expect fewer than 60 visible frames per second.")
+        else:
+            verdict = ("\U0001F534 Too slow for comfortable play on this host. A machine with more and faster CPU cores, "
+                       "or a GPU, is needed for 60 fps.")
+        extra = f"\nRenderer: `{res['rdp']}` / RSP: `{res['rsp']}`" if res.get("rdp") else ""
+        await interaction.followup.send(
+            f"**{ref[1]}** ran at **{fps:.1f} fps** (the game wants {target:.1f}, {pct:.0f}%).{extra}\n{verdict}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"\u274c Benchmark failed: {e}", ephemeral=True)
+    finally:
+        sess.closed = True
+        sess.kill()
 
 
 @bot.tree.command(name="emu-stop", description="Stop the game.")
