@@ -2356,17 +2356,35 @@ EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))
 EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
 # N64 settings, fastest first. If the emulator crashes on one (some hosts forbid the JIT it uses), the bot moves
 # to the next automatically and remembers which one worked. Pin one with N64_PROFILE=0, 1 or 2.
+# Speed settings for the software renderer (angrylion). The renderer is the heaviest part of N64 emulation on a
+# host without a GPU, so every option here trades a little picture quality for speed:
+#   * multithreading: angrylion can split a frame across CPU cores (N64_THREADS=all, or a number such as 4)
+#   * VI overlay "Unfiltered": skips the video-interface filtering pass (slightly rougher edges, noticeably faster)
+#   * sync "Low": the cheapest synchronisation level
+# Set N64_QUALITY=1 to keep the filtered picture. Core options a core doesn't know are simply ignored.
+N64_THREADS = os.environ.get("N64_THREADS", "all").strip().lower()
+N64_QUALITY = os.environ.get("N64_QUALITY", "0") == "1"
+_mt_next = "all threads" if N64_THREADS in ("all", "") else (N64_THREADS if N64_THREADS.isdigit() else "all threads")
+_mt_par = "disabled" if N64_THREADS == "1" else "enabled"
+_vi_overlay = "Filtered" if N64_QUALITY else "Unfiltered"
+_PARALLEL_SPEED = {"parallel-n64-angrylion-multithread": _mt_par, "parallel-n64-angrylion-vioverlay": _vi_overlay,
+                   "parallel-n64-angrylion-sync": "Low", "parallel-n64-framerate": "fullspeed",
+                   "parallel-n64-screensize": "320x240", "parallel-n64-cpucore": "dynamic_recompiler"}
+_NEXT_SPEED = {"mupen64plus-angrylion-multithread": _mt_next, "mupen64plus-angrylion-vioverlay": _vi_overlay,
+               "mupen64plus-angrylion-sync": "Low", "mupen64plus-43screensize": "320x240"}
+# N64 settings, fastest first. If the emulator crashes on one (some hosts forbid the JIT it uses), the bot moves
+# to the next automatically and remembers which one worked. Pin one with N64_PROFILE=0, 1, 2 or 3.
 N64_PROFILES = [
     # (label, libretro core, core settings). ParaLLEl N64 is listed first: its software renderer is documented to need
     # no GPU. Mupen64Plus-Next is kept as a fallback (on hosts without a GPU it can crash while starting).
     ("ParaLLEl N64: angrylion + parallel RSP", "parallel_n64_libretro",
-     {"parallel-n64-gfxplugin": "angrylion", "parallel-n64-rspplugin": "parallel"}),
+     {**_PARALLEL_SPEED, "parallel-n64-gfxplugin": "angrylion", "parallel-n64-rspplugin": "parallel"}),
     ("ParaLLEl N64: angrylion + cxd4 RSP", "parallel_n64_libretro",
-     {"parallel-n64-gfxplugin": "angrylion", "parallel-n64-rspplugin": "cxd4"}),
+     {**_PARALLEL_SPEED, "parallel-n64-gfxplugin": "angrylion", "parallel-n64-rspplugin": "cxd4"}),
     ("Mupen64Plus-Next: angrylion + parallel RSP", "mupen64plus_next_libretro",
-     {"mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "parallel", "mupen64plus-cpucore": "dynamic_recompiler"}),
+     {**_NEXT_SPEED, "mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "parallel", "mupen64plus-cpucore": "dynamic_recompiler"}),
     ("Mupen64Plus-Next: angrylion + cxd4 RSP + interpreter", "mupen64plus_next_libretro",
-     {"mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "cxd4", "mupen64plus-cpucore": "cached_interpreter"}),
+     {**_NEXT_SPEED, "mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "cxd4", "mupen64plus-cpucore": "cached_interpreter"}),
 ]
 _n64_pin = os.environ.get("N64_PROFILE", "").strip()
 _n64_pinned = _n64_pin.isdigit() and int(_n64_pin) < len(N64_PROFILES)
@@ -2374,6 +2392,7 @@ _n64_start = int(_n64_pin) if _n64_pinned else 0
 EMU_MAX_N64 = int(os.environ.get("EMU_MAX_N64", "1"))        # N64 is heavy: one game at a time by default
 EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"
 EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))
+EMU_STREAM_FPS_N64 = int(os.environ.get("EMU_STREAM_FPS_N64", "30"))   # N64 is streamed at 30 fps by default
 EMU_AUDIO = os.environ.get("EMU_AUDIO", "1") == "1"
 EMU_JPEG_QUALITY = int(os.environ.get("EMU_JPEG_QUALITY", "72"))
 EMU_AFK_PAUSE = int(os.environ.get("EMU_AFK_PAUSE", "60"))
@@ -2973,6 +2992,8 @@ class Worker:
         self.base_mask = 0
         self.next_t = 0.0
         self.frame_counter = 0
+        self.tick = 0
+        self.render_every = max(1, int(os.environ.get("N64_RENDER_EVERY", "2")))   # draw every Nth frame; logic runs every frame
         self.last_srm = time.monotonic()
         self.stop = False
 
@@ -2993,6 +3014,9 @@ class Worker:
         c = self.core
         c.mask = self.effective_mask()
         c.new_frame = False
+        self.tick += 1
+        if self.live and self.tick % self.render_every:
+            render = False                        # frame skip: the game still runs at full speed, only drawing is skipped
         c.av_enable = 3 if render else 2          # behind schedule: ask the core to skip drawing this frame
         c.run_frame()
         c.av_enable = 3
@@ -3244,6 +3268,10 @@ if __name__ == "__main__":
         bench_cli(sys.argv[2], sys.argv[3])
         sys.exit(0)
     _setup_pipes()
+    try:                                  # more CPU priority for the emulator (needs permission; harmless if refused)
+        os.nice(-10)
+    except Exception:
+        pass
     Worker().main()
 '''
 
@@ -3789,7 +3817,7 @@ class EmuSession:
         self.live = on
         if not on:
             self._audio_sent = False
-        self.send({"op": "live", "on": on, "fps": EMU_STREAM_FPS,
+        self.send({"op": "live", "on": on, "fps": (EMU_STREAM_FPS_N64 if self.system == "n64" else EMU_STREAM_FPS),
                    "quality": EMU_JPEG_QUALITY, "afk": EMU_AFK_PAUSE})
 
     def _players_msg(self) -> dict:
@@ -3895,6 +3923,69 @@ class EmuSession:
 
 
 emu_web_tokens: dict = {}
+
+# Browser mode for N64: the game runs inside the player's own browser (EmulatorJS, WebGL), so it doesn't depend on the
+# host's CPU at all. The bot only hands out a personal link and serves the game file. Set N64_MODE=server to go back to
+# running N64 on the host.
+N64_MODE = os.environ.get("N64_MODE", "browser").strip().lower()
+N64_LINK_HOURS = int(os.environ.get("N64_LINK_HOURS", "6"))
+n64_browser_tokens: dict = {}      # token -> (rel, user_id, expires_at)
+
+N64_BROWSER_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>__TITLE__</title><style>
+html,body{margin:0;height:100%;background:#0b0c10;color:#e8e8ee;font:14px system-ui,sans-serif;overflow:hidden}
+#game{width:100%;height:100%}
+</style></head><body><div id="game"></div><script>
+EJS_player = '#game';
+EJS_core = 'n64';
+EJS_gameName = __NAME__;
+EJS_gameUrl = __URL__;
+EJS_pathtodata = 'https://cdn.emulatorjs.org/stable/data/';
+EJS_startOnLoaded = true;
+EJS_color = '#5865f2';
+</script><script src="https://cdn.emulatorjs.org/stable/data/loader.js"></script></body></html>'''
+
+
+def make_n64_link(rel: str, user_id: int) -> str:
+    now = time.time()
+    for k in [k for k, v in n64_browser_tokens.items() if v[2] < now]:
+        n64_browser_tokens.pop(k, None)
+    token = secrets.token_urlsafe(12)
+    n64_browser_tokens[token] = (rel, user_id, now + N64_LINK_HOURS * 3600)
+    return f"{EMU_WEB_BASE}/n64/{token}"
+
+
+def _n64_lookup(token: str):
+    info = n64_browser_tokens.get(token)
+    if not info or info[2] < time.time():
+        n64_browser_tokens.pop(token, None)
+        return None
+    return info
+
+
+async def web_n64_page(request):
+    info = _n64_lookup(request.match_info["token"])
+    if not info:
+        return web.Response(status=404, text="This link has expired. Run /emu-play again.")
+    system, fname = info[0].split("/", 1)
+    from urllib.parse import quote
+    url = f"/n64/{request.match_info['token']}/rom/{quote(fname)}"
+    title = os.path.splitext(fname)[0]
+    page = (N64_BROWSER_HTML.replace("__TITLE__", __import__("html").escape(title))
+            .replace("__NAME__", json.dumps(title)).replace("__URL__", json.dumps(url)))
+    return web.Response(text=page, content_type="text/html")
+
+
+async def web_n64_rom(request):
+    info = _n64_lookup(request.match_info["token"])
+    if not info:
+        return web.Response(status=404, text="expired")
+    try:
+        path = await asyncio.to_thread(ensure_rom_local, info[0])
+    except Exception:
+        return web.Response(status=404, text="game not found")
+    return web.FileResponse(path, headers={"Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=3600"})
 
 
 async def emu_close(sess: EmuSession, reason: str, autosave: bool = True):
@@ -4436,6 +4527,26 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
     ref = valid_rom_ref(game)
     if not ref or game not in all_roms():
         await interaction.response.send_message("❌ Pick a valid game.", ephemeral=True)
+        return
+    if ref[0] == "n64" and N64_MODE == "browser":
+        if not EMU_WEB_BASE:
+            await interaction.response.send_message(
+                "\u274c Browser play needs the bot's public web address. Set PUBLIC_URL (or RENDER_EXTERNAL_URL) to your "
+                "bot's https:// URL and restart.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(ensure_rom_local, game)
+        except Exception as e:
+            await interaction.followup.send(f"\u274c Couldn't load that game: {e}"[:1900], ephemeral=True)
+            return
+        link = make_n64_link(game, interaction.user.id)
+        await interaction.followup.send(
+            f"\U0001F3AE **{os.path.splitext(ref[1])[0]}** runs in your own browser, so it's smooth and doesn't use the "
+            f"bot's CPU:\n{link}\n"
+            f"Works on desktop and phone (touch controls appear on phones; keyboards and controllers work too). "
+            f"Your personal link is valid for {N64_LINK_HOURS} hours. The first load downloads the emulator, so give it a moment.",
+            ephemeral=True)
         return
     if interaction.channel.id in emu_sessions:
         await interaction.response.send_message("⚠️ Game already running.", ephemeral=True)
@@ -5907,6 +6018,8 @@ async def start_web():
         web.get("/", web_home),
         web.get("/emu/{token}", web_emu_page),
         web.get("/emu/{token}/ws", web_emu_ws),
+        web.get("/n64/{token}", web_n64_page),
+        web.get("/n64/{token}/rom/{name}", web_n64_rom),
         web.get("/radio", web_radio_page),
         web.get("/radio/api/countries", web_radio_countries),
         web.get("/radio/api/stations", web_radio_stations),
