@@ -2354,6 +2354,19 @@ EMU_SCALE = int(os.environ.get("EMU_SCALE", "2"))
 EMU_HOLD_STEPS = [4, 8, 16, 30]
 EMU_SETTLE_FRAMES = int(os.environ.get("EMU_SETTLE_FRAMES", "4"))
 EMU_MAX_ROM_BYTES = int(os.environ.get("EMU_MAX_ROM_MB", "8")) * 1024 * 1024
+# N64 settings, fastest first. If the emulator crashes on one (some hosts forbid the JIT it uses), the bot moves
+# to the next automatically and remembers which one worked. Pin one with N64_PROFILE=0, 1 or 2.
+N64_PROFILES = [
+    ("angrylion + parallel RSP + dynarec", {"mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "parallel",
+                                            "mupen64plus-cpucore": "dynamic_recompiler"}),
+    ("angrylion + cxd4 RSP + dynarec", {"mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "cxd4",
+                                        "mupen64plus-cpucore": "dynamic_recompiler"}),
+    ("angrylion + cxd4 RSP + interpreter", {"mupen64plus-rdp-plugin": "angrylion", "mupen64plus-rsp-plugin": "cxd4",
+                                            "mupen64plus-cpucore": "cached_interpreter"}),
+]
+_n64_pin = os.environ.get("N64_PROFILE", "").strip()
+_n64_pinned = _n64_pin.isdigit() and int(_n64_pin) < len(N64_PROFILES)
+_n64_start = int(_n64_pin) if _n64_pinned else 0
 EMU_MAX_N64 = int(os.environ.get("EMU_MAX_N64", "1"))        # N64 is heavy: one game at a time by default
 EMU_ADD_OPEN = os.environ.get("EMU_ADD_OPEN", "0") == "1"
 EMU_STREAM_FPS = int(os.environ.get("EMU_STREAM_FPS", "60"))
@@ -2392,7 +2405,6 @@ _ROM_BAD_CHARS = re.compile(r"[^\w .,'()&!+\-]")
 
 N64_WORKER_SOURCE = r'''#!/usr/bin/env python3
 # AUTO-WRITTEN BY THE BOT from the copy inside the bot file. Edit that copy (or delete this line to keep your own edits).
-# AUTO-WRITTEN BY THE BOT from the copy inside the bot file. Edit that copy (or delete this line to keep your own edits).
 """LUX-NET libretro worker (N64 first, any software-rendered core works).
 
 Talks to the bot over stdin/stdout with the same framing the NES/SNES worker uses:
@@ -2411,6 +2423,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import faulthandler
 import gc
 import hashlib
 import io
@@ -2436,6 +2449,8 @@ def _setup_pipes():
     os.dup2(2, 1)
     _PROTO_OUT = os.fdopen(out_fd, "wb", buffering=0)
     _PROTO_IN = sys.stdin.buffer
+    # If the core crashes (segfault), print where it happened so the bot can show it.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
 
 
 _out_lock = threading.Lock()
@@ -2493,17 +2508,8 @@ STICK_MAX = 32767
 # overridden with the N64_CORE_OPTIONS environment variable ("key=value;key=value").
 N64_DEFAULT_OPTIONS = {
     "mupen64plus-cpucore": "dynamic_recompiler",
-    "mupen64plus-rdp-plugin": os.environ.get("N64_RDP", "angrylion"),
-    "mupen64plus-rsp-plugin": os.environ.get("N64_RSP", "cxd4"),
-    "mupen64plus-angrylion-multithread": "all threads",
-    "mupen64plus-angrylion-sync": "Low",
-    "mupen64plus-angrylion-vioverlay": "Filtered",
-    "mupen64plus-angrylion-overscan": "disabled",
-    "mupen64plus-43screensize": "320x240",
-    "mupen64plus-EnableLODEmulation": "False",
-    "mupen64plus-pak1": "memory",
-    "mupen64plus-virefresh": "Auto",
-    "mupen64plus-audio-buffer-size": "2048",
+    "mupen64plus-rdp-plugin": os.environ.get("N64_RDP", "angrylion"),     # software renderer: no GPU needed
+    "mupen64plus-rsp-plugin": os.environ.get("N64_RSP", "parallel"),      # "parallel" is the fast LLE RSP; "cxd4" is the slower fallback
 }
 
 
@@ -2676,6 +2682,7 @@ class Encoder(threading.Thread):
 # ----------------------------------------------------------------------------- the core wrapper
 class Core:
     def __init__(self, core_path: str, sysdir: str, savedir: str, options: dict, n64: bool):
+        log("stage: opening core", os.path.basename(core_path), "options:", options)
         self.lib = ctypes.CDLL(core_path, mode=ctypes.RTLD_LOCAL)
         self.sysdir = os.fsencode(sysdir)
         self.savedir = os.fsencode(savedir)
@@ -2728,7 +2735,9 @@ class Core:
         L.retro_set_audio_sample_batch(self._cb_batch)
         L.retro_set_input_poll(self._cb_poll)
         L.retro_set_input_state(self._cb_state)
+        log("stage: retro_init")
         L.retro_init()
+        log("stage: retro_init finished")
 
     # ---- libretro callbacks (they must never raise)
     def _environment(self, cmd, data):
@@ -2853,12 +2862,14 @@ class Core:
                 self.rom_buf = f.read()
             game.data = ctypes.cast(ctypes.c_char_p(self.rom_buf), ctypes.c_void_p)
             game.size = len(self.rom_buf)
+        log("stage: retro_load_game", os.path.basename(rom_path), "need_fullpath =", bool(info.need_fullpath))
         if not self.lib.retro_load_game(ctypes.byref(game)):
             hint = ""
             if self.hw_requested:
                 hint = (" The core asked for GPU rendering, which this host can't provide. "
                         "Use the software renderer: N64_RDP=angrylion and N64_RSP=cxd4.")
             raise RuntimeError("the core refused to load this game." + hint)
+        log("stage: game loaded")
         self.loaded = True
         av = RetroSystemAvInfo()
         self.lib.retro_get_system_av_info(ctypes.byref(av))
@@ -3003,13 +3014,14 @@ class Worker:
         n64 = "mupen64plus" in os.path.basename(m["core"]).lower() or m.get("system") == "n64"
         self.n64 = n64
         options = dict(N64_DEFAULT_OPTIONS) if n64 else {}
-        options.update(parse_option_overrides(os.environ.get("N64_CORE_OPTIONS", "")))
-        options.update(m.get("options") or {})
+        options.update(m.get("options") or {})                                   # settings chosen by the bot
+        options.update(parse_option_overrides(os.environ.get("N64_CORE_OPTIONS", "")))   # your own overrides win
         savedir = m.get("savedir") or "saves"
         self.core = Core(m["core"], m.get("sysdir") or "system", savedir, options, n64)
         self.core.load(m["rom"], "N64" if n64 else "")
         t0 = time.perf_counter()
-        for _ in range(int(m.get("warmup", 6))):
+        for i in range(int(m.get("warmup", 6))):
+            log("stage: warm-up frame", i + 1)
             self.core.run_frame()
             self.core.audio = []
             if self.core.frame is not None and time.perf_counter() - t0 > 20:
@@ -3336,20 +3348,54 @@ def ensure_rom_local(rel: str) -> str:
     return path
 
 
+_last_rom_error = ""
+
+
+def _upload_rom_direct(rel: str, data: bytes):
+    """Upload straight to Supabase storage with a long timeout (the client library gives up after about 20 s, which
+    large files on a slow link can exceed). Returns None on success or the server's error text."""
+    import json as _json
+    from urllib.parse import quote
+    req = urllib.request.Request(
+        f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{ROM_BUCKET}/{quote(rel, safe='/')}", data=data, method="POST",
+        headers={"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY,
+                 "Content-Type": "application/octet-stream", "x-upsert": "true"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            r.read()
+        return None
+    except urllib.error.HTTPError as e:
+        body = e.read()[:400].decode("utf-8", "replace")
+        try:
+            body = _json.loads(body).get("message") or body
+        except ValueError:
+            pass
+        return f"HTTP {e.code}: {body}"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
 def add_rom_blocking(system: str, filename: str, data: bytes) -> bool:
+    global _last_rom_error
     path = os.path.join(ROM_DIR, system, filename)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
-    try:
+    rel = f"{system}/{filename}"
+    err = _upload_rom_direct(rel, data)
+    if err is None:
+        _remote_roms.add(rel)
+        _last_rom_error = ""
+        return True
+    logger.warning(f"Could not persist ROM {rel}: {err}")
+    try:                                    # last resort: the client library
         supabase.storage.from_(ROM_BUCKET).upload(
-            path=f"{system}/{filename}", file=data,
-            file_options={"content-type": "application/octet-stream", "upsert": "true"},
-        )
-        _remote_roms.add(f"{system}/{filename}")
+            path=rel, file=data, file_options={"content-type": "application/octet-stream", "upsert": "true"})
+        _remote_roms.add(rel)
+        _last_rom_error = ""
         return True
     except Exception as e:
-        logger.warning(f"Could not persist ROM: {e}")
+        _last_rom_error = err if err else str(e)
         return False
 
 
@@ -3461,8 +3507,8 @@ async def ingest_rom(raw_name: str, data: bytes):
     rel = f"{system}/{name}"
     replaced = rel in all_roms()
     saved_remote = await asyncio.to_thread(add_rom_blocking, system, name, data)
-    note = "" if saved_remote else ("\n\u26a0\ufe0f Saved on the host only. The cloud backup failed (storage limit or "
-                                    "connection), so it may vanish if the host resets.")
+    note = "" if saved_remote else (f"\n\u26a0\ufe0f Saved on the host only. The cloud backup failed: "
+                                    f"`{_last_rom_error[:300] or 'unknown error'}`. The game may vanish if the host resets.")
     return True, (f"\u2705 {'Replaced' if replaced else 'Added'} **{os.path.splitext(name)[0]}** "
                   f"({EMU_SYSTEMS[system]['label']}, {len(data) / 1048576:.1f} MB). Play it with `/emu-play`.{note}")
 
@@ -3555,7 +3601,7 @@ class EmuSession:
         self.last_mask = 0
         self.seq = 0
         self.inputs = 0
-        self.err_tail = deque(maxlen=20)
+        self.err_tail = deque(maxlen=80)
         self.pending = None
         self._err_task = None
         self._reader_task = None
@@ -3625,8 +3671,8 @@ class EmuSession:
         except Exception:
             pass
         await asyncio.sleep(0.2)
-        tail = " | ".join(list(self.err_tail)[-4:])[-350:]
-        return f"the emulator process stopped (exit code {code})" + (f": {tail}" if tail else "")
+        summary = summarize_worker_errors(self.err_tail)
+        return f"the emulator process stopped (exit code {code})" + (f". {summary}" if summary else "")
 
     async def _reader(self, proc):
         try:
@@ -4289,6 +4335,60 @@ class EmuView(discord.ui.View):
             await interaction.response.send_message("\u26a0\ufe0f That button isn't available for this game.", ephemeral=True)
 
 
+def summarize_worker_errors(lines) -> str:
+    """Boil a worker's stderr down to what matters: the last startup step, and anything the emulator core said.
+    Python's own stack dump (printed on a crash) is dropped."""
+    lines = [x.strip() for x in lines if x and x.strip()]
+    stage = next((x for x in reversed(lines) if "stage:" in x), "")
+    noise = ("File ", "Thread ", "Current thread", "Fatal Python", "Stack ", "[n64-worker]", "import audioop", "Traceback")
+    core = [x for x in lines if not x.startswith(noise) and "audioop" not in x and "DeprecationWarning" not in x
+            and not x.startswith("...")][-3:]
+    parts = []
+    if stage:
+        parts.append("Last step: " + stage.split("stage:", 1)[1].strip()[:160] + ".")
+    if core:
+        parts.append("The emulator said: " + " / ".join(x[:140] for x in core))
+    if not parts:
+        rest = [x for x in lines if "audioop" not in x and "DeprecationWarning" not in x]
+        if rest:
+            parts.append(" | ".join(rest[-2:])[-250:])
+    return " ".join(parts)[:600]
+
+
+async def load_with_fallback(make_session, load_args: dict, is_n64: bool):
+    """Start a worker and load the game. For N64, walk the settings ladder when the emulator dies or refuses.
+    Returns (session, load_reply, profile_name_or_None, earlier_failures)."""
+    global _n64_start
+    failures = []
+    if not is_n64:
+        sess = make_session()
+        await sess.spawn()
+        res = await sess.call(op="load", **load_args)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("err"))
+        return sess, res, None, failures
+    order = [_n64_start] if _n64_pinned else list(range(_n64_start, len(N64_PROFILES)))
+    for k in order:
+        name, opts = N64_PROFILES[k]
+        sess = make_session()
+        try:
+            await sess.spawn()
+            res = await sess.call(op="load", options=opts, **load_args)
+            if res.get("ok"):
+                _n64_start = k            # remember what works on this host
+                return sess, res, name, failures
+            err = str(res.get("err") or "unknown error")
+        except Exception as e:
+            err = str(e)
+        failures.append(f"**{name}**: {err[:400]}")
+        sess.closed = True
+        sess.kill()
+        if emu_sessions.get(sess.channel_id) is sess:
+            emu_sessions.pop(sess.channel_id, None)
+        logger.warning(f"N64 setting '{name}' failed: {err[:300]}")
+    raise RuntimeError("N64 failed on every setting I tried:\n" + "\n".join(failures))
+
+
 @bot.tree.command(name="emu-play", description="Play a NES, SNES or N64 game.")
 @app_commands.describe(game="Pick a game", resume="Continue previous")
 @app_commands.autocomplete(game=emu_rom_autocomplete)
@@ -4314,19 +4414,21 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         return
 
     await interaction.response.defer(ephemeral=True)
-    sess = EmuSession(interaction.channel.id, game, interaction.user.id)
-    emu_sessions[sess.channel_id] = sess
+
+    def make_session():
+        new_sess = EmuSession(interaction.channel.id, game, interaction.user.id)
+        emu_sessions[new_sess.channel_id] = new_sess
+        return new_sess
+
+    sess = None
     try:
         rom_path = await asyncio.to_thread(ensure_rom_local, game)
-        core_path = await asyncio.to_thread(ensure_core, sess.system)
-        await sess.spawn()
+        core_path = await asyncio.to_thread(ensure_core, ref[0])
         load_args = dict(core=core_path, rom=rom_path, sysdir=os.path.join(EMU_BASE, "system"),
                          savedir=os.path.join(STATE_DIR, "sram"))
-        if sess.system == "n64":
+        if ref[0] == "n64":
             load_args["system"] = "n64"
-        res = await sess.call(op="load", **load_args)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("err"))
+        sess, res, profile, failures = await load_with_fallback(make_session, load_args, ref[0] == "n64")
         sess.audio_rate = int(res.get("audio_rate") or res.get("rate") or 0)
         sess.audio_ch = int(res.get("audio_ch") or res.get("ch") or 2)
         if sess.system == "n64" and resume and os.path.exists(sess.auto_path):
@@ -4337,11 +4439,16 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         msg = await interaction.channel.send(embed=sess.make_embed(fname),
                                              file=discord.File(io.BytesIO(res.get("png", b"")), filename=fname), view=sess.view)
         sess.message_id = msg.id
-        tip = " N64 is best played with **Play live** on the message." if sess.system == "n64" else ""
+        tip = ""
+        if sess.system == "n64":
+            tip = f" N64 mode: {profile}. Best played with **Play live** on the message."
+            if failures:
+                tip += " (A faster setting crashed on this host, so a safer one is being used.)"
         await interaction.followup.send("✅ Game started!" + tip, ephemeral=True)
     except Exception as e:
-        emu_sessions.pop(sess.channel_id, None)
-        await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
+        if sess is not None and emu_sessions.get(sess.channel_id) is sess:
+            emu_sessions.pop(sess.channel_id, None)
+        await interaction.followup.send(f"❌ Failed: {e}"[:1900], ephemeral=True)
 
 
 @bot.tree.command(name="emu-games", description="List games.")
@@ -4441,18 +4548,21 @@ async def emu_bench(interaction: discord.Interaction, game: str):
         await interaction.response.send_message("\u26a0\ufe0f Stop the running game first so the test is accurate.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    sess = EmuSession(-interaction.user.id, game, interaction.user.id)       # private, never shown in a channel
+    made = []
+
+    def make_session():
+        new_sess = EmuSession(-interaction.user.id, game, interaction.user.id)     # private, never shown in a channel
+        made.append(new_sess)
+        return new_sess
+
     try:
         rom_path = await asyncio.to_thread(ensure_rom_local, game)
-        core_path = await asyncio.to_thread(ensure_core, sess.system)
-        await sess.spawn()
+        core_path = await asyncio.to_thread(ensure_core, ref[0])
         load_args = dict(core=core_path, rom=rom_path, sysdir=os.path.join(EMU_BASE, "system"),
                          savedir=os.path.join(STATE_DIR, "sram"))
-        if sess.system == "n64":
+        if ref[0] == "n64":
             load_args["system"] = "n64"
-        res = await asyncio.wait_for(sess.call(op="load", **load_args), 240)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("err"))
+        sess, _res, profile, failures = await asyncio.wait_for(load_with_fallback(make_session, load_args, ref[0] == "n64"), 600)
         res = await asyncio.wait_for(sess.call(op="bench", frames=120), 300)
         if not res.get("ok"):
             raise RuntimeError(res.get("err"))
@@ -4466,14 +4576,17 @@ async def emu_bench(interaction: discord.Interaction, game: str):
         else:
             verdict = ("\U0001F534 Too slow for comfortable play on this host. A machine with more and faster CPU cores, "
                        "or a GPU, is needed for 60 fps.")
-        extra = f"\nRenderer: `{res['rdp']}` / RSP: `{res['rsp']}`" if res.get("rdp") else ""
+        extra = f"\nSetting used: **{profile}**" if profile else ""
+        if failures:
+            extra += "\nFaster settings that crashed:\n" + "\n".join(failures)
         await interaction.followup.send(
-            f"**{ref[1]}** ran at **{fps:.1f} fps** (the game wants {target:.1f}, {pct:.0f}%).{extra}\n{verdict}", ephemeral=True)
+            f"**{ref[1]}** ran at **{fps:.1f} fps** (the game wants {target:.1f}, {pct:.0f}%).{extra}\n{verdict}"[:1900], ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"\u274c Benchmark failed: {e}", ephemeral=True)
+        await interaction.followup.send(f"\u274c Benchmark failed: {e}"[:1900], ephemeral=True)
     finally:
-        sess.closed = True
-        sess.kill()
+        for x in made:
+            x.closed = True
+            x.kill()
 
 
 @bot.tree.command(name="emu-stop", description="Stop the game.")
