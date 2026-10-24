@@ -3944,36 +3944,121 @@ EJS_gameUrl = __URL__;
 EJS_pathtodata = 'https://cdn.emulatorjs.org/stable/data/';
 EJS_startOnLoaded = true;
 EJS_color = '#5865f2';
+EJS_onGameStart = function () { startLive(); };
+function startLive() {
+  var base = '/n64/__TOKEN__';
+  var busy = false;
+  function grab(cb) {
+    try {
+      var emu = window.EJS_emulator;
+      if (emu && typeof emu.screenshot === 'function') { emu.screenshot(function (b) { cb(b); }, 'canvas', 'jpeg', 0); return; }
+    } catch (e) {}
+    var cv = document.querySelector('#game canvas');
+    if (!cv) return cb(null);
+    try { cv.toBlob(cb, 'image/jpeg', 0.6); } catch (e) { cb(null); }
+  }
+  setInterval(function () {
+    if (busy || document.hidden) return;
+    busy = true;
+    grab(function (b) {
+      if (!b) { busy = false; return; }
+      fetch(base + '/frame', { method: 'POST', body: b }).catch(function () {}).finally(function () { busy = false; });
+    });
+  }, 1000);
+  addEventListener('pagehide', function () { try { navigator.sendBeacon(base + '/end'); } catch (e) {} });
+}
 </script><script src="https://cdn.emulatorjs.org/stable/data/loader.js"></script></body></html>'''
 
 
-def make_n64_link(rel: str, user_id: int) -> str:
+N64_EMBED_INTERVAL = float(os.environ.get("N64_EMBED_INTERVAL", "1.0"))   # seconds between Discord picture updates
+
+
+def make_n64_link(rel: str, user_id: int, player: str = "", channel_id: int = 0, message_id: int = 0) -> str:
     now = time.time()
-    for k in [k for k, v in n64_browser_tokens.items() if v[2] < now]:
+    for k in [k for k, v in n64_browser_tokens.items() if v["expires"] < now]:
         n64_browser_tokens.pop(k, None)
     token = secrets.token_urlsafe(12)
-    n64_browser_tokens[token] = (rel, user_id, now + N64_LINK_HOURS * 3600)
+    title = os.path.splitext(rel.split("/", 1)[1])[0]
+    n64_browser_tokens[token] = {"rel": rel, "user": user_id, "expires": now + N64_LINK_HOURS * 3600, "player": player,
+                                 "channel_id": channel_id, "message_id": message_id, "title": title, "started": now,
+                                 "seq": 0, "last_edit": 0.0, "editing": False}
     return f"{EMU_WEB_BASE}/n64/{token}"
 
 
 def _n64_lookup(token: str):
     info = n64_browser_tokens.get(token)
-    if not info or info[2] < time.time():
+    if not info or info["expires"] < time.time():
         n64_browser_tokens.pop(token, None)
         return None
     return info
+
+
+async def n64_edit_embed(info: dict, data: bytes, kind: str):
+    ch = bot.get_channel(info["channel_id"])
+    if ch is None or not info["message_id"]:
+        return
+    info["seq"] += 1
+    fname = f"n{info['seq']}.{kind}"
+    embed = discord.Embed(color=discord.Color.dark_grey())
+    embed.set_author(name=f"N64: {info['title']}")
+    embed.set_image(url=f"attachment://{fname}")
+    mins = int((time.time() - info["started"]) / 60)
+    embed.set_footer(text=f"{info['player']} is playing \u2022 live \u2022 {mins} min"[:400])
+    try:
+        await ch.get_partial_message(info["message_id"]).edit(
+            content=None, embed=embed, attachments=[discord.File(io.BytesIO(data), filename=fname)])
+    except Exception as e:
+        logger.warning(f"Could not update N64 embed: {e}")
+
+
+async def web_n64_frame(request):
+    info = _n64_lookup(request.match_info["token"])
+    if not info or not info["message_id"]:
+        return web.Response(status=404)
+    if info["editing"] or time.monotonic() - info["last_edit"] < N64_EMBED_INTERVAL:
+        return web.Response(status=204)
+    data = await request.read()
+    if not data or len(data) > 600_000:
+        return web.Response(status=413)
+    if data[:4] == b"\x89PNG":
+        kind = "png"
+    elif data[:2] == b"\xff\xd8":
+        kind = "jpg"
+    else:
+        return web.Response(status=415)
+    info["editing"] = True
+    try:
+        await n64_edit_embed(info, data, kind)
+        info["last_edit"] = time.monotonic()
+    finally:
+        info["editing"] = False
+    return web.Response(status=204)
+
+
+async def web_n64_end(request):
+    info = _n64_lookup(request.match_info["token"])
+    if info and info["message_id"]:
+        ch = bot.get_channel(info["channel_id"])
+        if ch is not None:
+            try:
+                await ch.get_partial_message(info["message_id"]).edit(
+                    content=f"\u23F9\uFE0F **N64: {info['title']}** ended.", embed=None, attachments=[])
+            except Exception:
+                pass
+    return web.Response(status=204)
 
 
 async def web_n64_page(request):
     info = _n64_lookup(request.match_info["token"])
     if not info:
         return web.Response(status=404, text="This link has expired. Run /emu-play again.")
-    system, fname = info[0].split("/", 1)
+    system, fname = info["rel"].split("/", 1)
     from urllib.parse import quote
     url = f"/n64/{request.match_info['token']}/rom/{quote(fname)}"
     title = os.path.splitext(fname)[0]
     page = (N64_BROWSER_HTML.replace("__TITLE__", __import__("html").escape(title))
-            .replace("__NAME__", json.dumps(title)).replace("__URL__", json.dumps(url)))
+            .replace("__NAME__", json.dumps(title)).replace("__URL__", json.dumps(url))
+            .replace("__TOKEN__", request.match_info["token"]))
     return web.Response(text=page, content_type="text/html")
 
 
@@ -3982,7 +4067,7 @@ async def web_n64_rom(request):
     if not info:
         return web.Response(status=404, text="expired")
     try:
-        path = await asyncio.to_thread(ensure_rom_local, info[0])
+        path = await asyncio.to_thread(ensure_rom_local, info["rel"])
     except Exception:
         return web.Response(status=404, text="game not found")
     return web.FileResponse(path, headers={"Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=3600"})
@@ -4540,7 +4625,15 @@ async def emu_play(interaction: discord.Interaction, game: str, resume: bool = T
         except Exception as e:
             await interaction.followup.send(f"\u274c Couldn't load that game: {e}"[:1900], ephemeral=True)
             return
-        link = make_n64_link(game, interaction.user.id)
+        msg_id = 0
+        try:                     # the live embed that shows the game in the channel
+            first = discord.Embed(color=discord.Color.dark_grey(),
+                                  description=f"Waiting for **{interaction.user.display_name}** to start the game...")
+            first.set_author(name=f"N64: {os.path.splitext(ref[1])[0]}")
+            msg_id = (await interaction.channel.send(embed=first)).id
+        except Exception as e:
+            logger.warning(f"Could not post the N64 embed: {e}")
+        link = make_n64_link(game, interaction.user.id, interaction.user.display_name, interaction.channel.id, msg_id)
         await interaction.followup.send(
             f"\U0001F3AE **{os.path.splitext(ref[1])[0]}** runs in your own browser, so it's smooth and doesn't use the "
             f"bot's CPU:\n{link}\n"
@@ -6020,6 +6113,8 @@ async def start_web():
         web.get("/emu/{token}/ws", web_emu_ws),
         web.get("/n64/{token}", web_n64_page),
         web.get("/n64/{token}/rom/{name}", web_n64_rom),
+        web.post("/n64/{token}/frame", web_n64_frame),
+        web.post("/n64/{token}/end", web_n64_end),
         web.get("/radio", web_radio_page),
         web.get("/radio/api/countries", web_radio_countries),
         web.get("/radio/api/stations", web_radio_stations),
