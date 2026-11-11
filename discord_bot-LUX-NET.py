@@ -342,10 +342,96 @@ async def get_or_create_webhook(channel: discord.abc.GuildChannel, refresh: bool
         return None
 
 
+# One webhook per channel makes Discord merge back-to-back messages from DIFFERENT people into a single block
+# (it groups by webhook, not by the name shown), so some senders lose their name. A small pool of webhooks per
+# channel is rotated so two different people never post back to back through the same one. Set RELAY_WEBHOOKS=1
+# to go back to a single webhook.
+RELAY_WEBHOOKS = max(1, int(os.environ.get("RELAY_WEBHOOKS", "2")))
+_webhook_pool_cache: dict = {}               # root channel id -> [webhooks]; index 0 is the primary one
+_pool_locks: dict = {}
+_pool_retry: dict = {}                       # root channel id -> time before which a failed pool build isn't retried
+_last_sender: OrderedDict = OrderedDict()    # target channel id -> (sender id, webhook index) of the last relayed message
+_msg_wh_owner: OrderedDict = OrderedDict()   # message id -> id of the webhook that posted it
+
+
 def forget_webhook(channel):
     root = _webhook_root(channel)
     if root is not None:
         _webhook_cache.pop(root.id, None)
+        _webhook_pool_cache.pop(root.id, None)
+
+
+async def get_webhook_pool(channel, refresh: bool = False) -> list:
+    root = _webhook_root(channel)
+    if root is None:
+        return []
+
+    def usable(cached):
+        return bool(cached) and not refresh and (len(cached) >= RELAY_WEBHOOKS or time.monotonic() < _pool_retry.get(root.id, 0))
+
+    cached = _webhook_pool_cache.get(root.id)
+    if usable(cached):
+        return cached
+    primary = await get_or_create_webhook(channel, refresh=refresh)
+    if primary is None:
+        return []
+    pool = [primary]
+    if RELAY_WEBHOOKS > 1:
+        async with _pool_locks.setdefault(root.id, asyncio.Lock()):
+            cached = _webhook_pool_cache.get(root.id)
+            if usable(cached):
+                return cached
+            try:
+                others = sorted((w for w in await root.webhooks()
+                                 if w.user and w.user.id == bot.user.id and w.token and w.id != primary.id),
+                                key=lambda w: w.id)
+                pool += others
+                while len(pool) < RELAY_WEBHOOKS:
+                    pool.append(await root.create_webhook(name=f"LUX-NET Relay Bridge {len(pool) + 1}"))
+            except Exception as e:
+                _pool_retry[root.id] = time.monotonic() + 300
+                logger.warning(f"Could not build the webhook pool in #{root.name}: {e}")
+            _webhook_pool_cache[root.id] = pool
+    return pool
+
+
+async def pick_webhook(channel, sender=None, refresh: bool = False):
+    """Same sender as the last relayed message here -> same webhook (Discord groups them, as it does natively).
+    A different sender -> the next webhook, so their name and avatar always show."""
+    if sender is None or RELAY_WEBHOOKS <= 1:
+        return await get_or_create_webhook(channel, refresh=refresh)
+    pool = await get_webhook_pool(channel, refresh=refresh)
+    if not pool:
+        return None
+    n = min(len(pool), RELAY_WEBHOOKS)
+    last = _last_sender.get(channel.id)
+    if last is None:
+        idx = 0
+    elif last[0] == sender and last[1] < n:
+        idx = last[1]
+    else:
+        idx = (last[1] + 1) % n
+    _remember(_last_sender, channel.id, (sender, idx), cap=3000)
+    return pool[idx]
+
+
+async def with_message_webhook(channel, message_id: int, fn):
+    """Edits and deletes only work through the webhook that posted the message: try the remembered owner first,
+    then the channel's other relay webhooks."""
+    pool = await get_webhook_pool(channel)
+    if not pool:
+        return None
+    owner = _msg_wh_owner.get(message_id)
+    last = None
+    for wh in sorted(pool, key=lambda w: 0 if w.id == owner else 1):
+        try:
+            return await fn(wh)
+        except discord.HTTPException as e:
+            if e.status not in (400, 403, 404):
+                raise
+            last = e
+    if last is not None:
+        raise last
 
 
 # ------------------------------------------------------------------------------
@@ -510,6 +596,7 @@ class RelayPayload:
     attachments: list
     source_id: int
     source_channel_id: int
+    author_id: int = 0
 
 
 async def _download_attachment(att: discord.Attachment, limit_bytes: int) -> RelayAttachment:
@@ -599,15 +686,16 @@ async def build_relay_payload(message: discord.Message, *, with_reply: bool = Tr
         attachments=list(attachments),
         source_id=message.id,
         source_channel_id=message.channel.id,
+        author_id=message.author.id,
     )
 
 
-async def webhook_send(channel, *, files_factory=None, thread=None, **kwargs):
+async def webhook_send(channel, *, files_factory=None, thread=None, sender=None, **kwargs):
     """Send through the cached webhook. Fresh File objects are built for every attempt (a File can
     only be uploaded once, which is what used to break video/image relays on all but the first server)."""
     last_err = None
     for attempt in (0, 1):
-        wh = await get_or_create_webhook(channel, refresh=bool(attempt))
+        wh = await pick_webhook(channel, sender, refresh=bool(attempt))
         if wh is None:
             return None
         kw = dict(kwargs)
@@ -619,7 +707,10 @@ async def webhook_send(channel, *, files_factory=None, thread=None, **kwargs):
         if t is not None:
             kw["thread"] = t
         try:
-            return await wh.send(wait=True, **kw)
+            sent = await wh.send(wait=True, **kw)
+            if sent is not None:
+                _remember(_msg_wh_owner, sent.id, wh.id, cap=6000)
+            return sent
         except discord.NotFound as e:           # webhook (or thread) was deleted: rebuild once
             last_err = e
             forget_webhook(channel)
@@ -669,7 +760,7 @@ async def relay_to_target(ch, p: RelayPayload, *, thread_name: str | None = None
                     return None
             else:
                 factory = None
-            sent = await webhook_send(ch, files_factory=factory, thread=thread_obj, **kw)
+            sent = await webhook_send(ch, files_factory=factory, thread=thread_obj, sender=p.author_id or None, **kw)
             if sent is None:
                 return first
             if first is None:
@@ -1152,10 +1243,8 @@ async def _set_reaction_line(cid: int, mid: int, line: str):
     ch = await resolve_channel(cid)
     if ch is None:
         return
-    wh = await get_or_create_webhook(ch)
-    if wh is None:
-        return
-    try:
+
+    async def apply(wh):
         msg = await wh.fetch_message(mid, **_thread_kw(ch))
         current = msg.content or ""
         base = _REACTION_LINE_RE.sub("", current)
@@ -1165,6 +1254,9 @@ async def _set_reaction_line(cid: int, mid: int, line: str):
         if new == current:
             return
         await wh.edit_message(mid, content=new, allowed_mentions=discord.AllowedMentions.none(), **_thread_kw(ch))
+
+    try:
+        await with_message_webhook(ch, mid, apply)
     except discord.NotFound:
         pass
     except Exception as e:
@@ -1242,11 +1334,9 @@ async def _edit_copy(cid: int, mid: int, content: str):
     ch = await resolve_channel(cid)
     if ch is None:
         return
-    wh = await get_or_create_webhook(ch)
-    if wh is None:
-        return
     try:
-        await wh.edit_message(mid, content=content, allowed_mentions=discord.AllowedMentions.none(), **_thread_kw(ch))
+        await with_message_webhook(ch, mid, lambda wh: wh.edit_message(
+            mid, content=content, allowed_mentions=discord.AllowedMentions.none(), **_thread_kw(ch)))
     except Exception as e:
         logger.warning(f"Could not sync edit to {cid}/{mid}: {e}")
 
@@ -1255,11 +1345,8 @@ async def _delete_copy(cid: int, mid: int):
     ch = await resolve_channel(cid)
     if ch is None:
         return
-    wh = await get_or_create_webhook(ch)
-    if wh is None:
-        return
     try:
-        await wh.delete_message(mid, **_thread_kw(ch))
+        await with_message_webhook(ch, mid, lambda wh: wh.delete_message(mid, **_thread_kw(ch)))
     except discord.NotFound:
         pass
     except Exception as e:
@@ -2324,7 +2411,7 @@ async def relay_watch_post(source_channel, requester: discord.abc.User, item: di
 
     async def one(ch):
         try:
-            await webhook_send(ch, username=username, avatar_url=requester.display_avatar.url, content=content,
+            await webhook_send(ch, sender=requester.id, username=username, avatar_url=requester.display_avatar.url, content=content,
                                allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             logger.warning(f"Could not relay video link: {e}")
