@@ -18,6 +18,7 @@ import struct
 import zipfile
 import atexit
 import secrets
+import unicodedata
 import shutil
 import random
 import csv
@@ -83,6 +84,8 @@ _LINK_COLS = {
     "text_relays": "channel_id",
     "thread_relays": "thread_id",
     "vc_code_relays": "vc_id",
+    "tts_vc_relays": "vc_id",
+    "tts_text_relays": "channel_id",
 }
 
 def add_link(table: str, code: str, item_id: int):
@@ -458,8 +461,12 @@ def _remember(od: OrderedDict, key, value=True, cap: int = 3000):
         od.popitem(last=False)
 
 
+_tts_text_cache: dict = {}        # text channel id -> (expires_at, [tts voice channel ids])
+
+
 def invalidate_relay_cache():
     _target_cache.clear()
+    _tts_text_cache.clear()
 
 
 def _query_targets(table: str, item_id: int) -> list:
@@ -802,6 +809,100 @@ async def relay_payload(p: RelayPayload, targets: list) -> list:
 def schedule_mapping(source_id: int, source_channel_id: int, sent: list):
     pairs = [(t.id, m.id) for t, m in sent]
     spawn(asyncio.to_thread(register_message_mappings, source_id, source_channel_id, pairs))
+
+
+# ------------------------------------------------------------------------------
+# CATCH-UP: when a channel joins a network, send it what it missed
+# ------------------------------------------------------------------------------
+# The bot doesn't keep message text, so the catch-up reads recent history straight from the channels that are
+# already in the network. Only real messages are replayed (not the bot's own relayed copies, which would be
+# duplicates), anything this channel already received earlier is skipped, and each replayed message is mapped
+# so edits, deletes and reaction totals work on it like any other relayed message.
+RELAY_BACKFILL_DEFAULT = int(os.environ.get("RELAY_BACKFILL_DEFAULT", "50"))
+RELAY_BACKFILL_MAX = int(os.environ.get("RELAY_BACKFILL_MAX", "500"))
+_backfilling: set = set()
+
+
+def _already_copied(root_ids: list, channel_id: int) -> set:
+    done = set()
+    try:
+        for i in range(0, len(root_ids), 100):
+            res = (supabase.table("message_mappings").select("root_message_id")
+                   .eq("channel_id", channel_id).in_("root_message_id", root_ids[i:i + 100]).execute())
+            done.update(int(r["root_message_id"]) for r in res.data)
+    except Exception as e:
+        logger.warning(f"Could not check which messages the channel already has: {e}")
+    return done
+
+
+async def _collect_missed(source_ids: list, limit: int) -> list:
+    found = []
+    for cid in source_ids:
+        src = await resolve_channel(cid)
+        if not isinstance(src, discord.TextChannel):
+            continue
+        picked = 0
+        try:
+            async for m in src.history(limit=min(limit * 4, 2000)):
+                if m.author.bot or m.webhook_id or not m.guild or is_user_banned(m.author.id):
+                    continue
+                if m.type not in (discord.MessageType.default, discord.MessageType.reply):
+                    continue
+                if not (m.content or m.attachments or m.embeds or m.stickers or getattr(m, "message_snapshots", None)):
+                    continue
+                found.append(m)
+                picked += 1
+                if picked >= limit:
+                    break
+        except discord.HTTPException as e:
+            logger.warning(f"Catch-up could not read #{getattr(src, 'name', cid)}: {e}")
+    found.sort(key=lambda m: m.id)                       # snowflakes are chronological
+    return found
+
+
+async def backfill_channel(channel, code: str, limit: int):
+    if channel.id in _backfilling or not supabase:
+        return
+    _backfilling.add(channel.id)
+    try:
+        links = await asyncio.to_thread(get_links, "text_relays", code)
+        source_ids = [int(c) for c in links if int(c) != channel.id]
+        if not source_ids:
+            return
+        missed = await _collect_missed(source_ids, limit)
+        if not missed:
+            return
+        done = await asyncio.to_thread(_already_copied, [m.id for m in missed], channel.id)
+        fresh = [m for m in missed if m.id not in done][-limit:]
+        if not fresh:
+            return
+        none = discord.AllowedMentions.none()
+        try:
+            await channel.send(f"\U0001F4DC **Catching up:** the last {len(fresh)} message(s) from this network, "
+                               f"sent before this channel was linked.", allowed_mentions=none)
+        except discord.HTTPException as e:
+            logger.warning(f"Catch-up could not post in #{channel.name}: {e}")
+            return
+        sent_count = 0
+        for m in fresh:                                  # oldest first, one at a time, so the order is right
+            try:
+                ts = int(m.created_at.timestamp())
+                p = await build_relay_payload(m, extra_text=f"\n-# \U0001F552 <t:{ts}:f>", targets=[channel])
+                first = await relay_to_target(channel, p)
+                if first is not None:
+                    schedule_mapping(m.id, m.channel.id, [(channel, first)])
+                    sent_count += 1
+            except Exception as e:
+                logger.warning(f"Catch-up skipped message {m.id}: {e}")
+        try:
+            await channel.send(f"✅ Caught up ({sent_count} message(s)). New messages now relay live.",
+                               allowed_mentions=none)
+        except discord.HTTPException:
+            pass
+    except Exception as e:
+        logger.error(f"Catch-up failed for #{getattr(channel, 'name', channel.id)}: {e}")
+    finally:
+        _backfilling.discard(channel.id)
 
 
 # ------------------------------------------------------------------------------
@@ -1786,7 +1887,7 @@ async def maybe_join_voice(channel: discord.VoiceChannel):
     if not VOICE_OK or not isinstance(channel, discord.VoiceChannel):
         return
     gid = channel.guild.id
-    if gid in voice_sessions or gid in _voice_connecting or gid in radio_sessions:
+    if gid in voice_sessions or gid in _voice_connecting or gid in radio_sessions or gid in tts_sessions or gid in _tts_connecting:
         return
     if len(voice_sessions) >= MAX_VOICE_SESSIONS:
         return
@@ -1833,10 +1934,14 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         session = voice_sessions.get(member.guild.id)
         if session and (after.channel is None or after.channel.id != session.channel_id):
             await end_voice_session(member.guild.id)
+        ts = tts_sessions.get(member.guild.id)
+        if ts and (after.channel is None or after.channel.id != ts["channel_id"]):
+            await tts_stop(member.guild.id)
         return
 
     if before.channel and before.channel != after.channel and not member.bot:
         await radio_maybe_leave(before.channel)
+        await tts_maybe_leave(before.channel)
 
     if member.bot or is_user_banned(member.id) or not VOICE_OK:
         return
@@ -1856,6 +1961,9 @@ async def on_message(message: discord.Message):
 
     if message.channel.id in emu_sessions and await emu_chat_input(message):
         return
+
+    if message.content and supabase:
+        spawn(tts_on_message(message))                   # reads it aloud if this text channel is linked to TTS voice channels
 
     if not supabase:
         return
@@ -2078,18 +2186,28 @@ async def list_bridges(interaction: discord.Interaction, network_code: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="link-relay", description="Link this text channel to a cross-server relay network.")
-@app_commands.describe(network_code="The network code to link this text channel to")
-async def link_relay(interaction: discord.Interaction, network_code: str):
+@app_commands.describe(
+    network_code="The network code to link this text channel to",
+    history="How many recent messages from the network to send to this channel now (0 = none)")
+async def link_relay(interaction: discord.Interaction, network_code: str,
+                     history: app_commands.Range[int, 0, RELAY_BACKFILL_MAX] = RELAY_BACKFILL_DEFAULT):
     channel_id = interaction.channel.id
     code = network_code.strip().lower()
 
+    was_linked = channel_id in [int(c) for c in get_links("text_relays", code)]
     add_link("text_relays", code, channel_id)
     channels = get_links("text_relays", code)
 
+    catch_up = (history > 0 and not was_linked and any(int(c) != channel_id for c in channels)
+                and isinstance(interaction.channel, discord.TextChannel))
+    note = f"\n\U0001F4DC Catching up on up to the last {history} messages this channel missed..." if catch_up else ""
+
     await interaction.response.send_message(
-        f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! ({len(channels)} connected)",
+        f"✅ Linked **#{interaction.channel.name}** to relay network `{code}`! ({len(channels)} connected){note}",
         ephemeral=False
     )
+    if catch_up:
+        spawn(backfill_channel(interaction.channel, code, history))
 
 @bot.tree.command(name="unlink-relay", description="Unlink this text channel from its active relay network.")
 async def unlink_relay(interaction: discord.Interaction):
@@ -2226,6 +2344,12 @@ async def link_vc(interaction: discord.Interaction, network_code: str, voice_cha
 
     await interaction.response.defer()
     code = network_code.strip().lower()
+    if code.startswith("direct-"):
+        await interaction.followup.send("❌ Codes starting with `direct-` are reserved for direct calls. Use `/direct-call`.", ephemeral=True)
+        return
+    if await get_tts_codes(target.id):
+        await interaction.followup.send("❌ That voice channel is a TTS voice channel. Use a separate voice channel for the bridge, or `/unlink-tts-vc` first.", ephemeral=True)
+        return
     await asyncio.to_thread(add_link, "vc_code_relays", code, target.id)
     linked = await asyncio.to_thread(get_links, "vc_code_relays", code)
 
@@ -2254,9 +2378,9 @@ async def unlink_vc(interaction: discord.Interaction, voice_channel: discord.Voi
         return
 
     await interaction.response.defer()
-    codes = await get_vc_codes(target.id)
+    codes = {c for c in await get_vc_codes(target.id) if not c.startswith("direct-")}   # direct calls end with /direct-end
     if not codes:
-        await interaction.followup.send("⚠️ Not linked.", ephemeral=True)
+        await interaction.followup.send("⚠️ Not linked to a voice bridge.", ephemeral=True)
         return
 
     for code in codes:
@@ -2264,9 +2388,516 @@ async def unlink_vc(interaction: discord.Interaction, voice_channel: discord.Voi
 
     session = voice_sessions.get(interaction.guild.id)
     if session and session.channel_id == target.id:
-        await end_voice_session(interaction.guild.id)
+        remaining = await get_vc_codes(target.id)
+        if remaining:
+            session.codes = remaining                    # still in a direct call
+        else:
+            await end_voice_session(interaction.guild.id)
 
     await interaction.followup.send("🔌 Disconnected voice channel.")
+
+# ------------------------------------------------------------------------------
+# TTS VOICE CHANNELS (separate from bridge voice channels)
+# ------------------------------------------------------------------------------
+# A TTS voice channel doesn't relay people's voices. Instead, text typed in a text channel linked to the same TTS
+# network code is read aloud in every TTS voice channel of that network (across servers) that has someone in it.
+# Needs: ffmpeg on the host plus the `edge-tts` package (free, no key). `gTTS` also works as a fallback.
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+try:
+    from gtts import gTTS
+except ImportError:
+    gTTS = None
+
+TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
+TTS_LANG = os.environ.get("TTS_LANG", "en")                       # only used by the gTTS fallback
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "200"))
+TTS_QUEUE_MAX = int(os.environ.get("TTS_QUEUE_MAX", "6"))         # messages waiting per server before new ones are dropped
+TTS_USER_COOLDOWN = float(os.environ.get("TTS_USER_COOLDOWN", "2"))
+
+tts_sessions: dict = {}          # guild id -> {"vc", "channel_id", "queue", "wake", "task"}
+_tts_connecting: set = set()
+_tts_user_last: OrderedDict = OrderedDict()       # user id -> last time they were read aloud
+_tts_last_speaker: OrderedDict = OrderedDict()    # text channel id -> (user id, time): skip repeating the name
+
+
+def tts_available() -> bool:
+    return bool(shutil.which("ffmpeg")) and (edge_tts is not None or gTTS is not None)
+
+
+def _tts_clean(message: discord.Message) -> str:
+    text = unicodedata.normalize("NFKC", message.clean_content or "")   # fancy-font names/text -> plain letters
+    text = re.sub(r"https?://\S+", " link ", text)
+    text = re.sub(r"<a?:(\w+):\d+>", r"\1", text)
+    text = re.sub(r"[*_~`|>#]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()[:TTS_MAX_CHARS]
+
+
+async def tts_synth(text: str) -> bytes | None:
+    if edge_tts is not None:
+        try:
+            async def run():
+                buf = bytearray()
+                async for chunk in edge_tts.Communicate(text, TTS_VOICE).stream():
+                    if chunk.get("type") == "audio":
+                        buf.extend(chunk["data"])
+                return bytes(buf)
+            data = await asyncio.wait_for(run(), timeout=15)
+            if data:
+                return data
+        except Exception as e:
+            logger.warning(f"edge-tts failed: {e}")
+    if gTTS is not None:
+        try:
+            def run_gtts():
+                b = io.BytesIO()
+                gTTS(text=text, lang=TTS_LANG).write_to_fp(b)
+                return b.getvalue()
+            return await asyncio.wait_for(asyncio.to_thread(run_gtts), timeout=15) or None
+        except Exception as e:
+            logger.warning(f"gTTS failed: {e}")
+    return None
+
+
+def _tts_query_vcs(text_id: int) -> list:
+    res = supabase.table("tts_text_relays").select("network_code").eq("channel_id", text_id).execute()
+    codes = list({r["network_code"] for r in res.data})
+    if not codes:
+        return []
+    r = supabase.table("tts_vc_relays").select("vc_id").in_("network_code", codes).execute()
+    return list({int(x["vc_id"]) for x in r.data})
+
+
+async def tts_targets(text_id: int) -> list:
+    now = time.monotonic()
+    hit = _tts_text_cache.get(text_id)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        ids = await asyncio.to_thread(_tts_query_vcs, text_id)
+    except Exception as e:
+        logger.warning(f"TTS lookup failed (are the tts_* tables created?): {e}")
+        return hit[1] if hit else []
+    _tts_text_cache[text_id] = (now + RELAY_CACHE_TTL, ids)
+    return ids
+
+
+async def get_tts_codes(channel_id: int) -> set:
+    def query():
+        res = supabase.table("tts_vc_relays").select("network_code").eq("vc_id", channel_id).execute()
+        return {row["network_code"] for row in res.data}
+    try:
+        return await asyncio.to_thread(query)
+    except Exception as e:
+        logger.error(f"Error checking TTS voice channels: {e}")
+        return set()
+
+
+async def tts_on_message(message: discord.Message):
+    try:
+        if not tts_available() or not message.guild:
+            return
+        vc_ids = await tts_targets(message.channel.id)
+        if not vc_ids:
+            return
+        text = _tts_clean(message)
+        if not text:
+            return
+        now = time.monotonic()
+        if now - _tts_user_last.get(message.author.id, 0.0) < TTS_USER_COOLDOWN:
+            return
+        _remember(_tts_user_last, message.author.id, now, cap=2000)
+        channels = [c for c in (bot.get_channel(v) for v in vc_ids)
+                    if isinstance(c, discord.VoiceChannel) and humans_in(c) > 0]
+        if not channels:
+            return
+        last = _tts_last_speaker.get(message.channel.id)
+        same = last is not None and last[0] == message.author.id and now - last[1] < 30
+        _remember(_tts_last_speaker, message.channel.id, (message.author.id, now), cap=2000)
+        name = unicodedata.normalize("NFKC", message.author.display_name)
+        audio = await tts_synth(text if same else f"{name} says: {text}")
+        if audio:
+            await asyncio.gather(*(tts_enqueue(c, audio) for c in channels), return_exceptions=True)
+    except Exception as e:
+        logger.warning(f"TTS message failed: {e}")
+
+
+async def tts_enqueue(channel: discord.VoiceChannel, audio: bytes):
+    gid = channel.guild.id
+    sess = tts_sessions.get(gid)
+    if sess is None:
+        if gid in voice_sessions or gid in _voice_connecting or gid in radio_sessions or gid in _tts_connecting:
+            return
+        _tts_connecting.add(gid)
+        try:
+            vc = await channel.connect(timeout=20, self_deaf=True)
+            sess = {"vc": vc, "channel_id": channel.id, "queue": deque(), "wake": asyncio.Event(), "task": None}
+            tts_sessions[gid] = sess
+            sess["task"] = spawn(_tts_worker(gid, sess))
+        except Exception as e:
+            logger.error(f"TTS could not join {channel.id}: {e}")
+            try:
+                if channel.guild.voice_client:
+                    await channel.guild.voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            return
+        finally:
+            _tts_connecting.discard(gid)
+    elif sess["channel_id"] != channel.id:
+        return                                           # this server is already speaking in another TTS channel
+    if len(sess["queue"]) < TTS_QUEUE_MAX:
+        sess["queue"].append(audio)
+        sess["wake"].set()
+
+
+async def _tts_worker(gid: int, sess: dict):
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            if not sess["queue"]:
+                sess["wake"].clear()
+                try:
+                    await asyncio.wait_for(sess["wake"].wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    ch = sess["vc"].channel
+                    if ch is None or humans_in(ch) == 0:
+                        break
+                continue
+            audio = sess["queue"].popleft()
+            vc = sess["vc"]
+            if not vc.is_connected():
+                break
+            done = asyncio.Event()
+            try:
+                vc.play(discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True, options="-vn -loglevel error"),
+                        after=lambda err: loop.call_soon_threadsafe(done.set))
+            except Exception as e:
+                logger.warning(f"TTS playback failed: {e}")
+                continue
+            await done.wait()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"TTS worker error: {e}")
+    finally:
+        await tts_stop(gid)
+
+
+async def tts_stop(gid: int):
+    sess = tts_sessions.pop(gid, None)
+    if not sess:
+        return
+    task = sess.get("task")
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+    vc = sess["vc"]
+    try:
+        if vc.is_playing():
+            vc.stop()
+        await vc.disconnect(force=True)
+    except Exception:
+        pass
+
+
+async def tts_maybe_leave(channel):
+    sess = tts_sessions.get(channel.guild.id)
+    if sess and sess["channel_id"] == channel.id and humans_in(channel) == 0:
+        await tts_stop(channel.guild.id)
+
+
+def _codes_for(table: str, item_id: int) -> set:
+    res = supabase.table(table).select("network_code").eq(_LINK_COLS[table], item_id).execute()
+    return {r["network_code"] for r in res.data}
+
+
+def _tts_setup_note() -> str:
+    if tts_available():
+        return ""
+    return "\n⚠️ The host can't speak yet: it needs **ffmpeg** and the `edge-tts` Python package installed."
+
+
+def _need_manage_channels(interaction: discord.Interaction) -> bool:
+    return bool(interaction.guild and interaction.user.guild_permissions.manage_channels)
+
+
+@bot.tree.command(name="link-tts-vc", description="Make a voice channel a TTS voice channel that reads linked text channels aloud.")
+@app_commands.describe(network_code="Shared TTS network code", voice_channel="TTS voice channel (optional)",
+                       text_channel="Text channel whose messages get read aloud (optional)")
+async def link_tts_vc(interaction: discord.Interaction, network_code: str,
+                      voice_channel: discord.VoiceChannel = None, text_channel: discord.TextChannel = None):
+    if not _need_manage_channels(interaction):
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
+        return
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message("❌ Join a voice channel first or select one.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    code = network_code.strip().lower()
+    if await get_vc_codes(target.id):
+        await interaction.followup.send("❌ That voice channel is part of a voice bridge. Use a separate voice channel for TTS, or `/unlink-vc` first.", ephemeral=True)
+        return
+    await asyncio.to_thread(add_link, "tts_vc_relays", code, target.id)
+    msg = f"🗣️ **{target.name}** is now a TTS voice channel on `{code}`."
+    if text_channel:
+        await asyncio.to_thread(add_link, "tts_text_relays", code, text_channel.id)
+        msg += f"\nMessages typed in {text_channel.mention} will be read aloud."
+    else:
+        msg += "\nNow run `/link-tts-text` with the same code in the text channel people will type in."
+    await interaction.followup.send(msg + _tts_setup_note())
+
+
+@bot.tree.command(name="link-tts-text", description="Messages typed in this text channel get read aloud in the TTS voice channels on the same code.")
+@app_commands.describe(network_code="Shared TTS network code", text_channel="Text channel (optional, defaults to this one)")
+async def link_tts_text(interaction: discord.Interaction, network_code: str, text_channel: discord.TextChannel = None):
+    if not _need_manage_channels(interaction):
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
+        return
+    target = text_channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None)
+    if target is None:
+        await interaction.response.send_message("❌ Run this in a text channel or select one.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    code = network_code.strip().lower()
+    await asyncio.to_thread(add_link, "tts_text_relays", code, target.id)
+    await interaction.followup.send(f"🗣️ {target.mention} is linked to TTS network `{code}`: what people type here is read aloud in its TTS voice channels." + _tts_setup_note())
+
+
+@bot.tree.command(name="unlink-tts-vc", description="Stop using a voice channel as a TTS voice channel.")
+@app_commands.describe(voice_channel="Voice channel (optional)")
+async def unlink_tts_vc(interaction: discord.Interaction, voice_channel: discord.VoiceChannel = None):
+    if not _need_manage_channels(interaction):
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
+        return
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message("❌ Join a voice channel first or select one.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    codes = await get_tts_codes(target.id)
+    if not codes:
+        await interaction.followup.send("⚠️ Not a TTS voice channel.", ephemeral=True)
+        return
+    for code in codes:
+        await asyncio.to_thread(remove_link, "tts_vc_relays", code, target.id)
+    sess = tts_sessions.get(interaction.guild.id)
+    if sess and sess["channel_id"] == target.id:
+        await tts_stop(interaction.guild.id)
+    await interaction.followup.send("🔌 Removed the TTS voice channel.")
+
+
+@bot.tree.command(name="unlink-tts-text", description="Stop reading this text channel aloud.")
+@app_commands.describe(text_channel="Text channel (optional, defaults to this one)")
+async def unlink_tts_text(interaction: discord.Interaction, text_channel: discord.TextChannel = None):
+    if not _need_manage_channels(interaction):
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
+        return
+    target = text_channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None)
+    if target is None:
+        await interaction.response.send_message("❌ Run this in a text channel or select one.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    codes = await asyncio.to_thread(_codes_for, "tts_text_relays", target.id)
+    if not codes:
+        await interaction.followup.send("⚠️ Not linked to TTS.", ephemeral=True)
+        return
+    for code in codes:
+        await asyncio.to_thread(remove_link, "tts_text_relays", code, target.id)
+    await interaction.followup.send(f"🔌 {target.mention} is no longer read aloud.")
+
+
+# ------------------------------------------------------------------------------
+# DIRECT CALLS: a private link between exactly two voice channels (separate from bridge networks)
+# ------------------------------------------------------------------------------
+# /direct-call (in a text channel) makes a one-time pairing code. The other server runs /direct-join with it.
+# Under the hood the two voice channels share a private `direct-...` code, so the existing bridge audio path
+# carries the call, and each voice channel can still be in normal bridge networks too. Both text channels get a
+# notice with a button that opens their voice channel.
+DIRECT_CALL_TTL = 24 * 3600
+_DC_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _dc_find(ids: list):
+    ids = [int(i) for i in ids if i]
+    if not ids:
+        return None
+    cond = ",".join(f"{col}.eq.{i}" for i in ids for col in ("vc_a", "vc_b", "text_a", "text_b"))
+    res = supabase.table("direct_calls").select("*").or_(cond).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def _dc_get(code: str):
+    res = supabase.table("direct_calls").select("*").eq("code", code).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def _dc_write(op: str, code: str, data: dict | None = None):
+    if op == "insert":
+        supabase.table("direct_calls").insert({"code": code, **(data or {})}).execute()
+    elif op == "update":
+        supabase.table("direct_calls").update(data or {}).eq("code", code).execute()
+    else:
+        supabase.table("direct_calls").delete().eq("code", code).execute()
+
+
+async def _dc_notice(text_id, voice, text: str):
+    ch = await resolve_channel(int(text_id)) if text_id else None
+    if ch is None:
+        return
+    view = discord.ui.View()
+    if voice is not None:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Join call",
+                                        url=f"https://discord.com/channels/{voice.guild.id}/{voice.id}"))
+    try:
+        await ch.send(text, view=view if voice is not None else discord.utils.MISSING,
+                      allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as e:
+        logger.warning(f"Could not post direct call notice in {text_id}: {e}")
+
+
+async def _dc_detach(code: str, vc_id: int):
+    await asyncio.to_thread(remove_link, "vc_code_relays", code, vc_id)
+    ch = await resolve_channel(int(vc_id))
+    if ch is None:
+        return
+    live = voice_sessions.get(ch.guild.id)
+    if live and live.channel_id == ch.id:
+        remaining = await get_vc_codes(ch.id)
+        if remaining:
+            live.codes = remaining
+        else:
+            await end_voice_session(ch.guild.id)
+
+
+def _dc_pretty(code: str) -> str:
+    raw = code.removeprefix("direct-").upper()
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+@bot.tree.command(name="direct-call", description="Start a direct call link between your voice channel and one in another server.")
+@app_commands.describe(voice_channel="Your voice channel for the call (optional, defaults to the one you're in)")
+async def direct_call(interaction: discord.Interaction, voice_channel: discord.VoiceChannel = None):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed.", ephemeral=True)
+        return
+    if not _need_manage_channels(interaction) or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Run this in a text channel, with **Manage Channels** permission.", ephemeral=True)
+        return
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message("❌ Join a voice channel first or select one.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    if await get_tts_codes(target.id):
+        await interaction.followup.send("❌ That is a TTS voice channel. Pick a different voice channel.", ephemeral=True)
+        return
+    if await asyncio.to_thread(_dc_find, [target.id]):
+        await interaction.followup.send("⚠️ That voice channel already has a direct call. End it with `/direct-end` first.", ephemeral=True)
+        return
+    code = "direct-" + "".join(secrets.choice(_DC_ALPHABET) for _ in range(8)).lower()
+    try:
+        await asyncio.to_thread(_dc_write, "insert", code, {"vc_a": target.id, "text_a": interaction.channel.id})
+    except Exception as e:
+        await interaction.followup.send(f"❌ Couldn't create the call (is the `direct_calls` table created?): {e}", ephemeral=True)
+        return
+    await asyncio.to_thread(add_link, "vc_code_relays", code, target.id)
+    live = voice_sessions.get(interaction.guild.id)
+    if live and live.channel_id == target.id:
+        live.codes = live.codes | {code}
+    await interaction.followup.send(
+        f"📞 **Direct call ready** for {target.mention}.\n"
+        f"On the other server, in a text channel, run `/direct-join code:{_dc_pretty(code)}` "
+        f"(from inside their voice channel, or pick one). The code works once and expires in 24 hours.")
+    if humans_in(target) > 0:
+        await maybe_join_voice(target)
+
+
+@bot.tree.command(name="direct-join", description="Join a direct call that another server started.")
+@app_commands.describe(code="The code from /direct-call", voice_channel="Your voice channel for the call (optional)")
+async def direct_join(interaction: discord.Interaction, code: str, voice_channel: discord.VoiceChannel = None):
+    if not VOICE_OK:
+        await interaction.response.send_message("❌ Voice bridge dependencies are not installed.", ephemeral=True)
+        return
+    if not _need_manage_channels(interaction) or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Run this in a text channel, with **Manage Channels** permission.", ephemeral=True)
+        return
+    target = _resolve_voice_channel(interaction, voice_channel)
+    if not target:
+        await interaction.response.send_message("❌ Join a voice channel first or select one.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    net = "direct-" + re.sub(r"[^A-Za-z0-9]", "", code).lower().removeprefix("direct")
+    row = None
+    try:
+        row = await asyncio.to_thread(_dc_get, net)
+    except Exception as e:
+        logger.error(f"Direct call lookup failed: {e}")
+    expired = False
+    if row:
+        try:
+            expired = (datetime.now(timezone.utc) - _parse_ts(row["created_at"])).total_seconds() > DIRECT_CALL_TTL
+        except Exception:
+            expired = False
+    if not row or row.get("vc_b") or expired:
+        await interaction.followup.send("❌ That code isn't valid, was already used, or has expired.", ephemeral=True)
+        return
+    vc_a = await resolve_channel(int(row["vc_a"]))
+    if vc_a is None:
+        await interaction.followup.send("❌ The other voice channel is gone. Ask them to run `/direct-call` again.", ephemeral=True)
+        return
+    if vc_a.guild.id == interaction.guild.id:
+        await interaction.followup.send("❌ A direct call needs two different servers (the bot can only sit in one voice channel per server).", ephemeral=True)
+        return
+    if await get_tts_codes(target.id):
+        await interaction.followup.send("❌ That is a TTS voice channel. Pick a different voice channel.", ephemeral=True)
+        return
+    if await asyncio.to_thread(_dc_find, [target.id]):
+        await interaction.followup.send("⚠️ That voice channel already has a direct call. End it with `/direct-end` first.", ephemeral=True)
+        return
+    await asyncio.to_thread(_dc_write, "update", net, {"vc_b": target.id, "text_b": interaction.channel.id})
+    await asyncio.to_thread(add_link, "vc_code_relays", net, target.id)
+    for ch in (vc_a, target):
+        live = voice_sessions.get(ch.guild.id)
+        if live and live.channel_id == ch.id:
+            live.codes = live.codes | {net}
+    await interaction.followup.send(f"📞 Connected to **{vc_a.guild.name}** ➜ {vc_a.name}. Join {target.mention} to talk.")
+    await _dc_notice(row["text_a"], vc_a,
+                     f"📞 **Direct call connected** with **{interaction.guild.name}** ({target.name}). Join {vc_a.mention} to talk.")
+    for ch in (vc_a, target):
+        if humans_in(ch) > 0:
+            await maybe_join_voice(ch)
+
+
+@bot.tree.command(name="direct-end", description="End the direct call linked to this text channel or voice channel.")
+@app_commands.describe(voice_channel="Voice channel of the call (optional)")
+async def direct_end(interaction: discord.Interaction, voice_channel: discord.VoiceChannel = None):
+    if not _need_manage_channels(interaction):
+        await interaction.response.send_message("❌ You need **Manage Channels** permission.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    ids = [interaction.channel.id] + ([voice_channel.id] if voice_channel else [])
+    row = None
+    try:
+        row = await asyncio.to_thread(_dc_find, ids)
+    except Exception as e:
+        logger.error(f"Direct call lookup failed: {e}")
+    if not row:
+        await interaction.followup.send("⚠️ No direct call is linked to this channel.", ephemeral=True)
+        return
+    code = row["code"]
+    for vid in (row.get("vc_a"), row.get("vc_b")):
+        if vid:
+            await _dc_detach(code, int(vid))
+    await asyncio.to_thread(_dc_write, "delete", code)
+    await interaction.followup.send("☎️ Direct call ended.")
+    me = interaction.channel.id
+    for tid in (row.get("text_a"), row.get("text_b")):
+        if tid and int(tid) != me:
+            await _dc_notice(tid, None, "☎️ The direct call was ended by the other server.")
+
 
 @bot.tree.command(name="voice-status", description="Show live status of the voice bridge.")
 async def voice_status(interaction: discord.Interaction):
@@ -5808,6 +6439,8 @@ async def radio_begin(interaction: discord.Interaction, st: dict, target: discor
         return "\u274c FFmpeg isn't installed on the host."
     if gid in voice_sessions or gid in _voice_connecting:
         return "\u274c The voice relay is active in this server. End it before starting the radio."
+    if gid in tts_sessions or gid in _tts_connecting:
+        return "\u274c A TTS voice channel is active in this server. Wait for it to finish before starting the radio."
     raw = [st["url"]] + list(st.get("alts", []))
     resolved = await asyncio.gather(*(resolve_stream_url(u) for u in raw[:4]))
     checks = await asyncio.gather(*(radio_url_is_public(u) for u in resolved))
